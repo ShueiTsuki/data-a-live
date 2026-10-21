@@ -1,0 +1,18 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index ce3b401..df5fb9f 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -861,8 +861,13 @@ fbcon_probe(void)
+ 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ #if defined(FUXI)
++#if !defined(PANDORA)
+     fuxi_ctl0 = (volatile uint32_t *)ml_io_map(0x0ae16000, 0x1000);
+     fuxi_intf1 = (volatile uint32_t *)ml_io_map(0x0ae36000, 0x1000);
++#endif
++    /* PANDORA: SM8550 MDP addresses do not exist here (SM8850 MDP is at 0x9800000) and
++     * the 17 Pro panel refreshes by itself (measured by shim/hello), so no kick:
++     * fuxi_display_kick() returns early while fuxi_intf1 is NULL. */
+ #endif
+     if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
