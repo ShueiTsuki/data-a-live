@@ -1,0 +1,26 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index b63657e..1caeb86 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,7 +38,9 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-#if defined(FUXI)
++#if defined(PANDORA)
++    "     'IONameMatch'     = 'xiaomi,pandora';"
++#elif defined(FUXI)
+     "     'IONameMatch'     = 'xiaomi,fuxi';"
+ #else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
+@@ -48,7 +50,9 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-#if defined(FUXI)
++#if defined(PANDORA)
++    "     'IONameMatch'     = 'qcom,sm8850-cpu';"
++#elif defined(FUXI)
+     "     'IONameMatch'     = 'qcom,sm8550-cpu';"
+ #else
+     "     'IONameMatch'     = 'qcom,kryo470';"
