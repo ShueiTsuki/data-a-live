@@ -6,6 +6,8 @@ the 17 Pro's live FDT (device/DT_FINDINGS.md) and shim/hello measurements.
 Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
   --qemu   QEMU virt twin: QEMU's GIC/timer, RAM at 0xb0000000 and ios-sweet's 1080x2400
            framebuffer at 0x9c000000 so tools/qemu-sweet.py can decode the screen.
+  --qemu-gic  phone RAM and framebuffer, but QEMU's GIC/timer: lets tools/qemu_loader.py run
+           the real phone image (shim/loader) past interrupt setup.
 """
 import hashlib, os, struct, sys
 
@@ -83,15 +85,15 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False):
-    """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer)."""
+def build(seed=None, qemu=False, qemu_gic=False):
+    """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     fb, fb_size, fb_w, fb_h, fb_stride = ((QEMU_FB, QEMU_FB_SIZE, QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE)
                                           if qemu else (FB, FB_SIZE, FB_W, FB_H, FB_STRIDE))
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu or qemu_gic else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -144,7 +146,7 @@ def build(seed=None, qemu=False):
     # cluster like ios-sweet (no AMP code paths). cpus=N selects a prefix.
     # QEMU keeps a single CPU (MPIDR 0).
     cpu_nodes = []
-    for core in range(1 if qemu else len(MPIDRS)):
+    for core in range(1 if qemu or qemu_gic else len(MPIDRS)):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
@@ -172,7 +174,7 @@ def build(seed=None, qemu=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu or qemu_gic else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
@@ -252,7 +254,7 @@ def build(seed=None, qemu=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

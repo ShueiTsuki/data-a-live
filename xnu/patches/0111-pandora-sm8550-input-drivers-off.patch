@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/fuxi_keys.c b/bsd/dev/fuxi_keys.c
+index 9dfb867..5a1eb6e 100644
+--- a/bsd/dev/fuxi_keys.c
++++ b/bsd/dev/fuxi_keys.c
+@@ -273,7 +273,12 @@ out:
+ void
+ fuxi_keys_init(void)
+ {
++#if defined(PANDORA)
++	/* Xiaomi 13 (SM8550) register addresses; the 17 Pro's differ. Off unless fuxikeys=1. */
++	int enabled = 0;
++#else
+ 	int enabled = 1;
++#endif
+ 	thread_t thread;
+ 	if (fk_started) {
+ 		return;
+@@ -281,7 +286,7 @@ fuxi_keys_init(void)
+ 	fk_started = true;
+ 	(void)PE_parse_boot_argn("fuxikeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+-		printf("FUXI KEYS: disabled (fuxikeys=0)\n");
++		printf("FUXI KEYS: disabled\n");
+ 		return;
+ 	}
+ 	if (kernel_thread_start(fk_thread, NULL, &thread) == KERN_SUCCESS) {
+diff --git a/bsd/dev/fuxi_touch.c b/bsd/dev/fuxi_touch.c
+index 3bd2bf4..44e6f8a 100644
+--- a/bsd/dev/fuxi_touch.c
++++ b/bsd/dev/fuxi_touch.c
+@@ -710,7 +710,12 @@ out:
+ void
+ fuxi_touch_init(void)
+ {
++#if defined(PANDORA)
++	/* Xiaomi 13 (SM8550) register addresses; the 17 Pro's differ. Off unless fuxitouch=1. */
++	int enabled = 0;
++#else
+ 	int enabled = 1;
++#endif
+ 	thread_t thread;
+ 	if (ft.started) {
+ 		return;
+@@ -718,6 +723,7 @@ fuxi_touch_init(void)
+ 	ft.started = true;
+ 	(void)PE_parse_boot_argn("fuxitouch", &enabled, sizeof(enabled));
+ 	if (!enabled) {
++		printf("FUXI TOUCH: disabled\n");
+ 		return;
+ 	}
+ 	if (kernel_thread_start_priority(ft_thread, NULL, FT_PRIORITY, &thread) == KERN_SUCCESS) {
