@@ -1,0 +1,37 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index ff2c49a..c0510cf 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -335,11 +335,16 @@ ARM64_PLKSEG_ADDR  =0xfffffff004004000
+ ARM64_LINK_ADDR    =0xfffffff007004000
+ 
+ # Use ARM_LARGE_MEMORY config for all MacOSX targets.
++# PANDORA (4 KiB pages): the boot page tables cover only the top 256 GiB of kernel
++# VA (T1SZ_BOOT 26), which excludes the large-memory link address. Keep the iOS
++# layout there, as the 4K BCM2837/UniXNU kernels do.
+ ifneq ($(filter $(PLATFORM),MacOSX),)
++ifeq ($(filter PANDORA,$(CURRENT_MACHINE_CONFIG)),)
+ LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
++endif
+ 
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..4dc81bd 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,9 +133,10 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(PANDORA)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
++/* iOS layout; also PANDORA, whose iOS userland runs on a 4 KiB macOS-flow kernel. */
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+ #endif
+ 
