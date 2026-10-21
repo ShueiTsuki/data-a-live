@@ -1,6 +1,6 @@
 # 小米 17 Pro (pandora) 跑 iOS 16：完整计划
 
-最后更新：2026-10-21
+最后更新：2026-10-22
 
 ## 目标和边界
 
@@ -103,6 +103,22 @@
   0108 不碰小米 13 的显示寄存器、0109 iOS 的内存分配器区域大小、0110 PANDORA 自己的机型/CPU 名。
 - tools/mkadt_pandora.py：17 Pro 的硬件说明生成器（手机模式填真实值，--qemu 为模拟器版）。
 - QEMU（wsl/ci_qemu.sh、qemu_run.sh）：内核初始化完成 → 内存盘挂成根目录 → **测试程序作为 PID 1 在用户态运行**（"init running as PID 1"，每 5 秒心跳）。构建 #7（提交 8ed225c，内核 sha f7d03f27…）。
+
+## 第 3 步准备（2026-10-22，未上真机）
+- shim/loader：真机引导程序。启动镜像里嵌着内核 + 17 Pro 硬件说明 + 内存盘（测试程序），开机后在屏幕上打几行状态，把内核放到 0x8c0000000，填好启动参数后跳进内核。不写任何存储。
+  - 做法：`wsl/make_phone_payload.sh /opt/work/runN` → `shim/loader/build.sh` → `shim/loader/out/loader-boot.img`。
+- tools/qemu_loader.py：把这个真机镜像原样放进模拟器跑（模拟器内存按手机地址摆）。硬件说明加 `--qemu-gic`（只把中断控制器换成模拟器的）时，能跑到测试程序成为 PID 1。
+- 模拟器抓到并修掉的问题：
+  - 0112：内存给到 5 GB 后，macOS 算法给内存压缩器预留 40 GB 地址空间，内核地址空间不够，启动时崩溃。改用 iOS 算法（预留量等于内存大小）。
+- 上真机前的安全检查：
+  - 存储驱动只在 `rd=ufsroot0` 或 `fuxi_ufs_probe=1` 时启动，写入还要 `ufsrw=1`。命令行里都没有，所以不碰存储。
+  - 0111：小米 13 的触摸、按键驱动默认会按小米 13 的地址写时钟、GPIO 和电源管理芯片总线。PANDORA 下改成默认关。
+  - GPU、Wi-Fi、电池、USB 驱动在这个配置里默认不启动。
+- 当前镜像：构建 #9（run 39674275521，提交 4902f72，内核 sha b9c2e85d…）。
+- 真机测试（等你在场）：`fastboot boot shim/loader/out/loader-boot.img`。
+  - 预期：先闪过几行黄白字（引导程序），然后内核日志刷屏。
+  - 可能停在中断控制器、计时器或某个高通部件上（拍照即可）。
+  - 也可能直接重启回安卓。这不伤数据。
 
 ## 主要风险
 - CPU 是高通自研 Oryon 核心（8 Elite Gen 5，6 个性能核 + 2 个超大核），ios-sweet（Cortex-A55/A76）和 UniXNU（骁龙 8 Gen 2，ARM 公版核心）都没在它上面跑过，目前没有苹果内核在 Oryon 上运行的先例。
