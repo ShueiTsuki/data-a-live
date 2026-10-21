@@ -1,0 +1,24 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -83,7 +83,7 @@
+ 		return false;
+ 	}
+ 	#if defined(FUXI)
+-    cpuName = OSSymbol::withCStringNoCopy("SM8550 boot CPU");
++    cpuName = OSSymbol::withCStringNoCopy("SM8550");
+ #else
+     cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
+ #endif
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -24,7 +24,9 @@
+  * clusters yet).
+  */
+ #if defined(FUXI)
+-#define SWEET_SMP_MAX_CPUS         1 /* Boot CPU only until SMP is validated. */
++/* Seven of the eight cores: cpu@100 (MPIDR 0x100) keeps running the loader's
++ * USB monitor and is not in the ADT. cpus=N is clamped here. */
++#define SWEET_SMP_MAX_CPUS         7
+ #else
+ #define SWEET_SMP_MAX_CPUS         8
+ #endif

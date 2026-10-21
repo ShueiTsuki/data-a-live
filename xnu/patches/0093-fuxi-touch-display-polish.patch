@@ -1,0 +1,502 @@
+--- a/bsd/dev/fuxi_touch.c
++++ b/bsd/dev/fuxi_touch.c
+@@ -11,6 +11,14 @@
+  * waits for the controller-ready event, enables multi-touch scanning and
+  * polls the event FIFO while GPIO25 (IRQ, active low) is asserted.
+  * No firmware upload: the FTS keeps its firmware in its own flash.
++ *
++ * Polling (0093): every 4 ms while a finger is down or the IRQ line was
++ * seen recently, every 8 ms when idle and every 32 ms while the display is
++ * off (AppleCLCD RequestPowerChange(0)); deadlines are absolute and use the
++ * critical timer urgency, so no coalescing leeway is added. Touches are not
++ * reported while the display is off (boot-arg fuxitouch_offsuppress=0 keeps
++ * reporting). Boot-arg fuxitouch_poll_us sets the active period (default
++ * 4000), fuxitouch_idle_us the idle one (default 8000).
+  */
+ #if defined(FUXI)
+ #include <sys/param.h>
+@@ -29,6 +37,9 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
++    void *parameter, integer_t priority, thread_t *new_thread);
++extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ void fuxi_touch_init(void);
+ 
+ #define FT_SE_PA     0x00a90000u
+@@ -44,6 +55,8 @@
+ #define FT_EV_ENTER  0x13u
+ #define FT_EV_MOTION 0x23u
+ #define FT_EV_LEAVE  0x33u
++#define FT_TYPE_HOVER 0x05u        /* ftsSoftware.h TOUCH_TYPE_HOVER: not touching */
++#define FT_PRIORITY  92            /* BASEPRI_PREEMPT */
+ 
+ static struct {
+ 	vm_offset_t se, gcc, tlmm, gpi, smmu;
+@@ -53,6 +66,10 @@
+ 	bool started;
+ 	uint32_t active;
+ 	int x[FT_MAX], y[FT_MAX];
++	bool ic_reset;                 /* controller-ready event while sensing */
++	/* Per-contact statistics (first finger down -> last finger up). */
++	uint64_t c_start, c_last, c_poll_sum, c_poll_max;
++	unsigned c_reports, c_polls, contacts;
+ } ft;
+ static int ft_chan;
+ 
+@@ -73,6 +90,14 @@
+ }
+ 
+ static void
++ft_sleep_until(uint64_t deadline)
++{
++	(void)assert_wait_deadline_with_leeway(&ft_chan, THREAD_UNINT,
++	    TIMEOUT_URGENCY_SYS_CRITICAL, deadline, 0);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
+ ft_sleep(unsigned ms)
+ {
+ 	uint64_t deadline;
+@@ -420,12 +445,34 @@
+ 	return 0;
+ }
+ 
++static uint64_t
++ft_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/* One line per contact: how often iOS got a report and what a FIFO read costs. */
++static void
++ft_contact_end(void)
++{
++	uint64_t dur = ft_us(ft.c_last - ft.c_start);
++	ft.contacts++;
++	printf("FUXI TOUCH: contact %u: %u reports in %llu ms (%llu us apart), %u polls, "
++	    "FIFO read avg %llu us max %llu us\n", ft.contacts, ft.c_reports, dur / 1000,
++	    ft.c_reports > 1 ? dur / (ft.c_reports - 1) : 0ULL, ft.c_polls,
++	    ft.c_polls ? ft_us(ft.c_poll_sum) / ft.c_polls : 0ULL, ft_us(ft.c_poll_max));
++}
++
+ static void
+ ft_report(uint32_t mask)
+ {
+-	static unsigned reports;
+-	if ((reports++ % 50u) == 0) {
+-		printf("FUXI TOUCH: report %u mask %#x id0 %d,%d\n", reports, mask, ft.x[0], ft.y[0]);
++	uint64_t now = mach_absolute_time();
++	if (mask && !ft.active) {
++		ft.c_start = now;
++		ft.c_reports = ft.c_polls = 0;
++		ft.c_poll_sum = ft.c_poll_max = 0;
+ 	}
+ 	for (unsigned id = 0; id < FT_MAX; id++) {
+ 		uint32_t bit = 1u << id;
+@@ -435,49 +482,70 @@
+ 			sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
+ 		}
+ 	}
++	if (mask || ft.active) {
++		ft.c_reports++;
++		ft.c_last = now;
++	}
++	bool ended = ft.active && !mask;
+ 	ft.active = mask;
++	if (ended) {
++		ft_contact_end();
++	}
+ }
+ 
+-/* Drain the FIFO: one event, then the remaining count from byte 7. */
++/*
++ * Drain the FIFO in two reads (as fts_event_handler): one event, whose
++ * byte 7 holds the number of events still queued, then all of those at
++ * once. With deliver false (display off) the events are consumed and
++ * dropped.
++ */
+ static int
+-ft_poll(void)
++ft_poll(bool deliver)
+ {
+ 	static const uint8_t fifo[] = {0x87};
+-	uint8_t e[8];
++	uint8_t e[8 * 32];
+ 	uint32_t mask = ft.active;
+ 	bool changed = false;
+-	for (unsigned i = 0; i < 32; i++) {
+-		int err = ft_read(fifo, 1, e, 8);
+-		if (err) {
+-			return err;
+-		}
+-		if (e[0] == 0) {
++	int err = ft_read(fifo, 1, e, 8);
++	if (err) {
++		return err;
++	}
++	if (e[0] == 0) {
++		return 0;
++	}
++	unsigned n = 1 + (e[7] & 0x1f);
++	if (n > 32) {
++		n = 32;
++	}
++	if (n > 1 && (err = ft_read(fifo, 1, e + 8, 8 * (n - 1)))) {
++		return err;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		const uint8_t *ev = e + 8 * i;
++		if (ev[0] == 0) {
+ 			break;
+ 		}
+-		static unsigned logged;
+-		if (logged < 16) {
+-			logged++;
+-			printf("FUXI TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
+-		}
+-		unsigned id = e[1] >> 4;
+-		if ((e[0] == FT_EV_ENTER || e[0] == FT_EV_MOTION || e[0] == FT_EV_LEAVE) && id < FT_MAX) {
+-			/* Super-resolution coordinates, 10x the 1080x2400 panel. */
+-			int x = ((e[3] << 8) | e[2]) / 10, y = ((e[5] << 8) | e[4]) / 10;
+-			ft.x[id] = x > 1079 ? 1079 : x;
+-			ft.y[id] = y > 2399 ? 2399 : y;
+-			if (e[0] == FT_EV_LEAVE) {
+-				mask &= ~(1u << id);
+-			} else {
+-				mask |= 1u << id;
+-			}
+-			changed = true;
++		if (ev[0] == FT_EV_READY) {
++			ft.ic_reset = true;
++			continue;
+ 		}
+-		if (!(e[7] & 0x1f)) {
+-			break;
++		unsigned id = ev[1] >> 4, type = ev[1] & 0xf;
++		if ((ev[0] != FT_EV_ENTER && ev[0] != FT_EV_MOTION && ev[0] != FT_EV_LEAVE) ||
++		    id >= FT_MAX || (type == 0 && ev[0] != FT_EV_LEAVE)) {
++			continue;
++		}
++		/* Super-resolution coordinates, 10x the 1080x2400 panel. */
++		int x = ((ev[3] << 8) | ev[2]) / 10, y = ((ev[5] << 8) | ev[4]) / 10;
++		ft.x[id] = x > 1079 ? 1079 : x;
++		ft.y[id] = y > 2399 ? 2399 : y;
++		if (ev[0] == FT_EV_LEAVE || type == FT_TYPE_HOVER) {
++			mask &= ~(1u << id);
++		} else {
++			mask |= 1u << id;
+ 		}
++		changed = true;
+ 	}
+-	if (changed) {
++	if (changed && deliver) {
+ 		ft_report(mask);
+ 	}
+ 	return 0;
+@@ -490,12 +558,18 @@
+ 	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
+ 	uint8_t ev[8] = {0}, chip[2] = {0};
+ 	unsigned delay_s = 30, errors = 0;
+-	unsigned ticks = 0;
+-	bool irq_seen = false;
++	unsigned poll_us = 4000, idle_us = 8000, offsup = 1;
++	bool irq_seen = false, was_off = false;
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("fuxitouchdelay", &delay_s, sizeof(delay_s));
+-	printf("FUXI TOUCH: starting in %u s\n", delay_s);
++	(void)PE_parse_boot_argn("fuxitouch_poll_us", &poll_us, sizeof(poll_us));
++	(void)PE_parse_boot_argn("fuxitouch_idle_us", &idle_us, sizeof(idle_us));
++	(void)PE_parse_boot_argn("fuxitouch_offsuppress", &offsup, sizeof(offsup));
++	poll_us = poll_us < 1000 ? 1000 : poll_us;
++	idle_us = idle_us < poll_us ? poll_us : idle_us;
++	printf("FUXI TOUCH: starting in %u s (poll %u us active, %u us idle)\n", delay_s,
++	    poll_us, idle_us);
+ 	ft_sleep(delay_s * 1000u);
+ 	ft.gcc = ml_io_map(FT_GCC_PA, 0x1f0000);
+ 	ft.tlmm = ml_io_map(FT_TLMM_PA, 0x30000);
+@@ -548,28 +622,82 @@
+ 		goto out;
+ 	}
+ 	printf("FUXI TOUCH: sensing, polling GPIO%u\n", FT_IRQ);
++	/*
++	 * IRQ is level low while the FIFO holds events. Check it every poll
++	 * period (absolute deadlines, no timer leeway) and read the FIFO every
++	 * 32 ms regardless in case the IC does not drive the line.
++	 */
++	uint64_t poll_abs, idle_abs, off_abs, recent_abs, sweep_abs;
++	nanoseconds_to_absolutetime(poll_us * 1000ULL, &poll_abs);
++	nanoseconds_to_absolutetime(idle_us * 1000ULL, &idle_abs);
++	nanoseconds_to_absolutetime(32 * NSEC_PER_MSEC, &off_abs);
++	nanoseconds_to_absolutetime(32 * NSEC_PER_MSEC, &sweep_abs);
++	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &recent_abs);
++	uint64_t next = mach_absolute_time(), last_irq = 0, last_read = 0;
+ 	for (;;) {
+-		/* IRQ is level low while the FIFO holds events; poll it every 8 ms,
+-		 * and read the FIFO every 32 ms regardless in case the IC does not
+-		 * drive the line. */
++		uint64_t now = mach_absolute_time();
++		bool off = offsup && sweet_fb_display_off;
++		if (off != was_off) {
++			was_off = off;
++			if (off && ft.active) {
++				ft_report(0);   /* release fingers held when the display went off */
++			}
++		}
+ 		bool irq = !(ft_rd(ft.tlmm, FT_GPIO(FT_IRQ) + 4) & 1u);
+-		if (irq && !irq_seen) {
+-			irq_seen = true;
+-			printf("FUXI TOUCH: IRQ line asserted\n");
+-		}
+-		if (irq || ft.active || (++ticks & 3u) == 0) {
+-			if (ft_poll()) {
+-				if ((errors++ % 100u) == 0) {
+-					printf("FUXI TOUCH: FIFO read error\n");
++		if (irq) {
++			last_irq = now;
++			if (!irq_seen) {
++				irq_seen = true;
++				printf("FUXI TOUCH: IRQ line asserted\n");
++			}
++		}
++		if (irq || ft.active || now - last_read >= sweep_abs) {
++			last_read = now;
++			int perr = ft_poll(!off);
++			uint64_t took = mach_absolute_time() - now;
++			if (ft.active) {
++				ft.c_polls++;
++				ft.c_poll_sum += took;
++				ft.c_poll_max = took > ft.c_poll_max ? took : ft.c_poll_max;
++			}
++			if (perr) {
++				errors++;
++				if (errors == 1 || (errors % 100u) == 0) {
++					printf("FUXI TOUCH: FIFO read error %d (%u in a row)\n", perr, errors);
+ 				}
+-				if (errors >= 10) {
++				/* Do not leave a finger stuck down while reads fail. */
++				if (errors >= 2 && ft.active) {
+ 					ft_report(0);
+ 				}
++				/* A timed-out transfer leaves TREs queued: reset the GPII rings. */
++				if (errors == 3 || (errors % 50u) == 0) {
++					int rerr = ft_gpi_init();
++					printf("FUXI TOUCH: GPI re-init after %u errors -> %d\n", errors, rerr);
++				}
+ 			} else {
++				if (errors >= 3) {
++					printf("FUXI TOUCH: FIFO reads recovered after %u errors\n", errors);
++				}
+ 				errors = 0;
+ 			}
++			if (ft.ic_reset) {
++				/* Controller-ready event while sensing: the IC reset itself. */
++				ft.ic_reset = false;
++				if (ft.active) {
++					ft_report(0);
++				}
++				int serr = ft_tx(sense, 3, false);
++				printf("FUXI TOUCH: controller reset event, sense on again -> %d\n", serr);
++			}
++		}
++		uint64_t period = off ? off_abs :
++		    (ft.active || now - last_irq < recent_abs) ? poll_abs : idle_abs;
++		next += period;
++		now = mach_absolute_time();
++		if (next <= now) {
++			next = now + period;
+ 		}
+-		ft_sleep(8);
++		ft_sleep_until(next);
+ 	}
+ out:
+ 	printf("FUXI TOUCH: stopped\n");
+@@ -590,7 +718,7 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	if (kernel_thread_start(ft_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start_priority(ft_thread, NULL, FT_PRIORITY, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -33,10 +33,19 @@
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
++ *
++ * FUXI (0093): frames are shown at up to 60 Hz by default (7 fast cores;
++ * sweetfb_hz still overrides), the tick runs on absolute deadlines so the
++ * copy time does not stretch the period, every 600 presented frames log
++ * "SWEET FB: stats" (copy time, swaps, dropped swaps), and display off is a
++ * single black fill (write-only: the panel memory is write-combined, the
++ * read-modify-write fade read it back uncached). sweet_fb_display_off tells
++ * the touch driver (bsd/dev/fuxi_touch.c) that the display is off.
+  */
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -116,6 +125,10 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint64_t      fTickAbs;       /* vsync period, absolute time units */
++	uint64_t      fNextTick;      /* next vsync deadline */
++	uint64_t      fStatCopy, fStatCopyMax, fStatStart;
++	uint32_t      fStatFrames, fStatSwaps, fStatDropped;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -195,10 +208,22 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++#if defined(FUXI)
++	uint32_t hz = 60;
++#else
+ 	uint32_t hz = 10;
++#endif
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++#if defined(FUXI)
++	nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fTickAbs);
++	fNextTick = mach_absolute_time() + fTickAbs;
++	fStatStart = mach_absolute_time();
++	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
++	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
++#else
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++#endif
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -209,6 +234,23 @@
+ 	return true;
+ }
+ 
++static void
++sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
++{
++#if defined(FUXI)
++	/* Absolute deadlines: the period does not grow by the copy time. */
++	uint64_t now = mach_absolute_time();
++	fb->fNextTick += fb->fTickAbs;
++	if (fb->fNextTick <= now) {
++		fb->fNextTick = now + fb->fTickAbs;
++	}
++	sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
++#else
++	(void)fb;
++	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++#endif
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -234,6 +276,18 @@
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++#if defined(FUXI)
++		if (step == 0) {
++			/* Plain stores, no DC ZVA (bzero) on the write-combined mapping. */
++			for (uint32_t y = 0; y < fb->fHeight; y++) {
++				volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
++					row[x] = 0;
++				}
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++#else
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -242,7 +296,8 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++#endif
++		sweet_fb_rearm(fb, sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -259,7 +314,7 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sweet_fb_rearm(fb, sender);
+ }
+ 
+ void
+@@ -304,6 +359,10 @@
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fStatSwaps++;
++	if (fDirty) {
++		fStatDropped++;         /* the previous frame was never shown */
++	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -315,7 +374,7 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+-
++	uint64_t t0 = mach_absolute_time();
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -403,7 +462,26 @@
+ 		s->release();
+ 	}
+ #if defined(FUXI)
+-    fuxi_display_kick();
++	fuxi_display_kick();
++	uint64_t t1 = mach_absolute_time(), took = t1 - t0;
++	fStatCopy += took;
++	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
++	if (++fStatFrames >= 600) {
++		uint64_t avg_ns, max_ns, span_ns;
++		absolutetime_to_nanoseconds(fStatCopy / fStatFrames, &avg_ns);
++		absolutetime_to_nanoseconds(fStatCopyMax, &max_ns);
++		absolutetime_to_nanoseconds(t1 - fStatStart, &span_ns);
++		IOLockLock(fLock);
++		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
++		fStatSwaps = fStatDropped = 0;
++		IOLockUnlock(fLock);
++		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
++		    "%u swaps, %u not shown\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
++		    max_ns / 1000, swaps, dropped);
++		fStatFrames = 0;
++		fStatCopy = fStatCopyMax = 0;
++		fStatStart = t1;
++	}
+ #endif
+ }
+ 
+@@ -547,6 +625,7 @@
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
++			sweet_fb_display_off = off ? 1 : 0;
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}

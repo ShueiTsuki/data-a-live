@@ -1,0 +1,31 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -721,10 +721,18 @@
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ #if defined(FUXI)
+-static volatile uint32_t *fuxi_ctl0;
+-/* The inherited M3 panel is command mode. Validated CTL0 starts a new frame. */
++static volatile uint32_t *fuxi_ctl0, *fuxi_intf1;
++/*
++ * The inherited M3 panel is command mode. ABL leaves INTF1 tear autorefresh on,
++ * which already sends a frame every TE; a manual CTL0 START on top of it corrupts
++ * the DSC stream (panel static, ar-01). Kick only when autorefresh is off.
++ */
+ void fuxi_display_kick(void)
+ {
++    if (fuxi_intf1 == NULL || (fuxi_intf1[0x2b4 / 4] & 0x80000000u)) {
++        __asm__ volatile("dsb sy" ::: "memory");
++        return;
++    }
+     if (fuxi_ctl0 != NULL && !(fuxi_ctl0[0x1c / 4] & 1)) {
+         __asm__ volatile("dsb sy" ::: "memory");
+         fuxi_ctl0[0x1c / 4] = 1;
+@@ -854,6 +862,7 @@
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ #if defined(FUXI)
+     fuxi_ctl0 = (volatile uint32_t *)ml_io_map(0x0ae16000, 0x1000);
++    fuxi_intf1 = (volatile uint32_t *)ml_io_map(0x0ae36000, 0x1000);
+ #endif
+     if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);

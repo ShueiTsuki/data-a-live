@@ -1,0 +1,380 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1164,7 +1164,7 @@
+  * the launchd retries cheap. Each name is logged on its first refusal.
+  */
+ static bool
+-sweet_exec_blocked(const char *name)
++sweet_exec_blocked(const char *name, bool log)
+ {
+ 	static char list[256];
+ 	static int state;       /* 0 unread, 1 none, 2 list */
+@@ -1183,7 +1183,7 @@
+ 			e++;
+ 		}
+ 		if ((size_t)(e - s) == len && strncmp(s, name, len) == 0) {
+-			if (idx < 32 && !(logged & (1u << idx))) {
++			if (log && idx < 32 && !(logged & (1u << idx))) {
+ 				logged |= 1u << idx;
+ 				printf("exec %s blocked (sweetnoexec)\n", name);
+ 			}
+@@ -1192,6 +1192,29 @@
+ 		s = *e ? e + 1 : e;
+ 	}
+ 	return false;
++}
++#include "sweet_execswap.h"
++static LCK_MTX_DECLARE(sweet_execswap_lock, &proc_lck_grp);
++static const char *
++sweet_exec_swap(const char *path, int pid)
++{
++ static struct sweet_execswap swap;
++ static bool parsed;
++ static unsigned logged;
++ lck_mtx_lock(&sweet_execswap_lock);
++ if (!parsed) {
++  if (PE_parse_boot_argn("sweetexecswap", swap.arg, sizeof(swap.arg)))
++   (void)sweet_execswap_parse(&swap);
++  parsed = true;
++ }
++ const char *replacement = sweet_execswap_match(&swap, path);
++ if (replacement && logged < 8) {
++  ++logged;
++  printf("SWEET EXECSWAP: %s -> %s pid %d%s\n", swap.name, replacement, pid,
++      sweet_exec_blocked(swap.name, false) ? " (wins over sweetnoexec)" : "");
++ }
++ lck_mtx_unlock(&sweet_execswap_lock);
++ return replacement;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+@@ -2195,6 +2218,19 @@
+ 	if (error) {
+ 		goto bad_notrans;
+ 	}
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++ /* Substitute only the original pathname, once, before namei/activation.
++  * Keep argv/env in their original userspace segment. The private flag
++  * survives fat/script activation and suppresses the late noexec check. */
++ const char *replacement = sweet_exec_swap(excpath, proc_getpid(p));
++ if (replacement) {
++  imgp->ip_flags |= IMGPF_SWEET_EXECSWAP;
++  exec_reset_save_path(imgp);
++  error = exec_save_path(imgp, CAST_USER_ADDR_T(replacement), UIO_SYSSPACE, &excpath);
++  if (error) goto bad_notrans;
++ }
++#endif
+ 
+ 	/* Use excpath, which contains the copyin-ed exec path */
+ 	DTRACE_PROC1(exec, uintptr_t, excpath);
+@@ -7450,7 +7486,7 @@
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-			if (sweet_exec_blocked(p->p_name)) {
++			if (!(imgp->ip_flags & IMGPF_SWEET_EXECSWAP) && sweet_exec_blocked(p->p_name, true)) {
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
+--- a/bsd/kern/sweet_execswap.h
++++ b/bsd/kern/sweet_execswap.h
+@@ -0,0 +1,32 @@
++/* Diagnostic exec path substitution, compiled only for SWEET boards.
++ * Caller serializes initialization/log quota; returned strings live for boot.
++ * Reject truncation, lists, relative paths, whitespace and ambiguous syntax.
++ */
++#define SWEET_EXECSWAP_BYTES 192
++#define IMGPF_SWEET_EXECSWAP 0x00010000 /* unused image_params flag */
++struct sweet_execswap {
++ char arg[SWEET_EXECSWAP_BYTES];
++ const char *name, *path;
++};
++static bool
++sweet_execswap_parse(struct sweet_execswap *s)
++{
++ s->name = s->path = NULL;
++ size_t n = strnlen(s->arg, sizeof(s->arg));
++ if (!n || n >= sizeof(s->arg)-1) return false;
++ char *colon = strchr(s->arg, ':');
++ if (!colon || colon == s->arg || colon-s->arg > 31 || colon[1] != '/' || !colon[2]) return false;
++ for (char *p=s->arg; *p; p++) {
++  if (*p <= ' ' || *p == ',' || (*p == ':' && p != colon) || (p < colon && *p == '/')) return false;
++ }
++ *colon = 0;
++ s->name = s->arg; s->path = colon+1;
++ return true;
++}
++static const char *
++sweet_execswap_match(const struct sweet_execswap *s, const char *path)
++{
++ const char *base = strrchr(path, '/');
++ base = base ? base+1 : path;
++ return s->name && strcmp(base, s->name) == 0 ? s->path : NULL;
++}
+--- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
+@@ -1,4 +1,4 @@
+-/* NativeAdrenoABI v2 userspace lane. No Apple accelerator/Metal impersonation.
++/* NativeAdrenoABI v2 userspace lane. Minimal Metal discovery metaclass only.
+  * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
+  * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
+  */
+@@ -8,38 +8,66 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <kern/clock.h>
+ #include <kern/task.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ #include "fuxi_gpu_abi.h"
+ #include "fuxi_abi_wire.h"
+ 
+-/* A physical-range view must OWN its wired backing until its last mapping is
+- * destroyed. IOConnectUnmapMemory64 looks up this same descriptor again.
+- * Releasing a BO with a forgotten CPU mapping can then never free live PTEs.
+- * Kernel and client mappings both use Normal NC/write-combine, avoiding a
+- * cached alias of memory the GPU accesses noncoherently. */
+-class FuxiAdrenoBoView : public IOGeneralMemoryDescriptor {
++/* A subrange keeps the BO's managed-page descriptor/pager identity. Never
++ * reconstruct a physical descriptor over wired managed RAM. The extra backing
++ * reference owns the matched prepare until the final CPU mapping disappears.
++ * Both mappings keep the buffer's Normal NC/write-combine cache policy. */
++class FuxiAdrenoBoView : public IOSubMemoryDescriptor {
+  OSDeclareDefaultStructors(FuxiAdrenoBoView)
+  IOBufferMemoryDescriptor *backing_ = nullptr;
+ public:
+- bool bind(IOBufferMemoryDescriptor *backing, IOAddressRange *ranges, unsigned count) {
+-  if (!initWithOptions(ranges,count,0,nullptr,
+-      kIODirectionInOut|kIOMemoryTypePhysical64|kIOMemoryMapperNone,nullptr)) return false;
++ bool bind(IOBufferMemoryDescriptor *backing) {
++  if (!initSubRange(backing,0,backing->getLength(),kIODirectionInOut)) return false;
+   backing_=backing; backing_->retain(); return true;
+  }
+  void free() override {
+   IOBufferMemoryDescriptor *backing=backing_;
+-  /* Tear down physical views/pager before releasing the backing. */
+-  IOGeneralMemoryDescriptor::free();
++  IOSubMemoryDescriptor::free();
+   if (backing) { backing->complete(); backing->release(); }
+  }
+ };
+-OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOGeneralMemoryDescriptor)
++OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOSubMemoryDescriptor)
+ 
+ static IOLock *openLock;
+ static bool connected;
++static bool execswapTest;
++static unsigned testPasses, traceLines;
++static bool abiExecswapTest(const char *swap) {
++ size_t n=strnlen(swap,192);
++ if (!n || n>=191) return false;
++ const char *colon=strchr(swap,':');
++ if (!colon || colon==swap || colon-swap>31) return false;
++ /* Match sweet_execswap_parse's basename rules; only this test path counts. */
++ for (const char *p=swap; p<colon; ++p)
++  if (*p<=' ' || *p==',' || *p=='/') return false;
++ return !strcmp(colon+1,"/usr/local/bin/fuxi-gpu-abi-test");
++}
++/* openLock serializes the boot-wide quota and trace budget (including opens
++ * denied after the test). No user stdout or root-image update is needed. */
++static void abiTrace(const char *step, int pid, IOReturn rc) {
++ IOLockLock(openLock);
++ if (traceLines < 64) {
++  ++traceLines;
++  IOLog("FUXI ABI: %s pid %d rc 0x%08x\n",step,pid,(unsigned)rc);
++ }
++ IOLockUnlock(openLock);
++}
++static const char *abiStep(unsigned selector) {
++ static const char *steps[]={"invalid","query","alloc","map","free","submit","wait",
++     "timestamp","status","set-metadata","get-metadata","create-queue","close-queue",
++     "cpu-token","cpu-unmap","device-info","import"};
++ return selector<=16 ? steps[selector] : "invalid";
++}
+ class FuxiAdrenoUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(FuxiAdrenoUserClient)
+  enum {MaxBos=64};
+@@ -54,7 +82,29 @@
+  } bos_[MaxBos] = {};
+  task_t task_ = TASK_NULL;
+  IOLock *lock_ = nullptr;
+- bool live_ = false;
++ bool live_ = false, diagnostic_ = false, resultChecked_ = false;
++ int pid_ = 0;
++ void result() {
++  if (!diagnostic_ || resultChecked_) return;
++  for (auto &b:bos_) if (b.memory && b.bytes==65536 && b.iova==0x20000000) {
++   resultChecked_=true;
++   volatile uint32_t *words=(volatile uint32_t *)b.memory->getBytesNoCopy();
++   __asm__ volatile("dsb sy" ::: "memory");
++   unsigned bad=0;
++   uint32_t value=words[0x1000/4];
++   for (unsigned i=0;i<256;i++) if (words[0x2000/4+i]!=0xff336699) ++bad;
++   bool pass=value==0xa740cafe && !bad;
++   IOLockLock(openLock);
++   if (pass && testPasses<2) ++testPasses;
++   if (traceLines<64) {
++    ++traceLines;
++    IOLog("FUXI ABI: result pid %d rc 0x%08x mem 0x%08x bad-pixels %u rounds %u/2\n",
++        pid_,(unsigned)(pass ? kIOReturnSuccess : kIOReturnIOError),value,bad,testPasses);
++   }
++   IOLockUnlock(openLock);
++   return;
++  }
++ }
+  uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
+  uint32_t nextToken_ = 1;
+  bool queues_[8] = {true};
+@@ -111,10 +161,8 @@
+   if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
+   if (!memory) return kIOReturnNoMemory;
+   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
+-  unsigned capacity=(unsigned)(allocated/16384), count=0;
+-  IOAddressRange *ranges=IONewData(IOAddressRange,capacity);
+   FuxiAdrenoBoView *view=new FuxiAdrenoBoView;
+-  bool valid=ranges && view && memory->getBytesNoCopy() && memory->getLength()==allocated;
++  bool valid=view && memory->getBytesNoCopy() && memory->getLength()==allocated;
+   uint64_t first=0;
+   for (uint64_t off=0;valid && off<allocated;off+=16384) {
+    IOByteCount length=0;
+@@ -123,14 +171,11 @@
+        (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
+    if (!valid) break;
+    if (!off) first=pa;
+-   if (count && ranges[count-1].address+ranges[count-1].length==pa) ranges[count-1].length+=16384;
+-   else ranges[count++]={pa,16384};
+   }
+   if (valid) {
+    bzero(memory->getBytesNoCopy(),allocated); /* includes 16K mapping tail */
+-   valid=view->bind(memory,ranges,count);
+-  }
+-  if (ranges) IODeleteData(ranges,IOAddressRange,capacity);
++   valid=view->bind(memory);
++  }
+   if (!valid) {
+    if (view) view->release();
+    memory->complete(); memory->release(); return kIOReturnNoMemory;
+@@ -277,24 +322,34 @@
+  bool initWithTask(task_t task, void *securityID, UInt32 type) override {
+   if (!IOUserClient::initWithTask(task,securityID,type)) return false;
+   task_=task; task_reference(task_);
++  pid_=proc_selfpid();
++  char name[64]={}; proc_name(pid_,name,sizeof(name));
++  diagnostic_=execswapTest && type==0x4147 && !strncmp(name,"fuxi-gpu-abi-",13);
+   lock_=IOLockAlloc(); return lock_!=nullptr;
+  }
+  bool mount() {
+   IOLockLock(openLock);
+-  bool ok=!connected && fuxi_gpu_abi_available();
++  bool refused=diagnostic_ && testPasses>=2;
++  bool ok=!refused && !connected && fuxi_gpu_abi_available();
++  if (refused && traceLines<64) {
++   ++traceLines;
++   IOLog("FUXI ABI: open refused pid %d rc 0x%08x already passed 2/2 rounds this boot\n",pid_,(unsigned)kIOReturnBusy);
++  }
+   if (ok) live_=connected=true;
+   IOLockUnlock(openLock); return ok;
+  }
+  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *a,
+      IOExternalMethodDispatch *, OSObject *, void *) override {
+-  if (!a || selector<1 || selector>16) return kIOReturnUnsupported;
++  if (!a || selector<1 || selector>16) { abiTrace("invalid",pid_,kIOReturnUnsupported); return kIOReturnUnsupported; }
+   if (a->scalarInputCount || a->scalarOutputCount || a->asyncWakePort ||
+       a->structureInputDescriptor || a->structureOutputDescriptor ||
+       a->structureInputSize!=fg_abi_input_size(selector) || a->structureOutputSize!=fg_abi_output_size(selector) ||
+-      (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) return kIOReturnBadArgument;
++      (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) { abiTrace(abiStep(selector),pid_,kIOReturnBadArgument); return kIOReturnBadArgument; }
+   IOLockLock(lock_);
+   if (a->structureOutputSize) bzero(a->structureOutput,a->structureOutputSize);
+   IOReturn s=live_ ? run(selector,a->structureInput,a->structureOutput) : kIOReturnNotOpen;
++  abiTrace(abiStep(selector),pid_,s);
++  if (selector==NativeAdrenoMethodWaitFence && s==kIOReturnSuccess) result();
+   IOLockUnlock(lock_); return s;
+  }
+  IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
+@@ -304,7 +359,9 @@
+   if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
+    b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
+   }
+-  IOLockUnlock(lock_); return *memory ? kIOReturnSuccess : kIOReturnNotFound;
++  IOReturn rc=*memory ? kIOReturnSuccess : kIOReturnNotFound;
++  abiTrace("cpu-map",pid_,rc);
++  IOLockUnlock(lock_); return rc;
+  }
+  IOReturn clientClose() override {
+   if (!lock_) return kIOReturnSuccess;
+@@ -321,7 +378,8 @@
+    IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
+   }
+   IOLockUnlock(lock_);
+-  if (wasLive) terminate(); return kIOReturnSuccess;
++  if (wasLive) { abiTrace("close",pid_,kIOReturnSuccess); terminate(); }
++  return kIOReturnSuccess;
+  }
+  void free() override {
+   (void)clientClose();
+@@ -331,14 +389,26 @@
+  }
+ };
+ OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
+-
+ /* Name matches Turnip's direct unsandboxed backend. Type 0 is its default;
+  * 0x4147 is the NativeAdreno plugin/raw-test open type. */
+-class NativeAdrenoGpuPublished : public IOService {
++/* IOServiceMatching("IOAcceleratorES") matches metaclass ancestry, not the
++ * provider object or a mutable IOClass property. This owns only a discovery
++ * name; it implements no Apple family/user-client ABI. The native root-only
++ * ABI below remains the sole GPU connection contract. */
++class IOAcceleratorES : public IOService {
++ OSDeclareDefaultStructors(IOAcceleratorES)
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES,IOService)
++class NativeAdrenoGpuPublished : public IOAcceleratorES {
+  OSDeclareDefaultStructors(NativeAdrenoGpuPublished)
+ public:
+  IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
+      OSDictionary *, IOUserClient **handler) override {
++  IOReturn rc=createClient(task,securityID,type,handler);
++  abiTrace("open",proc_selfpid(),rc);
++  return rc;
++ }
++ IOReturn createClient(task_t task, void *securityID, UInt32 type, IOUserClient **handler) {
+   if (!handler) return kIOReturnBadArgument;
+   *handler=nullptr;
+   if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
+@@ -351,9 +421,12 @@
+   *handler=uc; return kIOReturnSuccess;
+  }
+ };
+-OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOService)
++OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOAcceleratorES)
+ extern "C" void fuxi_gpu_abi_publish(void)
+ {
++ char swap[192]={};
++ execswapTest=PE_parse_boot_argn("sweetexecswap",swap,sizeof(swap)) &&
++     abiExecswapTest(swap);
+  openLock=IOLockAlloc();
+  auto *service=new NativeAdrenoGpuPublished;
+  if (!openLock || !service) { if (service) service->release(); return; }
+@@ -362,6 +435,16 @@
+  }
+  service->setName("NativeAdrenoGpu");
+  service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
++ service->setProperty("MetalPluginName","FuxiMetal");
++ service->setProperty("MetalPluginClassName","FuxiMTLDevice");
++ // Verify the exact ancestry test used by IOService's matching path before
++ // publishing a service which Metal will attempt to open.
++ if (!service->metaCast("IOAcceleratorES")) {
++  IOLog("FUXI MTL: IOAcceleratorES metaclass match FAIL\n");
++  service->stop(IOService::getPlatform());service->detach(IOService::getPlatform());
++  service->release();return;
++ }
++ IOLog("FUXI MTL: IOAcceleratorES metaclass match PASS plugin FuxiMetal/FuxiMTLDevice\n");
+  service->registerService(); /* retained for boot lifetime */
+  IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v2 HostImport 16K, open 0x4147, root only, watchdog 100 ms\n");
+ }

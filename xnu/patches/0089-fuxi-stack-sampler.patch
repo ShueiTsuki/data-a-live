@@ -1,0 +1,20 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -843,7 +843,16 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 
+-#if !defined(FUXI)
++#if defined(FUXI)
++	/*
++	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
++	 * would write the tail of ufsroot0, which here is the HFS image itself.
++	 */
++	char smp[8];
++	if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp)) && smp[0] != '-') {
++		sweet_sample_start();
++	}
++#else
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

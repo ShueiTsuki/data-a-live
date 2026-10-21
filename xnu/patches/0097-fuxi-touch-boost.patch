@@ -1,0 +1,519 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/fuxi_touch.c			standard
+ bsd/dev/fuxi_adreno.c			standard
++bsd/dev/fuxi_perf.c			standard
+ bsd/dev/fuxi_keys.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/fuxi_touch.c
++++ b/bsd/dev/fuxi_touch.c
+@@ -465,9 +465,11 @@
+ 	    ft.c_polls ? ft_us(ft.c_poll_sum) / ft.c_polls : 0ULL, ft_us(ft.c_poll_max));
+ }
+ 
++extern void fuxi_perf_input(void);
+ static void
+ ft_report(uint32_t mask)
+ {
++	fuxi_perf_input();
+ 	uint64_t now = mach_absolute_time();
+ 	if (mask && !ft.active) {
+ 		ft.c_start = now;
+--- a/bsd/dev/fuxi_keys.c
++++ b/bsd/dev/fuxi_keys.c
+@@ -27,6 +27,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_key(int key, int down);
++extern void fuxi_perf_input(void);
+ void fuxi_keys_init(void);
+ 
+ #define FK_CORE_PA     0x0c400000u
+@@ -254,6 +255,7 @@
+ 				state[k] = now[k];
+ 				printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
+ 				    state[k] ? "down" : "up", pon, gpio);
++				fuxi_perf_input();
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 			if (ok[k]) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,8 @@
+ #if defined(FUXI)
+ extern "C" {
+ #include "../../../bsd/dev/fuxi_adreno.h"
++void fuxi_perf_start(void);
++void fuxi_perf_swap(void);
+ }
+ #endif
+ 
+@@ -243,6 +245,7 @@
+ 
+ #if defined(FUXI)
+ 	fuxi_gpu_start(fPhys, fWidth, fHeight, fRowBytes);
++	fuxi_perf_start();
+ #endif
+ 	return true;
+ }
+@@ -395,6 +398,9 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++#if defined(FUXI)
++	fuxi_perf_swap();
++#endif
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fStatSwaps++;
+--- a/bsd/dev/fuxi_perf.c
++++ b/bsd/dev/fuxi_perf.c
+@@ -0,0 +1,409 @@
++/* Opt-in touch boost for SM8550. One thread-call owns all EPSS/TSENS MMIO.
++ * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
++ * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#define MACH_KERNEL_PRIVATE 1
++#include <kern/thread_call.h>
++#undef MACH_KERNEL_PRIVATE
++#include "fuxi_perf_logic.h"
++/* Same abort-contained access primitive as the built-in GPU driver; available
++ * even when fuxigpu=0. Each register access is naturally aligned. */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
++static uintptr_t fp_epss[3], fp_tsens[2];
++static const uint64_t fp_epss_pa[3] = {0x17d91000,0x17d92000,0x17d93000};
++static const uint64_t fp_tsens_pa[2] = {0xc271000,0xc272000};
++static const char * const fp_domain[3] = {"silver","gold","prime"};
++static const unsigned fp_cores[3] = {3,4,1};
++static const unsigned fp_cool_cap[3] = {1228800,1401600,1363200};
++static const unsigned fp_high_cap[3] = {1228800,2400000,2400000};
++static unsigned fp_cool[3], fp_high[3], fp_cool_khz[3], fp_high_khz[3];
++static unsigned fp_percore[3], fp_domain_failed[3], fp_applied[3], fp_applied_valid[3];
++static uint64_t fp_retry_interval, fp_retry_at, fp_retry_end;
++static unsigned fp_attempted, fp_retries;
++static struct {
++ const char *step;
++ unsigned domain, offset;
++ uint64_t pa;
++ uint32_t value;
++ int access, row;
++} fp_diagnostic;
++static uint64_t fp_input, fp_swap, fp_hold, fp_last, fp_window, fp_window_start;
++static uint64_t fp_boost_time, fp_boosts;
++static int fp_max_temp, fp_boosted;
++/* Temperatures are deci-Celsius, rise is dC/second. Only this worker owns
++ * history and votes. The 68 C ceiling can be lowered, never raised. */
++static unsigned fp_hot = 620, fp_limit = 680, fp_resume = 580;
++static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200;
++static uint64_t fp_budget, fp_duty_window, fp_recovery;
++static uint64_t fp_recover_since, fp_above_time, fp_cuts, fp_active_start;
++static uint64_t fp_duty_begin[16], fp_duty_end[16];
++static unsigned fp_duty_count;
++static int fp_prev_temp, fp_prev_valid, fp_blocked;
++static uint64_t fp_rate_elapsed;
++static int fp_rate_temp, fp_rate_valid, fp_rate;
++static unsigned fp_enabled, fp_started, fp_ready;
++static thread_call_data_t fp_call;
++static int fp_read(uintptr_t base, unsigned off, uint32_t *value)
++{
++ uint64_t v = 0;
++ if (fuxi_gpu_access(base+off, &v, 0, 0)) return 0;
++ *value = (uint32_t)v;
++ return 1;
++}
++static int fp_vote(unsigned d, unsigned level)
++{
++ for (unsigned c = 0; c < (fp_percore[d] ? fp_cores[d] : 1); c++) {
++  /* Power may disappear between samples or per-core votes. Never write a
++   * domain after an unsuccessful/clear enable read; latch it to cool. */
++  uint32_t enable;
++  if (!fp_read(fp_epss[d],0,&enable) || !(enable & 1)) {
++   fp_domain_failed[d] = 1;
++   return 0;
++  }
++  if (fp_domain_failed[d]) level = fp_cool[d];
++  uint64_t v = level;
++  unsigned off = 0x320+4*c;
++  if (fuxi_gpu_access(fp_epss[d]+off, &v, 1, 0)) return 0;
++  uint32_t got;
++  if (!fp_read(fp_epss[d], off, &got) || got != level) return 0;
++ }
++ return 1;
++}
++/* CPU sensors: tsens0 cpuss-0..3 and cpu-1-0..10 (1..15),
++ * tsens1 cpu-0-0..2 (1..3). Exclude aoss and non-CPU sensors.
++ * Loader/host indices are zero-based: STATUS(s) is TM+0xa0+4*s.
++ * Linux tsens-v2 uses per-sensor VALID, not a TM_TRDY bit-0 gate.
++ * Count only valid, plausible sensors in this sample. At least 75%
++ * (14 of 18) must be valid; never reuse an older temperature. */
++static int fp_temperature(int *hottest)
++{
++ int hottest_cpu = -400;
++ unsigned valid = 0;
++ for (unsigned d = 0; d < 2; d++) {
++  for (unsigned n = 1; n <= (d ? 3 : 15); n++) {
++   uint32_t status;
++   if (!fp_read(fp_tsens[d], 0xa0+4*n, &status) || !(status & (1u<<21))) continue;
++   int temp = (int)(status & 0xfff);
++   if (temp & 0x800) temp -= 4096;
++   if (temp < -400 || temp > 1500) continue;
++   valid++;
++   if (temp > hottest_cpu) hottest_cpu = temp;
++  }
++ }
++ if (valid*4 < 18*3) return 0;
++ *hottest = hottest_cpu;
++ return 1;
++}
++/* ml_io_map/io_map return VA + the PA's kernel-page offset. Do not add it
++ * again: EPSS shares one 16K physical page, as do the TSENS TM windows.
++ * A failed read leaves UINT32_MAX as a sentinel, distinguished by access=0. */
++static int fp_init_fail(const char *step, unsigned d, uint64_t pa,
++    unsigned off, uint32_t value, int access, int row)
++{
++ fp_diagnostic.step = step;
++ fp_diagnostic.domain = d;
++ fp_diagnostic.pa = pa;
++ fp_diagnostic.offset = off;
++ fp_diagnostic.value = value;
++ fp_diagnostic.access = access;
++ fp_diagnostic.row = row;
++ return 0;
++}
++static void fp_init_report(const char *outcome)
++{
++ unsigned d = fp_diagnostic.domain;
++ printf("FUXI PERF: %s after %u retries, step=%s domain=%s(%u) PA=%#llx offset=%#x value=%#x access=%d row=%d\n",
++     outcome,fp_retries,fp_diagnostic.step,
++     fp_diagnostic.step[0] == 't' ? "tsens" : fp_domain[d],d,
++     fp_diagnostic.pa,fp_diagnostic.offset,fp_diagnostic.value,
++     fp_diagnostic.access,fp_diagnostic.row);
++}
++static int fp_initialize(void)
++{
++ unsigned percore[3], cool_level[3], high_level[3], cool_freq[3], high_freq[3];
++ for (unsigned d = 0; d < 3; d++) {
++  if (!fp_epss[d]) fp_epss[d] = ml_io_map(fp_epss_pa[d], 0x1000);
++  if (!fp_epss[d]) return fp_init_fail("map",d,fp_epss_pa[d],0,0,0,-1);
++  uint32_t enable = UINT32_MAX, dcvs = UINT32_MAX, rows[40];
++  int access = fp_read(fp_epss[d],0,&enable);
++  if (!access || !(enable & 1))
++   return fp_init_fail("enable",d,fp_epss_pa[d],0,enable,access,-1);
++  access = fp_read(fp_epss[d],0xb0,&dcvs);
++  if (!access) return fp_init_fail("dcvs",d,fp_epss_pa[d],0xb0,dcvs,0,-1);
++  percore[d] = dcvs & 1;
++  /* Read the terminator, but never touch the remaining unused slots. A
++   * protected tail must not disable an otherwise usable frequency table. */
++  unsigned count;
++  for (count = 0; count < 40; count++) {
++   unsigned off = 0x100+4*count;
++   rows[count] = UINT32_MAX;
++   if (!fp_read(fp_epss[d],off,&rows[count]))
++    return fp_init_fail("LUT",d,fp_epss_pa[d],off,rows[count],0,(int)count);
++   if (count && fp_khz(rows[count]) == fp_khz(rows[count-1])) break;
++  }
++  unsigned cool_khz, high_khz;
++  int cool = fp_level(rows,count,fp_cool_cap[d],&cool_khz);
++  /* Cap boost at 2.4 GHz using eligible multi-core LUT rows.
++   * Hardware owns CPR/LMh.
++   * Silver stays cool: raising its shared rail also raises the monitor core. */
++  int high = fp_level(rows,count,fp_high_cap[d],&high_khz);
++  if (cool < 0 || high < 0)
++   return fp_init_fail("level selection",d,fp_epss_pa[d],0x100+4*(count-1),rows[count-1],1,(int)count-1);
++  cool_level[d] = (unsigned)cool;
++  high_level[d] = d ? (unsigned)high : (unsigned)cool;
++  cool_freq[d] = cool_khz;
++  high_freq[d] = d ? high_khz : cool_khz;
++ }
++ for (unsigned d = 0; d < 2; d++) {
++  if (!fp_tsens[d]) fp_tsens[d] = ml_io_map(fp_tsens_pa[d],0x1000);
++  if (!fp_tsens[d]) return fp_init_fail("tsens map",d,fp_tsens_pa[d],0,0,0,-1);
++ }
++ /* Commit policy only when every domain and sensor mapping passed. Failed
++  * attempts are read-only, including domains discovered on earlier tries. */
++ for (unsigned d = 0; d < 3; d++) {
++  fp_percore[d] = percore[d];
++  fp_cool[d] = cool_level[d]; fp_high[d] = high_level[d];
++  fp_cool_khz[d] = cool_freq[d]; fp_high_khz[d] = high_freq[d];
++ }
++ return 1;
++}
++/* Timestamp gate also applies to input-triggered calls, so input cannot
++ * accelerate retries or extend the fixed 60-second initialization window. */
++static int fp_try_initialize(uint64_t now)
++{
++ if (fp_attempted && now < fp_retry_at) return 0;
++ if (fp_attempted && now > fp_retry_end) goto disabled;
++ if (fp_attempted) fp_retries++;
++ else fp_retry_end = now + 60*fp_retry_interval;
++ if (fp_initialize()) {
++  fp_ready = 1;
++  printf("FUXI PERF: ready, LUT cool %u/%u/%u kHz high %u/%u/%u kHz, hold 1500 ms after %u retries\n",
++      fp_cool_khz[0],fp_cool_khz[1],fp_cool_khz[2],fp_high_khz[0],fp_high_khz[1],fp_high_khz[2],fp_retries);
++  return 1;
++ }
++ if (!fp_attempted) fp_init_report("init retry");
++ fp_attempted = 1;
++ if (now >= fp_retry_end || fp_retries == 60) goto disabled;
++ fp_retry_at = now + fp_retry_interval;
++ if (fp_retry_at > fp_retry_end) fp_retry_at = fp_retry_end;
++ return 0;
++disabled:
++ fp_init_report("disabled");
++ __atomic_store_n(&fp_enabled,0,__ATOMIC_RELEASE);
++ return 0;
++}
++static void fp_update_votes(int boost)
++{
++ for (unsigned d = 0; d < 3; d++) {
++  unsigned failed = fp_domain_failed[d];
++  uint32_t enable;
++  /* Check even if the desired vote did not change. A recovered domain may
++   * receive cool, but never resumes boost during this boot. */
++  if (!fp_read(fp_epss[d],0,&enable) || !(enable & 1)) {
++   fp_domain_failed[d] = 1;
++   fp_applied_valid[d] = 0;
++  } else {
++   unsigned level = boost && !failed ? fp_high[d] : fp_cool[d];
++   if (!fp_applied_valid[d] || fp_applied[d] != level) {
++    if (fp_vote(d,level)) {
++     fp_applied[d] = fp_domain_failed[d] ? fp_cool[d] : level;
++     fp_applied_valid[d] = 1;
++    } else {
++     fp_domain_failed[d] = 1;
++     fp_applied_valid[d] = 0;
++     /* A write/readback error may have left a high vote. fp_vote rechecks
++      * enable before each attempted cool write, including this fallback. */
++     (void)fp_vote(d,fp_cool[d]);
++    }
++   }
++  }
++  if (!failed && fp_domain_failed[d])
++   printf("FUXI PERF: domain=%s(%u) enable/vote failed, boosting disabled for domain, cool when enabled\n",fp_domain[d],d);
++ }
++}
++/* Exact rolling-window accounting, including a partially expired burst.
++ * Retain completed intervals, not samples: frequent input cannot exhaust the
++ * history. If all slots are occupied, deny entry until one expires. */
++static uint64_t fp_duty_used(uint64_t now)
++{
++ uint64_t edge = now > fp_duty_window ? now-fp_duty_window : 0;
++ unsigned keep = 0;
++ uint64_t used = 0;
++ for (unsigned i = 0; i < fp_duty_count; i++) {
++  if (fp_duty_end[i] <= edge) continue;
++  fp_duty_begin[keep] = fp_duty_begin[i];
++  fp_duty_end[keep] = fp_duty_end[i];
++  uint64_t begin = fp_duty_begin[i] > edge ? fp_duty_begin[i] : edge;
++  used += fp_duty_end[i]-begin;
++  keep++;
++ }
++ fp_duty_count = keep;
++ if (fp_boosted) {
++  uint64_t begin = fp_active_start > edge ? fp_active_start : edge;
++  used += now-begin;
++ }
++ return used;
++}
++static int fp_thermal_guard(int valid, int temp, uint64_t now, uint64_t elapsed_ns)
++{
++ /* Aggregate at least one fast period before updating slope. Touch callbacks
++  * can arrive much sooner than a TSENS conversion; differentiating each one
++  * would turn a quantized sensor update into a false extreme rise rate. */
++ if (!valid) {
++  fp_rate_valid = fp_rate = 0;
++  fp_rate_elapsed = 0;
++ } else if (!fp_rate_valid) {
++  fp_rate_temp = temp;
++  fp_rate_elapsed = 0;
++  fp_rate_valid = 1;
++  fp_rate = 0;
++ } else {
++  fp_rate_elapsed += elapsed_ns;
++  if (fp_rate_elapsed >= (uint64_t)fp_fast_ms*NSEC_PER_MSEC) {
++   uint64_t slope = temp > fp_rate_temp ?
++       (uint64_t)(temp-fp_rate_temp)*NSEC_PER_SEC/fp_rate_elapsed : 0;
++   fp_rate = slope > 1000000 ? 1000000 : (int)slope;
++   fp_rate_temp = temp;
++   fp_rate_elapsed = 0;
++  }
++ }
++ int rate = fp_rate;
++ /* Predict 100 ms ahead to cover timer/thermal lag. A fast rise above
++  * 55 C also cuts before reaching the soft threshold. Invalid quorum
++  * latches cool; no derivative is taken across a missing sample. */
++ int trip = !valid || temp >= (int)fp_hot || temp >= (int)fp_limit ||
++     (valid && temp+rate/10 >= (int)fp_limit) ||
++     (valid && temp >= (int)fp_hot-70 && rate >= (int)fp_rise);
++ if (trip) {
++  fp_blocked = 1;
++  fp_recover_since = 0;
++ } else if (fp_blocked) {
++  if (temp <= (int)fp_resume && rate < (int)fp_rise) {
++   if (!fp_recover_since) fp_recover_since = now;
++   if (now-fp_recover_since >= fp_recovery) fp_blocked = 0;
++  } else fp_recover_since = 0;
++ }
++ fp_prev_temp = temp;
++ fp_prev_valid = valid;
++ return !fp_blocked;
++}
++/* Reject out-of-range boot args rather than wrapping or disabling a guard. */
++static void fp_arg(const char *name, unsigned *value, unsigned low, unsigned high)
++{
++ unsigned candidate = *value;
++ if (PE_parse_boot_argn(name,&candidate,sizeof(candidate)) &&
++     candidate >= low && candidate <= high) *value = candidate;
++}
++static void fp_configure(void)
++{
++ fp_arg("fuxiperflimit",&fp_limit,450,680);
++ fp_arg("fuxiperfhot",&fp_hot,400,fp_limit);
++ if (fp_hot > fp_limit) fp_hot = fp_limit;
++ fp_arg("fuxiperfresume",&fp_resume,350,fp_hot-10);
++ if (fp_resume > fp_hot-10) fp_resume = fp_hot-10;
++ fp_arg("fuxiperfrise",&fp_rise,10,1000);
++ fp_arg("fuxiperffast",&fp_fast_ms,5,25);
++ fp_arg("fuxiperfbudget",&fp_budget_ms,20,500);
++ nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
++ nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
++ nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
++ printf("FUXI PERF: thermal hot %u limit %u resume %u dC rise %u dC/s fast %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
++     fp_hot,fp_limit,fp_resume,fp_rise,fp_fast_ms,fp_budget_ms);
++}
++static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
++{
++ (void)arg; (void)result;
++ if (!__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) return;
++ if (!fp_ready) {
++  if (!fp_try_initialize(mach_absolute_time())) {
++   if (__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE))
++    (void)thread_call_enter_delayed(&fp_call,fp_retry_at);
++   return;
++  }
++ }
++ uint64_t now = mach_absolute_time();
++ uint64_t elapsed = fp_last ? now-fp_last : 0, elapsed_ns;
++ absolutetime_to_nanoseconds(elapsed,&elapsed_ns);
++ if (fp_boosted) fp_boost_time += elapsed;
++ int temp = -400;
++ int valid = fp_temperature(&temp);
++ if (valid && temp > fp_max_temp) fp_max_temp = temp;
++ /* Charge a threshold-crossing interval conservatively to either endpoint.
++  * This is sampled exposure, not an interpolated sensor measurement. */
++ if ((valid && temp >= (int)fp_hot) ||
++     (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
++ int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
++ uint64_t used = fp_duty_used(now);
++ int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
++ int boost = safe && duty_ok && fp_want_boost(fp_boosted,valid,temp,now,
++     __atomic_load_n(&fp_input,__ATOMIC_ACQUIRE),
++     __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE),fp_hold);
++ /* First sample also establishes cool votes. No boost without fresh TSENS. */
++ fp_update_votes(boost);
++ if (boost && !fp_boosted) {
++  fp_boosts++;
++  fp_active_start = now;
++ }
++ if (!boost && fp_boosted) {
++  if (!safe || !duty_ok) fp_cuts++;
++  /* Entry reserves a slot; completed history is never silently discarded. */
++  fp_duty_begin[fp_duty_count] = fp_active_start;
++  fp_duty_end[fp_duty_count++] = now;
++ }
++ fp_boosted = boost;
++ fp_last = now;
++ if (!fp_window_start) fp_window_start = now;
++ if (now-fp_window_start >= fp_window) {
++  uint64_t ns, above_ns;
++  absolutetime_to_nanoseconds(fp_boost_time,&ns);
++  absolutetime_to_nanoseconds(fp_above_time,&above_ns);
++  printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s\n",
++      fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
++      valid,fp_boosted ? "high" : "cool");
++  fp_boosts = fp_boost_time = fp_above_time = fp_cuts = 0;
++  fp_max_temp = -400;
++  fp_window_start = now;
++ }
++ uint64_t deadline;
++ clock_interval_to_deadline(fp_boosted || fp_blocked ? fp_fast_ms : 100,
++     NSEC_PER_MSEC,&deadline);
++ /* Do not overrun a fractional remaining duty budget by a full sample. */
++ if (fp_boosted && fp_budget-used < deadline-now) deadline = now+fp_budget-used;
++ (void)thread_call_enter_delayed(&fp_call,deadline);
++}
++void fuxi_perf_start(void)
++{
++ unsigned enable = 0;
++ (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
++ if (enable != 1 || fp_started) return;
++ fp_started = 1;
++ fp_configure();
++ nanoseconds_to_absolutetime(1500ULL*NSEC_PER_MSEC,&fp_hold);
++ nanoseconds_to_absolutetime(10ULL*NSEC_PER_SEC,&fp_window);
++ nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_retry_interval);
++ fp_max_temp = -400;
++ thread_call_setup_with_options(&fp_call,fp_worker,NULL,
++     THREAD_CALL_PRIORITY_KERNEL,THREAD_CALL_OPTIONS_ONCE);
++ __atomic_store_n(&fp_enabled,1,__ATOMIC_RELEASE);
++ (void)thread_call_enter(&fp_call);
++}
++void fuxi_perf_input(void)
++{
++ if (!__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) return;
++ __atomic_store_n(&fp_input,mach_absolute_time(),__ATOMIC_RELEASE);
++ (void)thread_call_enter(&fp_call);
++}
++void fuxi_perf_swap(void)
++{
++ if (__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE))
++  __atomic_store_n(&fp_swap,mach_absolute_time(),__ATOMIC_RELEASE);
++}
++#endif
+--- a/bsd/dev/fuxi_perf_logic.h
++++ b/bsd/dev/fuxi_perf_logic.h
+@@ -0,0 +1,33 @@
++/* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
++#ifndef FUXI_PERF_LOGIC_H
++#define FUXI_PERF_LOGIC_H
++static unsigned fp_khz(uint32_t row)
++{
++ return row >> 30 ? (row & 255u)*19200u : 300000u;
++}
++/* Exclude one-core turbo rows. Duplicate frequencies terminate the table.
++ * Pick the fastest eligible row at/below cap; never infer level ordering. */
++static int fp_level(const uint32_t *rows, unsigned count, unsigned cap, unsigned *khz)
++{
++ int best = -1;
++ unsigned freq = 0, prev = 0;
++ for (unsigned i = 0; i < count; i++) {
++  unsigned f = fp_khz(rows[i]);
++  if (i && f == prev) break;
++  prev = f;
++  if (((rows[i] >> 16) & 7u) == 1 || !f || f > cap) continue;
++  if (best < 0 || f > freq) { best = i; freq = f; }
++ }
++ *khz = freq;
++ return best;
++}
++static int fp_want_boost(int boosted, int valid, int temp,
++    uint64_t now, uint64_t input, uint64_t swap, uint64_t hold)
++{
++ if (!valid || temp > 680 || (!boosted && temp > 600)) return 0;
++ int recent_input = input && now >= input && now-input <= hold;
++ uint64_t activity = input > swap ? input : swap;
++ int recent_activity = activity && now >= activity && now-activity <= hold;
++ return recent_activity && (boosted || recent_input);
++}
++#endif

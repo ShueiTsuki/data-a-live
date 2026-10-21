@@ -1,0 +1,67 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..c8f0b6d 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,11 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
++/* Native 4 KiB: two roots plus up to seven L2 pages per 6 GiB mapping.
++ * The physical and virtual bases may each straddle an extra 1 GiB region.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+index 19eb823..9597da7 100644
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -249,6 +249,7 @@ main(int     argc,
+ 
+ 
+ 	DECLARE("PGBYTES", ARM_PGBYTES);
++	DECLARE("BOOTSTRAP_TABLE_BYTES", BOOTSTRAP_TABLE_SIZE);
+ 	DECLARE("PGSHIFT", ARM_PGSHIFT);
+ 
+ 	DECLARE("VM_MIN_KERNEL_ADDRESS", VM_MIN_KERNEL_ADDRESS);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index ee48e68..a6f5d86 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -472,6 +472,10 @@ start_cpu:
+ 
+ 	/* allocate an L2 table */
+ 3:	add	$4, $4, PGBYTES
++	/* Refuse before a new table can overwrite adjacent kernel globals. */
++	add $6, x25, #(BOOTSTRAP_TABLE_BYTES >> 12), lsl #12
++	cmp $4, $6
++	b.hs Lbootstrap_tables_exhausted
+ 
+ 	/* create_l1_table_entry(virt_base, L1 table, L2 table, scratch1, scratch2, scratch3) */
+ 	create_l1_table_entry	$0, $3, $4, $6, $7, $8
+@@ -601,8 +605,8 @@ Lsweet_mark_pixel:
+ 	// Invalidate all entries in the bootstrap page tables
+ 	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
+ 	mov		x1, x25								// Start at V=P pagetable root
+-	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
+-	lsl		x2, x2, #2							// Shift by 2 for num entries on 4 pages
++	mov		x2, #(BOOTSTRAP_TABLE_BYTES / ARM_PGBYTES)
++	lsl		x2, x2, #(ARM_PGSHIFT - TTE_SHIFT) // Clear the whole reserved pool
+ 
+ Linvalidate_bootstrap:							// do {
+ 	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
+@@ -703,6 +707,12 @@ Lkernelcache_base_found:
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
++	b Lbootstrap_tables_ready
++Lbootstrap_tables_exhausted:
++	// MMU is still off. Stop with the offending cursor/end preserved for
++	// the early debugger rather than corrupting memory or forging a map.
++	b Lbootstrap_tables_exhausted
++Lbootstrap_tables_ready:
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 

@@ -1,0 +1,31 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -149,8 +149,10 @@
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ #if defined(FUXI)
+-    /* This bring-up target can issue only TEST UNIT READY and READ(10). */
+-    if (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28)) return EROFS;
++    /* Also permit only the exact device-WLUN ACTIVE power command used by Linux. */
++    bool active_power=!write && len==0 && cdb_len==6 && su.lun==0xd0 &&
++        cdb[0]==0x1b && cdb[1]==0 && cdb[2]==0 && cdb[3]==0 && cdb[4]==0x10 && cdb[5]==0;
++    if (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power)) return EROFS;
+ #endif
+ 
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+@@ -667,6 +669,15 @@
+         ufs_rd(REG_CAP),ufs_rd(REG_HCS),ufs_rd(REG_HCE),su.dma_pa);
+ #endif
+     error = ufs_take_over_host();
++#if defined(FUXI)
++    if (!error) {
++        static const uint8_t active[6]={0x1b,0,0,0,0x10,0};
++        su.lun=0xd0; /* UFS device well-known LUN, not a block-data LUN. */
++        for (int i=0;i<3 && (error=ufs_scsi(active,sizeof(active),0,false));i++) { }
++        su.lun=0;
++        printf("FUXI UFS device ACTIVE power command result=%d\n",error);
++    }
++#endif
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */

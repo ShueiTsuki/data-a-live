@@ -1,0 +1,200 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -114,6 +114,99 @@
+ 	bool ready;
+ } su;
+ 
++#if defined(FUXI)
++/*
++ * Fuxi root lives in one pinned, preallocated file inside Android's f2fs
++ * userdata (the user allowed only that file's blocks). ADT /chosen
++ * "fuxi-root-extents" lists it as u64 triples {file block, partition block,
++ * blocks} (4 KiB units, partition-relative) and "fuxi-root-blocks" is the
++ * root size. ufsroot0 is the file's contents; no I/O leaves its extents.
++ */
++#define FX_MAX_EXTENTS 512
++static struct { uint64_t file, part, count; } fx_ext[FX_MAX_EXTENTS];
++static unsigned fx_next;
++static bool fx_root;                    /* extent table loaded and validated */
++static uint64_t fx_part_first, fx_part_blocks;
++
++/* Device LBA of root block lblk; *run = blocks left in that extent. */
++static bool
++fx_map(uint64_t lblk, uint64_t *lba, uint64_t *run)
++{
++	for (unsigned i = 0; i < fx_next; i++) {
++		if (lblk >= fx_ext[i].file && lblk - fx_ext[i].file < fx_ext[i].count) {
++			uint64_t off = lblk - fx_ext[i].file;
++			*lba = fx_part_first + fx_ext[i].part + off;
++			*run = fx_ext[i].count - off;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* True only if device blocks [lba, lba+count) lie inside a single extent. */
++static bool
++fx_write_allowed(uint64_t lba, uint64_t count)
++{
++	if (!fx_root || count == 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < fx_next; i++) {
++		uint64_t first = fx_part_first + fx_ext[i].part;
++		if (lba >= first && lba - first < fx_ext[i].count &&
++		    count <= fx_ext[i].count - (lba - first)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Load and validate the extent table against the userdata partition bounds. */
++static int
++fx_load_extents(void)
++{
++	DTEntry chosen;
++	uint64_t const *ext = NULL, *blocks = NULL;
++	unsigned int size = 0, bsize = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "fuxi-root-extents", (void const **)&ext, &size) != kSuccess ||
++	    SecureDTGetProperty(chosen, "fuxi-root-blocks", (void const **)&blocks, &bsize) != kSuccess ||
++	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t)) ||
++	    size / (3 * sizeof(uint64_t)) > FX_MAX_EXTENTS) {
++		printf("FUXI UFS: no valid fuxi-root-extents in /chosen\n");
++		return ENXIO;
++	}
++	unsigned n = size / (3 * sizeof(uint64_t));
++	uint64_t want = *blocks, pos = 0;
++	for (unsigned i = 0; i < n && pos < want; i++) {
++		uint64_t file = ext[3 * i], part = ext[3 * i + 1], count = ext[3 * i + 2];
++		if (file != pos || count == 0 || part >= fx_part_blocks ||
++		    count > fx_part_blocks - part) {
++			printf("FUXI UFS: bad extent %u\n", i);
++			return EINVAL;
++		}
++		count = MIN(count, want - pos);
++		for (unsigned j = 0; j < fx_next; j++) {
++			if (part < fx_ext[j].part + fx_ext[j].count && fx_ext[j].part < part + count) {
++				printf("FUXI UFS: overlapping extents %u/%u\n", j, i);
++				return EINVAL;
++			}
++		}
++		fx_ext[fx_next].file = file;
++		fx_ext[fx_next].part = part;
++		fx_ext[fx_next].count = count;
++		fx_next++;
++		pos += count;
++	}
++	if (pos != want) {
++		printf("FUXI UFS: extents cover 0x%llx of 0x%llx blocks\n", pos, want);
++		fx_next = 0;
++		return EINVAL;
++	}
++	fx_root = true;
++	return 0;
++}
++#endif
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -152,7 +245,13 @@
+     /* Also permit only the exact device-WLUN ACTIVE power command used by Linux. */
+     bool active_power=!write && len==0 && cdb_len==6 && su.lun==0xd0 &&
+         cdb[0]==0x1b && cdb[1]==0 && cdb[2]==0 && cdb[3]==0 && cdb[4]==0x10 && cdb[5]==0;
+-    if (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power)) return EROFS;
++    bool root_write=write && su.writable && su.lun==0 && cdb_len==10 && cdb[0]==0x2a &&
++        fx_write_allowed((uint64_t)cdb[2]<<24|cdb[3]<<16|cdb[4]<<8|cdb[5],
++            (uint64_t)cdb[7]<<8|cdb[8]) && len==((uint32_t)cdb[7]<<8|cdb[8])*UFS_BLOCK;
++    bool root_sync=!write && len==0 && su.writable && fx_root && su.lun==0 &&
++        cdb_len==10 && cdb[0]==0x35;
++    if (!root_write && !root_sync &&
++        (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power))) return EROFS;
+ #endif
+ 
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+@@ -292,9 +391,14 @@
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
++#if defined(FUXI)
++	if (!su.writable || !fx_write_allowed(lba, count) || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba + count - 1 > UINT32_MAX) {
++#else
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++#endif
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
+@@ -452,19 +556,33 @@
+ 		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		uint64_t dev_lba = su.first_block + lba;
++#if defined(FUXI)
++		if (fx_root) {
++			uint64_t run;
++			if (!fx_map(lba, &dev_lba, &run)) {
++				error = EIO;
++				break;
++			}
++			if (blocks > run) {
++				blocks = (uint32_t)run;
++				want = blocks * UFS_BLOCK - skip;
++			}
++		}
++#endif
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
++			error = ufs_read_blocks(dev_lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
++				error = ufs_read_blocks(dev_lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = ufs_write_blocks(dev_lba, blocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -641,7 +759,8 @@
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ #if defined(FUXI)
+-    rw=0; /* Immutable read-only policy for the first storage probe. */
++    /* Writes need the extent-mapped root on userdata (checked after the GPT read). */
++    if (strcmp(want, "userdata") != 0) rw=0;
+ #endif
+ 	uint32_t cache = 0, wait = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+@@ -687,6 +806,20 @@
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++#if defined(FUXI)
++	if (!error && strcmp(want, "userdata") == 0) {
++		fx_part_first = su.first_block;
++		fx_part_blocks = su.nblocks;
++		error = fx_load_extents();
++		if (!error) {
++			/* ufsroot0 is now the pinned file only. */
++			su.nblocks = fx_ext[fx_next - 1].file + fx_ext[fx_next - 1].count;
++			printf("FUXI UFS: root file in userdata: %u extents, %llu blocks\n",
++			    fx_next, su.nblocks);
++		}
++	}
++	if (!fx_root) rw=0;
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;

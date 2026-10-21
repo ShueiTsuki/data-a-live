@@ -1,0 +1,132 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -701,8 +701,17 @@
+ 	}
+ 	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
+ 	for (int i = 0; i < size; i++) {
+-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+-	}
++        uint64_t slot=(at+(uint64_t)i)%SWEET_LOG_SIZE;
++        sweet_log_ring[slot]=c[i];
++#if defined(FUXI)
++        /* Publish to the isolated native USB monitor, which cannot snoop XNU's cache. */
++        if (((uintptr_t)&sweet_log_ring[slot] & 63)==63 || slot==SWEET_LOG_SIZE-1 || i==size-1)
++            __asm__ volatile("dc cvac, %0" :: "r"(&sweet_log_ring[slot]) : "memory");
++#endif
++    }
++#if defined(FUXI)
++    __asm__ volatile("dc cvac, %0; dsb sy" :: "r"(&sweet_log_total) : "memory");
++#endif
+ }
+ 
+ /*
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,7 +490,11 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++#if defined(FUXI)
++#define DEBUG_BSDINIT 1
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -506,6 +506,14 @@
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
+ 
++#if defined(FUXI)
++	adrp x16, EXT(fuxi_early_status)@page
++	add x16, x16, EXT(fuxi_early_status)@pageoff
++	mov x17, #1
++	str x17, [x16]
++	dsb sy
++#endif
++
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+@@ -719,6 +727,14 @@
+  */
+ common_start:
+ 
++#if defined(FUXI)
++	adrp x16, EXT(fuxi_early_status)@page
++	add x16, x16, EXT(fuxi_early_status)@pageoff
++	mov x17, #2
++	str x17, [x16]
++	dsb sy
++#endif
++
+ #if HAS_NEX_PG
+ 	mov x19, lr
+ 	bl		EXT(set_nex_pg)
+@@ -833,10 +849,27 @@
+ #endif /* HAS_APPLE_PAC */
+ 
+ 	// Enable caches, MMU, ROP and JOP
++
++#if defined(FUXI)
++	adrp x16, EXT(fuxi_early_status)@page
++	add x16, x16, EXT(fuxi_early_status)@pageoff
++	mov x17, #3
++	str x17, [x16]
++	dsb sy
++#endif
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++#if defined(FUXI)
++	adrp x16, EXT(fuxi_early_status)@page
++	add x16, x16, EXT(fuxi_early_status)@pageoff
++	mov x17, #4
++	str x17, [x16]
++	dc cvac, x16
++	dsb sy
++#endif
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,6 +11,13 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
++#if defined(FUXI)
++/* Native cpu@100 reads this initialized-data record with its MMU/cache off. */
++struct fuxi_early_record { uint64_t stage; char text[120]; };
++volatile struct fuxi_early_record fuxi_early_status __attribute__((aligned(64))) = {
++ 0x4655584900000000ULL, "not entered"
++};
++#endif
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+@@ -95,6 +102,19 @@
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
++#if defined(FUXI)
++ fuxi_early_status.stage=0x10000u+stage;
++ unsigned int i=0;
++ while (label && label[i] && i<sizeof(fuxi_early_status.text)-1) {
++  fuxi_early_status.text[i]=label[i]; i++;
++ }
++ fuxi_early_status.text[i]=0;
++ for (uintptr_t p=(uintptr_t)&fuxi_early_status;
++      p<(uintptr_t)&fuxi_early_status+sizeof(fuxi_early_status); p+=64)
++  __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++ __asm__ volatile("dsb sy" ::: "memory");
++#endif
++
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}

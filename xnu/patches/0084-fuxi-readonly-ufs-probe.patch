@@ -1,0 +1,123 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -148,6 +148,11 @@
+ static int
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
++#if defined(FUXI)
++    /* This bring-up target can issue only TEST UNIT READY and READ(10). */
++    if (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28)) return EROFS;
++#endif
++
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+@@ -587,9 +592,23 @@
+ sweet_ufs_init(void)
+ {
+ #if defined(FUXI)
+-    /* No Fuxi UFS handoff/SMMU validation yet; first boots use RAM disk. */
+-    printf("FUXI UFS: disabled during RAM-only bring-up\n");
+-    return ENXIO;
++    uint32_t requested=0;
++    if (!PE_parse_boot_argn("fuxi_ufs_probe", &requested, sizeof(requested)) || requested!=1)
++        return ENXIO;
++    vm_offset_t gcc=ml_io_map(0x177000,0x1000);
++    if (!gcc) return ENOMEM;
++    volatile uint32_t *ahb=(volatile uint32_t *)(gcc+0x24);
++    uint32_t old=*ahb;
++    if (!(old&1) || !(*(volatile uint32_t *)(gcc+4)&0x80000000) ||
++        ((*(volatile uint32_t *)(gcc+0x18)|*(volatile uint32_t *)(gcc+0x68))&0x80000000)) {
++        printf("FUXI UFS: power/AXI/UniPro not ready\n"); return ENXIO;
++    }
++    *ahb=old&~2u; /* Disable only automatic AHB gating, verified by native probe-09. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint64_t deadline;
++    clock_interval_to_deadline(1,NSEC_PER_MSEC,&deadline);
++    while ((*ahb&0x80000000) && mach_absolute_time()<deadline) __asm__ volatile("yield");
++    if (*ahb&0x80000000) { *ahb=old; return ETIMEDOUT; }
+ #endif
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+@@ -597,7 +616,13 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++
++#if defined(FUXI)
++    const char *ufs_node="/fuxi-ufs";
++#else
++    const char *ufs_node="/sweet-ufs";
++#endif
++    if (SecureDTLookupEntry(NULL, ufs_node, &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+@@ -606,6 +631,9 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++#if defined(FUXI)
++    rw=0; /* Immutable read-only policy for the first storage probe. */
++#endif
+ 	uint32_t cache = 0, wait = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+@@ -627,7 +655,11 @@
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
++#if defined(FUXI)
++	printf("FUXI UFS diagnostic: CAP=0x%x HCS=0x%x HCE=0x%x DMA=0x%llx\n",
++        ufs_rd(REG_CAP),ufs_rd(REG_HCS),ufs_rd(REG_HCE),su.dma_pa);
++#endif
++    error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+@@ -659,15 +691,30 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++
++#if !defined(FUXI)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++#endif
+ 	return 0;
+ }
+ 
++#if defined(FUXI)
++void fuxi_storage_probe(void);
++void fuxi_storage_probe(void)
++{
++ uint32_t requested=0;
++ if (!PE_parse_boot_argn("fuxi_ufs_probe",&requested,sizeof(requested)) || requested!=1) return;
++ int error=sweet_ufs_init();
++ printf("FUXI UFS read-only probe result=%d\n",error);
++ if (!error) printf("FUXI UFS GPT bounds: first=0x%llx count=0x%llx (4K blocks)\n",su.first_block,su.nblocks);
++}
++#endif
++
+ /*
+  * Persistent console log ("sweetlog"). Filming the phone screen is the only
+  * other way to see the console, so every character that reaches the
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -803,6 +803,10 @@
+ 
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	bsd_autoconf();
++#if defined(FUXI)
++    extern void fuxi_storage_probe(void);
++    fuxi_storage_probe();
++#endif
+ 
+ #if CONFIG_DTRACE
+ 	dtrace_postinit();
