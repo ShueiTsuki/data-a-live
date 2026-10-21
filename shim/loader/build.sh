@@ -1,15 +1,16 @@
 #!/bin/bash
 # Build pandora-loader with the NDK's LLVM tools: out/Image and out/loader-boot.img.
-# Needs out/payload.bin from wsl/make_phone_payload.sh.
+# Needs out/payload.bin from wsl/make_phone_payload.sh. OUT=dir builds from dir/payload.bin instead.
 set -euo pipefail
 cd "$(dirname "$0")"
 T="D:/Android/ndk/27.2.12479018/toolchains/llvm/prebuilt/windows-x86_64/bin"
-out=out
+out=${OUT:-out}
+mkdir -p $out
 [ -f $out/payload.bin ] || { echo "missing $out/payload.bin (wsl/make_phone_payload.sh)" >&2; exit 1; }
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic
        -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror)
 "$T/clang.exe" "${flags[@]}" -c start.S -o $out/start.o
-"$T/clang.exe" "${flags[@]}" -c payload.S -o $out/payload.o
+"$T/clang.exe" "${flags[@]}" -DPAYLOAD=\"$out/payload.bin\" -c payload.S -o $out/payload.o
 "$T/clang.exe" "${flags[@]}" -c loader.c -o $out/loader.o
 # Loaded at an unknown address: refuse absolute relocations in C.
 if "$T/llvm-readelf.exe" -r $out/loader.o | grep -q R_AARCH64_ABS; then

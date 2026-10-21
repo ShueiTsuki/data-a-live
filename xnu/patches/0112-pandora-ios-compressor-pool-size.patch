@@ -1,0 +1,23 @@
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..bcfbe04 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,7 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++#if XNU_TARGET_OS_OSX && !defined(PANDORA)
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
+@@ -859,6 +859,9 @@ vm_compressor_set_size(void)
+ 	compressor_pool_multiplier = 1;
+ 
+ #else
++	/* iOS sizing; also PANDORA (macOS-platform build on the iOS 4K kernel VA layout):
++	 * the macOS pool of 8 x max_mem (40 GiB VA for 5 GiB RAM) plus the 24 GiB zone map
++	 * does not fit in the kernel VA and kmem_range_init panics. */
+ 
+ 	if (compressor_pool_max_size > max_mem) {
+ 		compressor_pool_max_size = max_mem;

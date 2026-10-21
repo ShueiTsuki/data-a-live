@@ -9,5 +9,6 @@
 *.tar
 *.log
 out/
+outq/
 __pycache__/
 /tools/pinfile/pinfile
