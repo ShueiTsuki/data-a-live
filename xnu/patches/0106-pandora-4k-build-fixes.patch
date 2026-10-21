@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/fuxi_adreno.c b/bsd/dev/fuxi_adreno.c
+index 167c29e..f49a7ec 100644
+--- a/bsd/dev/fuxi_adreno.c
++++ b/bsd/dev/fuxi_adreno.c
+@@ -222,7 +222,8 @@ _Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100
+ static uint64_t fg_generation[FG_CACHE_SLOTS];
+ /* One transient PFN list, serialized by the surface cache lock. Keep lookup
+  * and actual NC SMMU table stores in separate timing buckets. */
+-static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
++/* PAGE_SIZE is not a constant on 4K kernels; size for the smallest page. */
++static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_MIN_SIZE+1];
+ static volatile uint64_t *fg_l2(void)
+ {
+  volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(G3_PT,4096);
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index fd95b4d..87160bc 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10996,11 +10996,25 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+  */
+ 
+ #elif (ARM_PGSHIFT == 12)
++#if defined(XNU_PLATFORM_MacOSX)
++/**
++ * PANDORA: a 4K kernel built with the macOS platform layout (MACH_VM_MAX_ADDRESS
++ * 0x7FFFFE000000), a combination Apple never shipped. As on 16K macOS, the
++ * commpage then lies inside the userspace VA range and is protected by the
++ * "commpage nesting" reserved region (vm_reserved_regions[], 1 GiB at
++ * _COMM_PAGE64_NESTING_START). With 4K pages the nested table is one L1 entry,
++ * so the reservation must cover exactly that L1 block.
++ */
++static_assert(((_COMM_PAGE64_NESTING_START & ARM_TT_L1_OFFMASK) == 0) &&
++    (_COMM_PAGE64_NESTING_SIZE == ARM_TT_L1_SIZE) &&
++    ((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) == _COMM_PAGE64_NESTING_START));
++#else
+ /**
+  * Ensure that 64-bit devices using 4K pages can nest the commpage completely
+  * above the maximum userspace VA.
+  */
+ static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
++#endif
+ #else
+ #error Nested shared page mapping is unsupported on this config
+ #endif

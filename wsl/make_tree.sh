@@ -9,7 +9,7 @@ T=/opt/work/tree
 rm -rf $T /opt/work/pd && mkdir -p /opt/work/pd
 cp $D/patches/*.patch /opt/work/pd/
 for f in $P/*.patch $P/*.sh; do tr -d '\r' < $f > /opt/work/pd/$(basename $f); done
-[ -d /opt/work/xnu-8796 ] || git clone -q --depth 1 --branch xnu-8796.141.3 https://github.com/apple-oss-distributions/xnu.git /opt/work/xnu-8796
+[ -d /opt/work/xnu-8796 ] || git -c url."https://ghfast.top/https://github.com/".insteadOf=https://github.com/ clone -q --depth 1 --branch xnu-8796.141.3 https://github.com/apple-oss-distributions/xnu.git /opt/work/xnu-8796
 cp -r /opt/work/xnu-8796 $T
 cd $T
 c() { git add -A && git -c user.name=t -c user.email=t@t commit -qm "$1"; }
