@@ -27,6 +27,16 @@
 ### Linux [读到]
 主线 `drivers/gpu/drm/msm/adreno/` 有 `a8xx_gpu.c`、`a8xx_preempt.c`，`a6xx_catalog.c` 里有一条正好对应我们芯片的记录：`chip_ids = 0x44050a01`，`ADRENO_8XX_GEN2`，固件 `gen80200_sqe.fw / gen80200_gmu.bin / gen80200_aqe.fw`，GMEM 18 MiB，`max_slices = 3`，`gmu_chipid = 0x8020100`。这是 gen8 上电、GMU、HFI 的权威参考（Qualcomm 自己提交，Linux 6.19 起）。
 
+SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [读到，torvalds master]：
+- 时钟驱动 `drivers/clk/qcom/gpucc-kaanapali.c`、`gxclkctl-kaanapali.c`、`gcc-kaanapali.c`。
+- 设备树 `arch/arm64/boot/dts/qcom/kaanapali.dtsi`：
+  - GPU 节点 `gpu@3d00000`，`compatible = "qcom,adreno-44050a01"`，带 zap 节点；
+  - GMU 节点 `gmu@3d6c000`（长 `0x68000`，`qcom,adreno-gmu-840.1`），中断是 SPI 304（HFI）和 SPI 305（GMU）；要开的时钟是 GPUCC 的 AHB、CX_GMU、CXO、HUB_CX_INT；电源域是 `GPU_CC_CX_GDSC` 和 `GX_CLKCTL_GX_GDSC`；
+  - GX 时钟控制器 `gxclkctl@3d64000`，挂在 RPMh 的 `RPMHPD_GFX` 电压域上；GPU 时钟控制器 `gpucc@3d90000`；
+  - GPU 的 SMMU `iommu@3da0000` 是标准的 `arm,mmu-500`（`qcom,kaanapali-smmu-500`）。GPU 用流编号 0 和 1，GMU 用流编号 5。
+
+注意：安卓设备树里 GMU 写在 `0x3d37000`（`reg-names` 是 `gmu`、`gmu_ao_blk_dec0`），主线写在 `0x3d6c000`，两边对寄存器区域的划分不同，移植时要逐个核对偏移。主线这几段原文存在调研笔记 `kaanapali_gpu_dt.txt` 里。
+
 ### Mesa / Turnip（Vulkan）[读到]
 - Mesa 主线 `src/freedreno/common/freedreno_devices.py` 已有 `Adreno (TM) 840`（`chip_id=0xffff44050A31`，a8xx_gen2，6 个 CCU）。
 - Linux 会把有效分片数写进芯片编号：`0x44050a01` 报给用户态时变成 `0x44050a31`（a8xx_gpu.c）。我们的内核驱动报编号时要照做，否则 Mesa 认不出。
