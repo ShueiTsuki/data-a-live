@@ -1,0 +1,29 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index b1a72fa..7afb190 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -238,6 +238,9 @@ static const amfi_t sweet_amfi = {
+ 	},
+ };
+ 
++#include <mach-o/loader.h>
++#include <libkern/kernel_mach_header.h>
++
+ /* True when the built-in interface is the one in use (no original AMFI). */
+ static SECURITY_READ_ONLY_LATE(bool) sweet_amfi_builtin;
+ 
+@@ -245,9 +248,11 @@ __startup_func
+ static void
+ sweet_amfi_register(void)
+ {
+-	if (amfi != NULL) {
+-		/* The prelinked original AMFI registered first (PANDORA, tools/mkprelink.py). */
+-		printf("SWEET AMFI: original AMFI interface present; built-in not registered\n");
++	kernel_segment_command_t *prelink = getsegbyname("__PRELINK_TEXT");
++	if (amfi != NULL || (prelink != NULL && prelink->vmsize != 0)) {
++		/* Original kexts are prelinked (PANDORA, tools/mkprelink.py, always with AMFI):
++		 * the original AMFI registers the interface while the security extensions load. */
++		printf("SWEET AMFI: original AMFI prelinked; built-in not registered\n");
+ 		return;
+ 	}
+ 	sweet_amfi_builtin = true;

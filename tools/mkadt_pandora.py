@@ -16,7 +16,7 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
 """
-import hashlib, json, os, struct, sys
+import hashlib, json, os, struct, sys, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -124,6 +124,33 @@ def root_extent_props(path, root_bytes=None):
             ('fuxi-root-blocks', struct.pack('<Q', root_bytes // 4096))]
 
 
+def empty_nvram_proxy():
+    """/chosen properties for a fresh, RAM-only CHRP NVRAM bank with no controller.
+
+    With /options present, XNU's IODTNVRAM builds a CHRP handler from these and panics
+    "IONVRAMCHRPHandler creation failed" without them. Layout as in UniXNU's sheng ADT
+    (scripts/make-sheng-adt.py): an 8 KiB bank with the nvram, common and free partitions,
+    each header {u8 sig 0x70, u8 checksum, u16 length/16, char name[12]}, and the adler32
+    of the bank after byte 20 stored at byte 16.
+    """
+    def header(name, size):
+        raw = bytearray(struct.pack('<BBH12s', 0x70, 0, size // 16, name))
+        checksum = sum(raw)
+        while checksum > 255:
+            checksum = (checksum & 255) + (checksum >> 8)
+        raw[1] = checksum
+        return raw
+
+    image = bytearray(8192)
+    image[:16] = header(b'nvram', 32)
+    image[32:48] = header(b'common', 16 + 2048)
+    free_at = 32 + 16 + 2048
+    image[free_at:free_at + 16] = header(b'free', len(image) - free_at)
+    struct.pack_into('<I', image, 16, zlib.adler32(bytes(image[20:])))
+    return [('nvram-bank-size', u32(len(image))), ('nvram-bank-count', u32(1)),
+            ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
+
+
 def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
     """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
@@ -180,13 +207,27 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
         # certificate-security-mode above.
         ('mix-n-match-prevention-status', u32(0)),
         ('effective-security-mode-ap', u32(1)),
+        # Read by the original AMFI (prelinked), which panics "no amfi-only-platform-code
+        # device tree node!" / "no protected-data-access ..." without them. Values of the
+        # iPhone X device tree template: AMFI not limited to platform code (as on a retail
+        # iPhone), protected data accessible, no loadable trust caches.
+        ('amfi-only-platform-code', u32(0)),
+        ('protected-data-access', u32(1)),
+        ('amfi-allows-trust-cache-load', u32(0)),
+    ] + empty_nvram_proxy() + [
     ] + list(root_props), [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
         # The iOS shared cache is in no trust cache, so dyld can only map it
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
-        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))]),
+        # The original AppleImage4 panics "failed to get manifest properties" without this
+        # node (iBoot publishes the boot manifest's properties here), as in UniXNU's sheng
+        # ADT. iOS 16's AppleImage4 also reads BNCH, the 48-byte (SHA-384) boot nonce hash
+        # iBoot computes, and panics "failed to read boot nonce hash" without it. No Apple
+        # manifest is verified on this board; the hash is zero.
+        node('manifest-properties', [ph(), ('BNCH', bytes(48))])])
 
     # Eight Oryon cores in DT order with their real MPIDRs, described as one homogeneous
     # cluster like ios-sweet (no AMP code paths). cpus=N selects a prefix.
@@ -267,6 +308,10 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
     # as a plain plist instead of decrypting it with the effaceable key.
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+    # /options: where iBoot publishes NVRAM variables; empty here, as in the iPhone X device
+    # tree template. The original AppleImage4 reads NVRAM through it and panics
+    # "unexpected nvram read return: 19" (ENODEV) when the node is missing.
+    options = node('options', [ph()])
 
     # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
     # (D22AP: 2, no Home button; absent = 0 = Home-button device).
@@ -296,7 +341,7 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, options, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
