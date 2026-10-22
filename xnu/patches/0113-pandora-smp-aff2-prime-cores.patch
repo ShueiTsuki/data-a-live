@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index e727e22..1701d4d 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -74,15 +74,23 @@ SweetCPU::start(IOService *provider)
+ 		return false;
+ 	}
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
++#if defined(PANDORA)
++	/* SM8850: Aff2:Aff1 = 0:0-5 and 1:0-1, Aff0 always 0 */
++	if ((cpu->phys_id & ~0x00ffff00u) != 0 ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#else
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#endif
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	#if defined(FUXI)
++#if defined(PANDORA)
++	cpuName = OSSymbol::withCStringNoCopy("SM8850");
++#elif defined(FUXI)
+     cpuName = OSSymbol::withCStringNoCopy("SM8550");
+ #else
+     cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
+@@ -205,7 +213,7 @@ SweetCPU::initCPU(bool boot)
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+-	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
++	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..3ada50e 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1207,7 +1207,12 @@ ml_get_boot_cluster_type(void)
+ int
+ ml_get_cpu_number(uint32_t phys_id)
+ {
++#if defined(PANDORA)
++	/* SM8850 prime cores differ from cores 0/1 only in Aff2. */
++	phys_id &= MPIDR_AFF2_MASK | MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
++#else
+ 	phys_id &= MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
++#endif
+ 
+ 	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
+ 		if (topology_info.cpus[i].phys_id == phys_id) {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index a6f5d86..c4dac24 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -143,7 +143,9 @@ LEXT(reset_vector)
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER || defined(SWEET)
++#if defined(PANDORA)
++	and		x0, x15, #0xFFFFFF					// Aff2:Aff1:Aff0 (SM8850 prime cores: Aff2 = 1)
++#elif HAS_CLUSTER || defined(SWEET)
+ 	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..291d2dc 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -53,13 +53,19 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
++#if defined(PANDORA)
++	/* SM8850 prime cores differ from cores 0/1 only in Aff2. */
++#define PE_GICR_AFF_MASK (MPIDR_AFF2_MASK | MPIDR_AFF1_MASK | MPIDR_AFF0_MASK)
++#else
+ 	// We only care about aff1 and aff0
+-	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++#define PE_GICR_AFF_MASK (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK)
++#endif
++	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & PE_GICR_AFF_MASK;
+ 
+ 	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
+ 		vm_offset_t gicr_pe_base = gicr_base + offset;
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+-		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & PE_GICR_AFF_MASK;
+ 
+ 		if (phys_id == aff_value) {
+ 			return gicr_pe_base;
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index e28bdca..2701991 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -23,7 +23,10 @@
+  * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+  * clusters yet).
+  */
+-#if defined(FUXI)
++#if defined(PANDORA)
++/* SM8850: all eight Oryon cores, MPIDR 0x000-0x500 and 0x10000/0x10100 (Aff2 = 1). */
++#define SWEET_SMP_MAX_CPUS         8
++#elif defined(FUXI)
+ /* Seven of the eight cores: cpu@100 (MPIDR 0x100) keeps running the loader's
+  * USB monitor and is not in the ADT. cpus=N is clamped here. */
+ #define SWEET_SMP_MAX_CPUS         7
