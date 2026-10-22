@@ -1,0 +1,43 @@
+/*
+ * The 17 Pro bootloader hands over with the UniPro link in HIBERN8 (all M-PHY TX/RX FSMs
+ * = 1) and auto-hibernate off (AHIT = 0), so a request never leaves the host: probe of
+ * 2026-10-22, device/DT_FINDINGS.md. Wake it the way Linux does
+ * (ufshcd_uic_hibern8_exit -> ufshcd_uic_pwr_ctrl): DME_HIBERNATE_EXIT, wait for the UIC
+ * command completion (IS.UCCS, result in ARG2) and then for IS.UHXS, and require
+ * HCS.UPMCRS = PWR_LOCAL. Link layer only: no UFS command, no data.
+ */
+#define PU_IS_UHXS      (1u << 5)
+
+static int
+pandora_h8_exit(void)
+{
+	if (!(ufs_rd(REG_HCS) & PU_HCS_UCRDY)) {
+		return EBUSY;
+	}
+	ufs_wr(REG_IS, PU_IS_UCCS | PU_IS_UHXS);
+	ufs_wr(PU_REG_UICCMD + 4, 0);
+	ufs_wr(PU_REG_UICCMD + 8, 0);
+	ufs_wr(PU_REG_UICCMD + 12, 0);
+	ufs_wr(PU_REG_UICCMD, 0x18);                    /* DME_HIBERNATE_EXIT */
+	for (int i = 0; i < 100000 && !(ufs_rd(REG_IS) & PU_IS_UCCS); i++) {
+		delay(1);
+	}
+	if (!(ufs_rd(REG_IS) & PU_IS_UCCS)) {
+		return ETIMEDOUT;
+	}
+	uint32_t rc = ufs_rd(PU_REG_UICCMD + 8) & 0xff;
+	ufs_wr(REG_IS, PU_IS_UCCS);
+	if (rc) {
+		return (int)(0x100 | rc);
+	}
+	for (int i = 0; i < 500000 && !(ufs_rd(REG_IS) & PU_IS_UHXS); i++) {
+		delay(1);
+	}
+	if (!(ufs_rd(REG_IS) & PU_IS_UHXS)) {
+		return (int)(0x300 | ETIMEDOUT);
+	}
+	ufs_wr(REG_IS, PU_IS_UHXS);
+	uint32_t upmcrs = (ufs_rd(REG_HCS) >> 8) & 7;
+	return upmcrs == 1 ? 0 : (int)(0x200 | upmcrs);
+}
+

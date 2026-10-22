@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2a9ef23..5eadbaa 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1004,7 +1004,7 @@ pandora_ufs_link(const char *when)
+  * no data), then DBR/CNR/IS sampled at 1 ms, 10 ms, 100 ms, 1 s and 5 s. No UTRLCLR:
+  * the slot is left as the host has it, so CNR shows what the host itself did.
+  */
+-static int
++static int __unused
+ pandora_ufs_tur_sampled(void)
+ {
+ 	static const uint32_t at_us[] = { 1000, 10000, 100000, 1000000, 5000000 };
+@@ -1048,6 +1048,49 @@ pandora_ufs_tur_sampled(void)
+ 	return done ? 0 : ETIMEDOUT;
+ }
+ 
++/*
++ * The 17 Pro bootloader hands over with the UniPro link in HIBERN8 (all M-PHY TX/RX FSMs
++ * = 1) and auto-hibernate off (AHIT = 0), so a request never leaves the host: probe of
++ * 2026-10-22, device/DT_FINDINGS.md. Wake it the way Linux does
++ * (ufshcd_uic_hibern8_exit -> ufshcd_uic_pwr_ctrl): DME_HIBERNATE_EXIT, wait for the UIC
++ * command completion (IS.UCCS, result in ARG2) and then for IS.UHXS, and require
++ * HCS.UPMCRS = PWR_LOCAL. Link layer only: no UFS command, no data.
++ */
++#define PU_IS_UHXS      (1u << 5)
++
++static int
++pandora_h8_exit(void)
++{
++	if (!(ufs_rd(REG_HCS) & PU_HCS_UCRDY)) {
++		return EBUSY;
++	}
++	ufs_wr(REG_IS, PU_IS_UCCS | PU_IS_UHXS);
++	ufs_wr(PU_REG_UICCMD + 4, 0);
++	ufs_wr(PU_REG_UICCMD + 8, 0);
++	ufs_wr(PU_REG_UICCMD + 12, 0);
++	ufs_wr(PU_REG_UICCMD, 0x18);                    /* DME_HIBERNATE_EXIT */
++	for (int i = 0; i < 100000 && !(ufs_rd(REG_IS) & PU_IS_UCCS); i++) {
++		delay(1);
++	}
++	if (!(ufs_rd(REG_IS) & PU_IS_UCCS)) {
++		return ETIMEDOUT;
++	}
++	uint32_t rc = ufs_rd(PU_REG_UICCMD + 8) & 0xff;
++	ufs_wr(REG_IS, PU_IS_UCCS);
++	if (rc) {
++		return (int)(0x100 | rc);
++	}
++	for (int i = 0; i < 500000 && !(ufs_rd(REG_IS) & PU_IS_UHXS); i++) {
++		delay(1);
++	}
++	if (!(ufs_rd(REG_IS) & PU_IS_UHXS)) {
++		return (int)(0x300 | ETIMEDOUT);
++	}
++	ufs_wr(REG_IS, PU_IS_UHXS);
++	uint32_t upmcrs = (ufs_rd(REG_HCS) >> 8) & 7;
++	return upmcrs == 1 ? 0 : (int)(0x200 | upmcrs);
++}
++
+ static void
+ pandora_ufs_gpt(void)
+ {
+@@ -1085,9 +1128,21 @@ pandora_ufs_gpt(void)
+ 	error = ufs_take_over_host();
+ 	printf("PANDORA UFS: take over host: %d (DMA at 0x%llx)\n", error, su.dma_pa);
+ 	if (!error) {
+-		error = pandora_ufs_tur_sampled();
+-		pandora_ufs_state("after");
+-		pandora_ufs_link("after");
++		error = pandora_h8_exit();
++		printf("PANDORA UFS: hibernate exit: %x (HCS=%08x IS=%08x)\n", error,
++		    ufs_rd(REG_HCS), ufs_rd(REG_IS));
++		pandora_ufs_link("awake");
++	}
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* The first command after the bootloader may report a unit attention. */
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			printf("PANDORA UFS: TEST UNIT READY try %d: %d\n", i + 1, error);
++		}
++		printf("PANDORA UFS: TEST UNIT READY: %d\n", error);
++		if (error) {
++			pandora_ufs_state("after");
++		}
+ 	}
+ 	if (!error) {
+ 		error = pandora_print_gpt();
