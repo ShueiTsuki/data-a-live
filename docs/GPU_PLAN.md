@@ -16,7 +16,8 @@
 | 芯片编号 | `0x44050a01` | 设备树 `qcom,chipid` |
 | 频率 | 160–1200 MHz，18 档 | `gpu_available_frequencies` |
 | GPU 寄存器 | `0x3d00000`，长 `0x40000`；另有 rscc、cx_dbgc、cx_misc | 设备树 `reg`/`reg-names` |
-| GMU | `0x3d37000`，compatible `qcom,gen8-gmu` | `qcom,gmu@3d37000` |
+| GMU | `0x3d37000`，长 `0x68000`（到 `0x3d9f000`，覆盖 Linux 清单里最高的 `0x3d8ec50`）；另有 `gmu_ao_blk_dec0` 在 `0x3d40000`，长 `0x10000`；compatible `qcom,gen8-gmu` | `qcom,gmu@3d37000` 的 `reg` |
+| GPU 其他区域 | rscc `0x3d50000`（= GPU 基地址 + `0x50000`，和 Linux a8xx 一致），cx_dbgc `0x3d61000`，cx_misc `0x3d9e000`（长 `0x2000`） | `qcom,kgsl-3d0` 的 `reg` |
 | GPU 的 SMMU | `kgsl-smmu@3da0000`（qsmmu-v500 / adreno-smmu，安卓由 `arm-smmu` 驱动绑定） | 设备树、`/sys/bus/platform/devices` |
 | GPU 时钟控制器 | `0x3d90000`（SMMU 的供应者之一） | `/sys/bus/platform/devices/3da0000.kgsl-smmu` |
 | UBWC | 版本 6 | `qcom,ubwc-mode` |
