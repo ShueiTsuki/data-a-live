@@ -24,13 +24,19 @@
  *                                  read-only: the file's first BYTES (default: all) read raw
  *                                  from DEV in file order, to standard output (the kernel's
  *                                  log file, written below the encryption layer)
- *   pinfile fsread  PATH           read-only: drop the file's cached pages and read it through
+ *   pinfile rawreadat PATH DEV OFFSET LEN
+ *                                  read-only: LEN bytes from byte OFFSET of the file (both whole
+ *                                  4 KiB blocks) read raw from DEV, to standard output
+ *   pinfile rawwriteat PATH DEV OFFSET OLD_SHA256 --yes
+ *                                  overwrite 1..64 blocks from byte OFFSET with standard input,
+ *                                  raw on DEV, only if those blocks now hash to OLD_SHA256
+ *   pinfile fsread  PATH          read-only: drop the file's cached pages and read it through
  *                                  the filesystem; blocks written raw no longer read as zeros
  *                                  (the filesystem decrypts our plaintext into noise), which
  *                                  proves the raw positions are this file's own blocks
  *
- * rawtest is the only command that writes to a raw block device. Before writing it
- * checks (checked_layout): the file is pinned; it is a regular file whose size is a
+ * rawtest, rawwrite and rawwriteat write to a raw block device. Before writing they
+ * check (checked_layout): the file is pinned; it is a regular file whose size is a
  * whole number of 4 KiB blocks; its extents start at 0, are contiguous, cover exactly
  * the file and carry no flag other than MERGED/LAST; DEV is the only device under the
  * filesystem's device-mapper device and has the same size (a 1:1 mapping, offset 0);
@@ -773,6 +779,125 @@ static int cmd_rawread(const char *path, const char *dev, const char *bytes_arg)
 	return 0;
 }
 
+/* Raw position of the file's byte OFF (a block start), or UINT64_MAX. */
+static uint64_t phys_of(uint64_t off)
+{
+	for (int i = 0; i < nL; i++)
+		if (off >= L[i].logical && off - L[i].logical < L[i].length)
+			return L[i].physical + (off - L[i].logical);
+	return UINT64_MAX;
+}
+
+static int parse_blocks(const char *s, uint64_t *v, const char *what)
+{
+	char *end;
+	*v = strtoull(s, &end, 0);
+	if (*end || *v % BLK) {
+		fprintf(stderr, "pinfile: refused: %s must be a multiple of %u\n", what, BLK);
+		return 1;
+	}
+	return 0;
+}
+
+/* Read-only: LEN bytes of the file from byte OFF, read raw from DEV, to standard output. */
+static int cmd_rawreadat(const char *path, const char *dev, const char *off_arg, const char *len_arg)
+{
+	uint64_t off, len;
+	if (parse_blocks(off_arg, &off, "OFFSET") || parse_blocks(len_arg, &len, "LEN") || !len)
+		return 1;
+	int rfd = open(dev, O_RDONLY | O_DIRECT | O_CLOEXEC);
+	if (rfd < 0)
+		return die("open DEV (read-only)");
+	int saved = dup(1);
+	if (saved < 0 || dup2(2, 1) < 0)
+		return die("dup");
+	int bad = checked_layout(path, dev, rfd);
+	fflush(stdout);
+	if (dup2(saved, 1) < 0)
+		return die("dup2");
+	close(saved);
+	if (bad)
+		return 1;
+	unsigned char *b;
+	if (posix_memalign((void **)&b, BLK, BLK))
+		return die("posix_memalign");
+	for (uint64_t at = off; at < off + len; at += BLK) {
+		uint64_t phys = phys_of(at);
+		if (phys == UINT64_MAX)
+			return fail("OFFSET+LEN beyond the file");
+		if (pread(rfd, b, BLK, (off_t)phys) != BLK)
+			return die("pread");
+		if (write(1, b, BLK) != BLK)
+			return die("write");
+	}
+	close(rfd);
+	free(b);
+	return 0;
+}
+
+/*
+ * Overwrite whole blocks of the file from byte OFF with standard input (a multiple of
+ * 4 KiB), raw on DEV. OLD is the SHA-256 of those blocks as they are now: anything else on
+ * disk and nothing is written. Prints the SHA-256 read back after the write.
+ */
+static int cmd_rawwriteat(const char *path, const char *dev, const char *off_arg, const char *old)
+{
+	uint64_t off;
+	if (parse_blocks(off_arg, &off, "OFFSET"))
+		return 1;
+	static unsigned char in[64 * BLK];
+	ssize_t got = read_full(0, in, sizeof in);
+	if (got < 0)
+		return die("read standard input");
+	unsigned char extra;
+	if (got == 0 || got % BLK || (got == (ssize_t)sizeof in && read_full(0, &extra, 1) != 0))
+		return fail("input must be 1..64 whole 4 KiB blocks");
+	uint64_t len = (uint64_t)got;
+	int fd = open(dev, O_RDWR | O_DIRECT | O_CLOEXEC);
+	if (fd < 0)
+		return die("open DEV for writing");
+	if (checked_layout(path, dev, fd))
+		return 1;
+	unsigned char *b;
+	if (posix_memalign((void **)&b, BLK, BLK))
+		return die("posix_memalign");
+	char hex[65];
+	unsigned char d[32];
+	struct sha256 h;
+	for (int pass = 0; pass < 2; pass++) {
+		sha256_init(&h);
+		for (uint64_t at = off; at < off + len; at += BLK) {
+			uint64_t phys = phys_of(at);
+			if (phys == UINT64_MAX || !inside_one_extent(phys, BLK))
+				return fail("OFFSET+LEN beyond the file");
+			if (pread(fd, b, BLK, (off_t)phys) != BLK)
+				return die("pread");
+			sha256_update(&h, b, BLK);
+		}
+		sha256_final(&h, d);
+		for (int i = 0; i < 32; i++)
+			sprintf(hex + 2 * i, "%02x", d[i]);
+		if (pass == 1)
+			break;
+		if (strcmp(hex, old) != 0) {
+			fprintf(stderr, "pinfile: refused: on disk now %s, expected %s\n", hex, old);
+			return 1;
+		}
+		for (uint64_t at = off; at < off + len; at += BLK) {
+			memcpy(b, in + (at - off), BLK);
+			if (pwrite(fd, b, BLK, (off_t)phys_of(at)) != BLK)
+				return die("pwrite");
+		}
+		if (fsync(fd) < 0)
+			return die("fsync DEV");
+	}
+	close(fd);
+	free(b);
+	printf("wrote %llu bytes at %#llx; sha256 read back: %s\n", (unsigned long long)len,
+	    (unsigned long long)off, hex);
+	return 0;
+}
+
 /* Read-only through the filesystem: which 4 KiB blocks are no longer all zero. */
 static int cmd_fsread(const char *path)
 {
@@ -819,6 +944,10 @@ int main(int argc, char **argv)
 		return cmd_rawread(argv[2], argc >= 4 ? argv[3] : DEFAULT_DEV, argc == 5 ? argv[4] : NULL);
 	if (argc >= 3 && argc <= 5 && !strcmp(argv[1], "rawhash"))
 		return cmd_rawhash(argv[2], argc >= 4 ? argv[3] : DEFAULT_DEV, argc == 5 ? argv[4] : NULL);
+	if (argc == 6 && !strcmp(argv[1], "rawreadat"))
+		return cmd_rawreadat(argv[2], argv[3], argv[4], argv[5]);
+	if (argc == 7 && !strcmp(argv[1], "rawwriteat") && !strcmp(argv[6], "--yes"))
+		return cmd_rawwriteat(argv[2], argv[3], argv[4], argv[5]);
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "rawcheck"))
 		return cmd_rawcheck(argv[2], argc == 4 ? argv[3] : DEFAULT_DEV);
 	if (argc >= 4 && !strcmp(argv[1], "create"))
@@ -833,6 +962,7 @@ int main(int argc, char **argv)
 	    "usage: pinfile create PATH SIZE_MB | status PATH | extents PATH [--json] | compare PATH [DEV]\n"
 	    "       pinfile rawtest PATH DEV N|all --yes | rawcheck PATH [DEV] | fsread PATH\n"
 	    "       pinfile rawwrite PATH DEV N|all --yes < IMAGE | rawhash PATH [DEV] [BYTES]\n"
-	    "       pinfile rawread PATH [DEV] [BYTES] > OUT\n");
+	    "       pinfile rawread PATH [DEV] [BYTES] > OUT | rawreadat PATH DEV OFFSET LEN > OUT\n"
+	    "       pinfile rawwriteat PATH DEV OFFSET OLD_SHA256 --yes < BLOCKS\n");
 	return 2;
 }

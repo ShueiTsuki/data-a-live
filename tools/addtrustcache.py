@@ -3,7 +3,7 @@
 
   addtrustcache.py PAYLOAD OUT TRUSTCACHE...
 
-Each TRUSTCACHE is an IPSW trust cache (IM4P "trst", e.g. Firmware/<OS dmg>.trustcache, the
+Each TRUSTCACHE (A+B+... merges several into one module) is an IPSW trust cache (IM4P "trst", e.g. Firmware/<OS dmg>.trustcache, the
 StaticTrustCache of BuildManifest.plist) or its raw payload. The first one becomes the static
 trust cache (bsd/kern/kern_trustcache.c load_static_trust_cache: module 0 = kTCTypeStatic).
 
@@ -14,6 +14,7 @@ and the block becomes one more payload segment right after kernel_end, like mkpa
 VM never gets that memory. The ADT gets /chosen/memory-map "TrustCache" = <phys, length>
 (DTTrustCacheRange: vm_offset_t paddr, size_t length). Needs ios-sweet's adt.py next to it.
 """
+import hashlib
 import os
 import struct
 import sys
@@ -26,10 +27,21 @@ SEG_TABLE = 0x2a8
 
 
 def raw_trust_cache(path):
+    """One module; A+B+... merges several (the kernel takes at most two static caches, so
+    e.g. the Cryptex1 SystemOS 'trcs' and AppOS 'trca' caches go into one second module)."""
+    if '+' in path:
+        parts = [raw_trust_cache(p)[0] for p in path.split('+')]
+        entries = sorted({c[24 + 24 * i:48 + 24 * i] for c in parts
+                          for i in range(struct.unpack_from('<I', c, 20)[0])})
+        hashes = [e[:20] for e in entries]
+        assert len(hashes) == len(set(hashes)), f'{path}: one cdhash with different flags'
+        uuid = hashlib.sha256(b''.join(c[4:20] for c in parts)).digest()[:16]
+        buf = struct.pack('<I16sI', 2, uuid, len(entries)) + b''.join(entries)
+        return buf, len(entries)
     buf = open(path, 'rb').read()
     if buf[:1] == b'\x30' and b'IM4P' in buf[:16]:
         buf, info = adt.im4p_payload(buf)
-        assert info['type'] in ('trst', 'trcs') and not info['encrypted'], (path, info)
+        assert info['type'] in ('trst', 'trcs', 'trca') and not info['encrypted'], (path, info)
     version, = struct.unpack_from('<I', buf, 0)
     assert version == 2, f'{path}: trust cache version {version}, expected 2'
     count, = struct.unpack_from('<I', buf, 20)

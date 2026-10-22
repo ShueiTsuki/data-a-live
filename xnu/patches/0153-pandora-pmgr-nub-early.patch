@@ -1,0 +1,35 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bef448e..030bdcc 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -695,12 +695,6 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
+-#if defined(PANDORA)
+-	/* ApplePMGRNub for a prelinked original AMFI (iokit/Kernel/arm/PandoraPMGRNub.cpp). */
+-	extern void pandora_pmgr_init(void);
+-	pandora_pmgr_init();
+-#endif
+-
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+ 	extern void sweet_amfi_policy_register(void);
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..7589525 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -714,6 +714,13 @@ kernel_bootstrap_thread(void)
+ 	vm_commpage_init();
+ 	vm_commpage_text_init();
+ 
++#if defined(PANDORA)
++	/* ApplePMGRNub for a prelinked original AMFI (iokit/Kernel/arm/PandoraPMGRNub.cpp):
++	 * started before the security extensions load, as AMFI waits only 30 s for it. */
++	extern void pandora_pmgr_init(void);
++	pandora_pmgr_init();
++#endif
++
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_initmach");
+ 	mac_policy_initmach();
