@@ -10,7 +10,9 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            the real phone image (shim/loader) past interrupt setup.
   --root-extents JSON  a pinned file in userdata (tools/pinfile `extents --json`) as the
            extent root: /chosen fuxi-root-extents + fuxi-root-blocks (patch 0088), the whole
-           file unless --root-bytes N says how much of it.
+           file, unless --root-bytes N says how much of it.
+  --log-extents JSON   a second pinned file for the kernel's console log (patch 0129):
+           /chosen pandora-log-extents + pandora-log-blocks, same layout.
 """
 import hashlib, json, os, struct, sys
 
@@ -86,6 +88,12 @@ def node(name, props=(), children=()):
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
     n.children = list(children)
     return n
+
+
+def log_extent_props(path):
+    """/chosen props for the console log file (patch 0129), same triples as the root."""
+    props = root_extent_props(path)
+    return [('pandora-log-extents', props[0][1]), ('pandora-log-blocks', props[1][1])]
 
 
 def root_extent_props(path, root_bytes=None):
@@ -285,6 +293,11 @@ if __name__ == '__main__':
         props = root_extent_props(opt('--root-extents'), int(rb, 0) if rb else None)
         print(f'root extents: {len(props[0][1]) // 24}, {struct.unpack("<Q", props[1][1])[0]} blocks',
               file=sys.stderr)
+    if opt('--log-extents'):
+        lp = log_extent_props(opt('--log-extents'))
+        print(f'log extents: {len(lp[0][1]) // 24}, {struct.unpack("<Q", lp[1][1])[0]} blocks',
+              file=sys.stderr)
+        props = list(props) + lp
     root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

@@ -20,6 +20,10 @@
  *   pinfile rawhash PATH [DEV] [BYTES]
  *                                  read-only: SHA-256 of the file's first BYTES (default: all)
  *                                  read raw from DEV in file order, to compare with the image
+ *   pinfile rawread PATH [DEV] [BYTES]
+ *                                  read-only: the file's first BYTES (default: all) read raw
+ *                                  from DEV in file order, to standard output (the kernel's
+ *                                  log file, written below the encryption layer)
  *   pinfile fsread  PATH           read-only: drop the file's cached pages and read it through
  *                                  the filesystem; blocks written raw no longer read as zeros
  *                                  (the filesystem decrypts our plaintext into noise), which
@@ -726,6 +730,49 @@ static int cmd_rawhash(const char *path, const char *dev, const char *bytes_arg)
 	return 0;
 }
 
+static int cmd_rawread(const char *path, const char *dev, const char *bytes_arg)
+{
+	int rfd = open(dev, O_RDONLY | O_DIRECT | O_CLOEXEC);
+	if (rfd < 0)
+		return die("open DEV (read-only)");
+	/* checked_layout prints a line: keep standard output for the data. */
+	int saved = dup(1);
+	if (saved < 0 || dup2(2, 1) < 0)
+		return die("dup");
+	int bad = checked_layout(path, dev, rfd);
+	fflush(stdout);
+	if (dup2(saved, 1) < 0)
+		return die("dup2");
+	close(saved);
+	if (bad)
+		return 1;
+	uint64_t want = UINT64_MAX;
+	if (bytes_arg) {
+		char *end;
+		want = strtoull(bytes_arg, &end, 0);
+		if (*end || want == 0)
+			return fail("BYTES must be a positive number");
+	}
+	unsigned char *b;
+	if (posix_memalign((void **)&b, BLK, CHUNK))
+		return die("posix_memalign");
+	uint64_t done = 0;
+	for (int i = 0; i < nL && done < want; i++)
+		for (uint64_t off = 0; off < L[i].length && done < want;) {
+			uint64_t n = L[i].length - off < CHUNK ? L[i].length - off : CHUNK;
+			if (pread(rfd, b, (size_t)n, (off_t)(L[i].physical + off)) != (ssize_t)n)
+				return die("pread");
+			uint64_t use = want - done < n ? want - done : n;
+			if (write(1, b, (size_t)use) != (ssize_t)use)
+				return die("write");
+			done += use;
+			off += n;
+		}
+	close(rfd);
+	free(b);
+	return 0;
+}
+
 /* Read-only through the filesystem: which 4 KiB blocks are no longer all zero. */
 static int cmd_fsread(const char *path)
 {
@@ -768,6 +815,8 @@ int main(int argc, char **argv)
 		return cmd_fsread(argv[2]);
 	if (argc == 6 && !strcmp(argv[1], "rawwrite") && !strcmp(argv[5], "--yes"))
 		return cmd_rawwrite(argv[2], argv[3], argv[4]);
+	if (argc >= 3 && argc <= 5 && !strcmp(argv[1], "rawread"))
+		return cmd_rawread(argv[2], argc >= 4 ? argv[3] : DEFAULT_DEV, argc == 5 ? argv[4] : NULL);
 	if (argc >= 3 && argc <= 5 && !strcmp(argv[1], "rawhash"))
 		return cmd_rawhash(argv[2], argc >= 4 ? argv[3] : DEFAULT_DEV, argc == 5 ? argv[4] : NULL);
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "rawcheck"))
@@ -783,6 +832,7 @@ int main(int argc, char **argv)
 	fprintf(stderr,
 	    "usage: pinfile create PATH SIZE_MB | status PATH | extents PATH [--json] | compare PATH [DEV]\n"
 	    "       pinfile rawtest PATH DEV N|all --yes | rawcheck PATH [DEV] | fsread PATH\n"
-	    "       pinfile rawwrite PATH DEV N|all --yes < IMAGE | rawhash PATH [DEV] [BYTES]\n");
+	    "       pinfile rawwrite PATH DEV N|all --yes < IMAGE | rawhash PATH [DEV] [BYTES]\n"
+	    "       pinfile rawread PATH [DEV] [BYTES] > OUT\n");
 	return 2;
 }
