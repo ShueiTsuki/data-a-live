@@ -94,6 +94,7 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 | Turnip 编成 840 机器码 | 这 590 个**全部成功**，0 失败，0 崩溃 |
 | 唯一的缺口 | `inplace_copy_lpf` / `inplace_copy_lph` 两个：用了 Metal 的光栅顺序组（raster order groups），翻译到 Vulkan 需要片元着色器像素互锁，Turnip 不支持 |
 
+- **将来实际要用的 Mesa 版本也做了同样的测试 [实测]**：UniXNU 和 ios-fuxi 固定用 Mesa `85fda3b36405bcaea8bffc64aa4f2651dc90770d`（26.2.0-devel），我在它上面按 UniXNU 记录的顺序（`scripts/data/adreno-compiler-inputs.json`）打上全部 9 个补丁，包括 `turnip-darwin-kmd.patch`，全部打上。这份源码自带 840 条目，在 Linux 上按 msm 版本编出来，同样把这 590 个着色器全部编成 840 的机器码，0 失败。Darwin 后端只在指定 `darwin` 内核接口时才编译，要在 macOS 机器上编，这里没测。另外，这组补丁在 Mesa 主线上大多已经打不上了，所以短期应该继续用 85fda3b。
 - 关于这个缺口：iOS 16 的 CoreAnimation 会先查询设备支不支持光栅顺序组 [读到 ios-fuxi `metal-m6.md:29`，"Observed CA capability queries"]。UniXNU 的 NativeMetal 按 Turnip 的真实能力回答"不支持"（`bridge/NativeMetalObjects.rs:426`），iPadOS 17 的 backboardd 照样用 GPU 合成跑通了桌面。所以 CoreAnimation 很可能在不支持时就不用 `inplace_copy`，改走别的路 [推断，要真机确认]。
 - 早先用 lavapipe 的描述时，`inplace_copy` 会被翻译成"互锁 + 片元写图像"的方案（lavapipe 支持互锁），Turnip 编译它时崩溃。这说明**测试必须用目标驱动的真实能力描述**，用别的驱动的描述会得出错误结论。
 - 没验证到的：着色器在 840 上的执行结果是否正确（drm-shim 不执行任何命令）；函数常量全填 0 的那 6 个万能着色器，CoreAnimation 运行时实际会用别的常量组合。
