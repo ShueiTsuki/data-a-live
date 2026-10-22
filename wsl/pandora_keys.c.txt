@@ -1,0 +1,95 @@
+#if defined(PANDORA)
+/*
+ * 17 Pro (SM8850): SPMI PMIC arbiter v8 ("qcom,canoe-spmi-pmic-arb", Linux
+ * drivers/spmi/spmi-pmic-arb.c v8): core 0x0c400000 (FEATURES +4: bus 0 APID count, 13
+ * bits), APID->PPID map at "chnl_map" 0x0c403000 + 4n (PPID bits 0-12), bus 0 owner table
+ * "chnl_owner" 0x0c42a000 + 4n (owner bits 0-2), observer channels 0x0c4c0000 +
+ * 0x40000 * ee + 0x20 * apid (same CMD/STATUS/RDATA0 as v7). PMK8850 (SID 0) pon_hlos@1300:
+ * RT_STS 0x1310 bit 7 power, bit 6 resin = volume down, as on the Xiaomi 13.
+ * Volume up is gpio-keys on TLMM GPIO 101 (active low), TLMM 0x0f000000, 0x1000 per pin,
+ * GPIO_IN_OUT at +4 bit 0 (pinctrl-kaanapali.c). Read only: the only stores are observer
+ * EXT_READL commands.
+ */
+#define PK_CORE_PA     0x0c400000u
+#define PK_MAP_PA      0x0c403000u
+#define PK_OWN_PA      0x0c42a000u
+#define PK_OBS_PA      0x0c4c0000u   /* EE 0 */
+#define PK_TLMM_GPIO   0x0f065000u   /* TLMM + 0x1000 * 101 */
+#define PK_MAX_APIDS   8192u
+
+static vm_offset_t pk_map, pk_own, pk_tlmm;
+
+static uint16_t
+pk_find_apid(uint16_t ppid, uint32_t count, unsigned *owner_out)
+{
+	uint16_t found = FK_NO_APID;
+	unsigned found_owner = 7;
+	for (uint32_t i = 0; i < count; ++i) {
+		uint32_t map = fk_rd(pk_map, 4u * i);
+		if (map == 0 || (map & 0x1fffu) != ppid) {
+			continue;
+		}
+		unsigned owner = fk_rd(pk_own, 4u * i) & 7u;
+		if (found == FK_NO_APID || owner == 0) {
+			found = (uint16_t)i;
+			found_owner = owner;
+		}
+	}
+	*owner_out = found_owner;
+	return found;
+}
+
+/* Volume up pressed (GPIO 101 low). */
+static bool
+pk_volup(bool *pressed)
+{
+	*pressed = (fk_rd(pk_tlmm, 0x4) & 1u) == 0;
+	return true;
+}
+
+static bool
+pk_setup(void)
+{
+	fk_core = ml_io_map(PK_CORE_PA, 0x1000);
+	pk_map = ml_io_map(PK_MAP_PA, 0x8000);
+	pk_own = ml_io_map(PK_OWN_PA, 0x8000);
+	fk_obs = ml_io_map(PK_OBS_PA, 0x40000);
+	pk_tlmm = ml_io_map(PK_TLMM_GPIO, 0x1000);
+	if (!fk_core || !pk_map || !pk_own || !fk_obs || !pk_tlmm) {
+		printf("PANDORA KEYS: MMIO mapping failed\n");
+		return false;
+	}
+	uint32_t version = fk_rd(fk_core, 0);
+	uint32_t count = fk_rd(fk_core, 4) & 0x1fffu;
+	printf("PANDORA KEYS: arbiter version=%#x bus0 apids=%u\n", version, count);
+	if (version < 0x80000000u || count == 0 || count > PK_MAX_APIDS) {
+		printf("PANDORA KEYS: not an arbiter v8, keys off\n");
+		return false;
+	}
+	unsigned owner;
+	fk_pon_apid = pk_find_apid(FK_PON_PPID, count, &owner);
+	uint8_t ptype = 0, psub = 0, pon = 0;
+	bool pok = fk_read(fk_pon_apid, 0x04, &ptype) &&
+	    fk_read(fk_pon_apid, 0x05, &psub) &&
+	    fk_read(fk_pon_apid, FK_PON_RT, &pon);
+	uint32_t ctl = fk_rd(pk_tlmm, 0x0), io = fk_rd(pk_tlmm, 0x4);
+	printf("PANDORA KEYS: pon-apid=%u/ee%u ok=%d type=%#x subtype=%#x rt=%#x st=%#x gpio101 ctl=%#x io=%#x\n",
+	    fk_pon_apid, owner, pok, ptype, psub, pon, fk_last_status, ctl, io);
+	if (!pok) {
+		fk_pon_apid = FK_NO_APID;
+	}
+	/* GPIO 101 must be a GPIO input: FUNC (bits 2-5) 0, OE (bit 9) off. PULL (bits 0-1)
+	 * is only logged: the board may pull the key line up itself. */
+	if ((ctl & 0x3cu) != 0 || (ctl & 0x200u)) {
+		printf("PANDORA KEYS: gpio101 not a GPIO input; volume-up withheld\n");
+		pk_tlmm = 0;
+	}
+	if (fk_pon_apid == FK_NO_APID && !pk_tlmm) {
+		return false;
+	}
+	printf("PANDORA KEYS: polling every 20 ms (power=%d volume-up=%d volume-down=%d)\n",
+	    fk_pon_apid != FK_NO_APID, pk_tlmm != 0, fk_pon_apid != FK_NO_APID);
+	return true;
+}
+#endif /* PANDORA */
+
