@@ -1,0 +1,78 @@
+diff --git a/iokit/Kernel/arm/PandoraPMGRNub.cpp b/iokit/Kernel/arm/PandoraPMGRNub.cpp
+index ea5ce44..509f77c 100644
+--- a/iokit/Kernel/arm/PandoraPMGRNub.cpp
++++ b/iokit/Kernel/arm/PandoraPMGRNub.cpp
+@@ -39,6 +39,10 @@ pandora_pmgr_meta(void)
+ 	return meta;
+ }
+ 
++/* pandora_pmgr=2: panic with the reason when the nub cannot be published (bring-up);
++ * 3: also panic right after a successful publication. */
++static int pandora_pmgr_mode = 1;
++
+ static void
+ pandora_pmgr_thread(void *arg, wait_result_t result)
+ {
+@@ -49,14 +53,20 @@ pandora_pmgr_thread(void *arg, wait_result_t result)
+ 	for (int i = 0; i < 300 && !(meta = pandora_pmgr_meta()); i++) {
+ 		IOSleep(100);
+ 	}
+-	if (!meta) {
+-		return;
+-	}
+ 	IOService *nub = NULL;
+ 	OSObject *obj = NULL;
++	/* The thread starts before the platform expert is published (0153), and IOResources is
++	 * not in the service plane yet either ("not registry member at registerService()").
++	 * AMFI matches the nub by class only, so the service root (IOPlatformExpertDevice,
++	 * registered by PE_init_iokit before matching starts) is the parent then. */
+ 	IOService *platform = IOService::getPlatform();
++	if (!platform) {
++		platform = IOService::getServiceRoot();
++	}
+ 	const char *why = NULL;
+-	if (meta->getClassSize() != PMGR_NUB_SIZE) {
++	if (!meta) {
++		why = "no ApplePMGRNub class after 30 s (ApplePMGR not prelinked or not loaded)";
++	} else if (meta->getClassSize() != PMGR_NUB_SIZE) {
+ 		why = "unexpected class size";
+ 	} else if (!platform) {
+ 		why = "no platform expert";
+@@ -68,9 +78,14 @@ pandora_pmgr_thread(void *arg, wait_result_t result)
+ 		why = "init failed";
+ 	} else if (!nub->attach(platform)) {
+ 		why = "attach failed";
++	} else if (!nub->inPlane(gIOServicePlane)) {
++		why = "attached but not in the service plane";
+ 	}
+ 	if (why) {
+ 		printf("PANDORA PMGR: %s\n", why);
++		if (pandora_pmgr_mode >= 2) {
++			panic("PANDORA PMGR: %s", why);
++		}
+ 		OSSafeReleaseNULL(obj);
+ 		return;
+ 	}
+@@ -78,16 +93,19 @@ pandora_pmgr_thread(void *arg, wait_result_t result)
+ 	nub->registerService(kIOServiceSynchronous);
+ 	/* The registry holds it from here on; AMFI keeps using it for the whole boot. */
+ 	printf("PANDORA PMGR: ApplePMGRNub published (no provider: reads 0xffffffff, writes ignored)\n");
++	if (pandora_pmgr_mode >= 3) {
++		panic("PANDORA PMGR: ApplePMGRNub %p published under %s", nub, platform->getName());
++	}
+ }
+ 
+ void
+ pandora_pmgr_init(void)
+ {
+-	int on = 1;
+-	(void)PE_parse_boot_argn("pandora_pmgr", &on, sizeof(on));
+-	if (!on) {
++	(void)PE_parse_boot_argn("pandora_pmgr", &pandora_pmgr_mode, sizeof(pandora_pmgr_mode));
++	if (!pandora_pmgr_mode) {
+ 		return;
+ 	}
++	printf("PANDORA PMGR: publisher started (mode %d)\n", pandora_pmgr_mode);
+ 	thread_t thread;
+ 	if (kernel_thread_start(pandora_pmgr_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
