@@ -1,0 +1,53 @@
+/*
+ * Read-only UFS diagnostics for the 17 Pro. GCC offsets: upstream Linux
+ * drivers/clk/qcom/gcc-kaanapali.c (Kaanapali = SM8850; the phone DT says
+ * "qcom,canoe-gcc" with the same 0x1f4200 register window). Branch CBCR: bit 31
+ * CLK_OFF, bit 1 HW_CTL (hardware gating), bit 0 enable. GDSCR bit 31 PWR_ON.
+ * UFSHCI 0x38-0x48 (UECPA/UECDL/UECN/UECT/UECDME) are read-to-clear error logs.
+ */
+#define PU_GCC_PA       0x00100000u
+
+static void
+pandora_ufs_clocks(void)
+{
+	vm_offset_t g = ml_io_map(PU_GCC_PA + 0x77000, 0x1000);
+	vm_offset_t m = ml_io_map(PU_GCC_PA + 0x9e000, 0x1000);
+	printf("PANDORA GCC: gdsc=%08x memphy_gdsc=%08x aggre_axi=%08x ahb=%08x axi=%08x\n",
+	    pu_rd(g, 0x004), pu_rd(m, 0x000), pu_rd(g, 0x0f0), pu_rd(g, 0x028), pu_rd(g, 0x018));
+	printf("PANDORA GCC: ice=%08x aux=%08x rx0=%08x rx1=%08x tx0=%08x unipro=%08x\n",
+	    pu_rd(g, 0x07c), pu_rd(g, 0x0bc), pu_rd(g, 0x030), pu_rd(g, 0x0d8), pu_rd(g, 0x02c),
+	    pu_rd(g, 0x06c));
+}
+
+static void
+pandora_ufs_state(const char *when)
+{
+	printf("PANDORA UFS %s: IS=%08x HCS=%08x HCE=%08x DBR=%08x RSR=%08x CNR=%08x\n", when,
+	    ufs_rd(REG_IS), ufs_rd(REG_HCS), ufs_rd(REG_HCE), ufs_rd(REG_UTRLDBR),
+	    ufs_rd(REG_UTRLRSR), ufs_rd(0x64));
+	printf("PANDORA UFS %s: UTRLBA=%08x%08x UEC PA=%08x DL=%08x N=%08x T=%08x DME=%08x\n", when,
+	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(0x38), ufs_rd(0x3c), ufs_rd(0x40),
+	    ufs_rd(0x44), ufs_rd(0x48));
+}
+
+/* One TEST UNIT READY with the host's view of it afterwards. */
+static int
+pandora_ufs_tur(void)
+{
+	static const uint8_t tur[6] = { 0x00 };
+	int error = ufs_scsi(tur, sizeof(tur), 0, false);
+	printf("PANDORA UFS: TEST UNIT READY: %d\n", error);
+	if (error) {
+		const struct utrd *utrd = (const struct utrd *)(su.dma + DMA_UTRL);
+		const struct ucd *ucd = (const struct ucd *)(su.dma + DMA_UCD);
+		dma_sync(DMA_UTRL, sizeof(*utrd));
+		dma_sync(DMA_UCD, sizeof(*ucd));
+		/* OCS still 0x0f: the host never fetched or completed the descriptor. */
+		printf("PANDORA UFS: UTRD dw0=%08x dw2=%08x (OCS %02x) resp %02x %02x %02x %02x\n",
+		    utrd->dw0, utrd->dw2, utrd->dw2 & 0xff, ucd->resp[0], ucd->resp[1],
+		    ucd->resp[6], ucd->resp[7]);
+		pandora_ufs_state("after");
+	}
+	return error;
+}
+
