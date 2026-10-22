@@ -150,6 +150,15 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 - **构建链**：需要 Xcode 工具链编 iOS 16 的插件、Rust 和 Mesa。ios-fuxi 的做法 [读到 `.github/workflows/fuxi-build.yml`]：Metal 插件、metal2vulkan 桥接库在 GitHub 的 `macos-14` 机器上编（带 cargo 缓存），其余在 `ubuntu-latest` 上编。我们的仓库是公开的，编译不限额，可以照做。
 - **墙纸**：7400 墙纸的图片是 HEIC（HEVC 视频编码）[读到 ios-fuxi]。HEVC 解码和 GPU 是两块不同的硬件。有了 GPU，CoreAnimation 可以在着色器里直接画 YUV 图片 [推断]，但如果问题出在解码这一步，GPU 解决不了，要另外确认。
 
+## 7.5 桌面调研已经查不出、只能上机回答的问题
+
+1. 从 fastboot 启动到我们内核接手时，GPU 的时钟和电源处于什么状态（ABL 有没有留着 CX 电或某些时钟）。这决定第 4 步只读探测能安全读哪些寄存器。
+2. 没有安卓内核时，`GPU_INIT_REGS` 和 zap（PAS 13）这两个安全调用能不能成功。ADSP 的 PAS 调用我们已经做通过，但 GPU 是另一个外设号。
+3. 我们能不能直接配置 `0x3da0000` 那块 SMMU 的上下文（安卓能，说明普通内核有权限；但安全上下文 secure 可能不行，我们第一阶段不需要它）。
+4. GMU 固件 `gen80200_gmu.bin` 在我们按 Linux 顺序准备好的环境里，会不会报告初始化成功、会不会回复第一条 HFI 消息 `MSG_TABLE`。
+5. iOS 16 上 `_MTLDevice` 的实例大小（ios-fuxi 实测是 528），以及 NativeMetal 经 N1 移植后，真正的 backboardd 会不会再拒绝别的功能。
+6. 墙纸的 HEIC 图层：问题是出在 HEVC 解码，还是出在 CPU 画 YUV 图片。有了 GPU 能解决后者，解决不了前者。
+
 ## 8. 许可
 
 - UniXNU：BSD-2-Clause-Patent；NativeAdreno 接口另有 MIT 声明。
