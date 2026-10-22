@@ -40,7 +40,7 @@
 每一步：做什么 / 碰不碰手机 / 怎么算成功 / 卡住怎么办。不估时间。
 
 ### 第 0 步 准备（进行中）
-- 已完成：设备信息、设备树（device/pandora-live.dtb）、分区表（device/partitions.txt）、37 个分区备份（backup/，全部核对通过）。
+- 已完成：设备信息、设备树（device/pandora-live.dtb）、分区表（device/partitions.txt）、37 个分区备份 + sda 主/备分区表（backup/，全部核对通过；super 和 userdata 未备份）。个人数据：E:/pandora_backup/selected（照片、微信、QQ、桌面、主题、设置、输入法；其余用户不需要）。
 - 待做：
   1. 只读备份 sda 的分区表（开头和结尾两份）。
   2. 从备份里取出原版 boot_b、vendor_boot_b、init_boot_b、dtbo_b，分析 17 Pro 引导程序要求的启动镜像格式。
