@@ -1,0 +1,28 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 27ae194..d9a15ed 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -33,6 +33,7 @@
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
++ * PANDORA stops it by default; sweetfb_noconsole=0 keeps drawing.
+  *
+  * FUXI (0093): frames are shown at up to 60 Hz by default (7 fast cores;
+  * sweetfb_hz still overrides), the tick runs on absolute deadlines so the
+@@ -849,9 +850,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 	bool gpuFrame = false, cpuFrame = false;
+ 
+ 	if (!fConsolePaused) {
++#if defined(PANDORA)
++		int quiet = 1;
++#else
+ 		int quiet = 0;
++#endif
+ 		fConsolePaused = true;
+-		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++		PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
++		if (quiet != 0) {
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
