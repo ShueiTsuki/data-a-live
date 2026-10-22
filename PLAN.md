@@ -139,6 +139,13 @@
 - 正式驱动（0120，构建 #18，`pandora_ufs_probe=3 ufsroot=super`）：sweet_ufs_init 在 PANDORA 下不再写 SM8550 时钟、先退出休眠再 ACTIVE；按名字找到 super（起点 0x3f200、12800 MiB、只读），读出第 1 块开头 `67 44 6c 61 34 00 00 00`（安卓动态分区几何结构的标记 gDla、长度 52），**第 4 步完成**。
 - 下一步讨论：iOS 根文件系统放哪。免清数据方案 = userdata 里的钉住文件 + 绕过加密层直接写 sda34 上该文件的块；先只读确认内核是否允许写正在使用的分区（CONFIG_BLK_DEV_WRITE_MOUNTED），再做 64 MB 测试文件。
 
+## 免清数据测试（2026-10-22，真机，tools/pinfile）
+- 依据：/data 是 default-key 加密映射（dm-62，1:1 叠在 sda34 上）；小米自己的 cust 就是 sda34 内一段被 linear 直接映射的区域（libfiemap 机制）。内核 CONFIG_BLK_DEV_WRITE_MOUNTED=y。
+- 阶段 A：/data/local/tmp/iostest.img，64 MiB，钉住，23 段（2 MiB 对齐），避开 cust（0x61400000–0x10a200000）。
+- 阶段 B：直接写 sda34 上第 0 块 → 通过文件系统读只有第 0 块变成乱码，证明位置就是这个文件自己的块。
+- 阶段 C：写满 16384 块，从存储读回全部一致；通过文件系统读 16384 块全部变化；文件仍钉住，GC 未动；dmesg 无 f2fs/IO 错误。块位置存档 device/iostest-extents-20261022.json。
+- 阶段 D（进行中）：重启、正常使用后复查 status / extents / rawcheck；之后用苹果内核按块位置只读读出比对。
+
 ## 主要风险
 - CPU 是高通自研 Oryon 核心（8 Elite Gen 5，6 个性能核 + 2 个超大核），ios-sweet（Cortex-A55/A76）和 UniXNU（骁龙 8 Gen 2，ARM 公版核心）都没在它上面跑过，目前没有苹果内核在 Oryon 上运行的先例。
 - 存储、地址转换单元、总线、显示控制器、虚拟化层这些高通自家部件，骁龙 8 Gen 2（UniXNU）比 732G（ios-sweet）更接近 17 Pro，但仍要对照设备树逐项核实。
