@@ -1,0 +1,232 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 030bdcc..bef448e 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -695,6 +695,12 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
++#if defined(PANDORA)
++	/* ApplePMGRNub for a prelinked original AMFI (iokit/Kernel/arm/PandoraPMGRNub.cpp). */
++	extern void pandora_pmgr_init(void);
++	pandora_pmgr_init();
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+ 	extern void sweet_amfi_policy_register(void);
+diff --git a/iokit/Kernel/arm/PandoraPMGRNub.cpp b/iokit/Kernel/arm/PandoraPMGRNub.cpp
+new file mode 100644
+index 0000000..ea5ce44
+--- /dev/null
++++ b/iokit/Kernel/arm/PandoraPMGRNub.cpp
+@@ -0,0 +1,96 @@
++/*
++ * PANDORA (patch 0148): publish an ApplePMGRNub for Apple's original AMFI, prelinked from
++ * the iPhone X iOS 16.7.16 kernelcache (tools/mkprelink.py, after UniXNU's NativePrelink).
++ *
++ * AMFI's developer-mode latch thread waits up to 30 s for a service of class ApplePMGRNub
++ * and panics ("AMFI: No PMGR?") without one. It then reads the PMGR always-on register
++ * through the nub, ORs in 4 and writes the value back. The nub's read and write forward to
++ * the provider stored at nub+0x88 (vtable slots 312/313); with no provider the original
++ * code returns 0xffffffff and does nothing on write, which is also what the generic
++ * ApplePMGR class does (20H392 ApplePMGR.kext, read 0xfffffff005685734, write 0xfffffff005683dbc).
++ * The nub's own overrides (attachToChild, message, compareName, matchLocation) are safe
++ * without a provider.
++ *
++ * So the nub here is the original class from the prelinked ApplePMGR kext, made by its
++ * metaclass, with no provider and no hardware behind it. Nothing happens when the kernel
++ * has no prelinked ApplePMGR (the class never appears). Boot-arg pandora_pmgr=0 turns it off.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(PANDORA)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSMetaClass.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/pexpert.h>
++
++#define PMGR_NUB_SIZE      0x740
++#define PMGR_NUB_PROVIDER  0x88
++
++extern "C" void pandora_pmgr_init(void);
++
++static const OSMetaClass *
++pandora_pmgr_meta(void)
++{
++	const OSSymbol *name = OSSymbol::withCString("ApplePMGRNub");
++	const OSMetaClass *meta = name ? OSMetaClass::getMetaClassWithName(name) : NULL;
++	OSSafeReleaseNULL(name);
++	return meta;
++}
++
++static void
++pandora_pmgr_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	const OSMetaClass *meta = NULL;
++	/* The prelinked ApplePMGR kext is loaded with AMFI, its dependent. */
++	for (int i = 0; i < 300 && !(meta = pandora_pmgr_meta()); i++) {
++		IOSleep(100);
++	}
++	if (!meta) {
++		return;
++	}
++	IOService *nub = NULL;
++	OSObject *obj = NULL;
++	IOService *platform = IOService::getPlatform();
++	const char *why = NULL;
++	if (meta->getClassSize() != PMGR_NUB_SIZE) {
++		why = "unexpected class size";
++	} else if (!platform) {
++		why = "no platform expert";
++	} else if (!(obj = meta->alloc()) || !(nub = OSDynamicCast(IOService, obj))) {
++		why = "alloc failed";
++	} else if (*(volatile uintptr_t *)((uintptr_t)nub + PMGR_NUB_PROVIDER) != 0) {
++		why = "provider field not empty";
++	} else if (!nub->init()) {
++		why = "init failed";
++	} else if (!nub->attach(platform)) {
++		why = "attach failed";
++	}
++	if (why) {
++		printf("PANDORA PMGR: %s\n", why);
++		OSSafeReleaseNULL(obj);
++		return;
++	}
++	nub->setName("pandora-pmgr");
++	nub->registerService(kIOServiceSynchronous);
++	/* The registry holds it from here on; AMFI keeps using it for the whole boot. */
++	printf("PANDORA PMGR: ApplePMGRNub published (no provider: reads 0xffffffff, writes ignored)\n");
++}
++
++void
++pandora_pmgr_init(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("pandora_pmgr", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(pandora_pmgr_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* PANDORA */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 04014fb..09cce8d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/PandoraPMGRNub.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/osfmk/kern/kalloc.c b/osfmk/kern/kalloc.c
+index 06fc2a2..ce8284d 100644
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -949,6 +949,10 @@ kalloc_type_view_copy(
+ 	}
+ }
+ 
++/* From UniXNU NativePrelink (BSD-2-Clause-Patent): PANDORA prelinks a few original kexts
++ * (tools/mkprelink.py), so __PRELINK_TEXT holds sparse headers listed in __macho_list. */
++__attribute__((used)) const uint32_t kalloc_sparse_prelink_index_version = 1;
++
+ __startup_func
+ static uint64_t
+ kalloc_type_view_parse(const kalloc_type_variant_t type)
+@@ -1031,10 +1035,46 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+ 		cur = prelink_sect->addr;
+ 		end = prelink_sect->addr + prelink_sect->size;
+ 
+-		while (cur < end) {
++		/* A sparse native prelink supplies its actual component headers.
++		 * Keep the original contiguous KCGEN format when no index exists.
++		 */
++		kernel_section_t *macho_list = getsectbynamefromheader(
++			xnu_mh, kPrelinkTextSegment, "__macho_list");
++		uint64_t list_index = 0, list_count = 0;
++		uintptr_t previous_header = 0;
++		if (macho_list) {
++			kernel_segment_command_t *prelink_segment =
++			    getsegbynamefromheader(xnu_mh, kPrelinkTextSegment);
++			if (!macho_list->size || macho_list->size % sizeof(uintptr_t) ||
++			    macho_list->addr % sizeof(uintptr_t) ||
++			    macho_list->size > prelink_segment->vmsize ||
++			    macho_list->addr < prelink_segment->vmaddr ||
++			    macho_list->addr - prelink_segment->vmaddr >
++			    prelink_segment->vmsize - macho_list->size) {
++				panic("kalloc_type_view_parse: invalid sparse prelink index");
++			}
++			list_count = macho_list->size / sizeof(uintptr_t);
++		}
++
++		while (macho_list ? list_index < list_count : cur < end) {
++			if (macho_list) {
++				uintptr_t unslid = ((const uintptr_t *)macho_list->addr)[list_index++];
++				if ((list_index > 1 && unslid <= previous_header) ||
++				    __builtin_add_overflow(unslid, vm_kernel_slide, &cur) ||
++				    cur % sizeof(uintptr_t) || cur < prelink_sect->addr ||
++				    cur > end || end - cur < sizeof(kernel_mach_header_t)) {
++					panic("kalloc_type_view_parse: sparse header outside prelink text");
++				}
++				previous_header = unslid;
++			}
+ 			uint64_t kext_text_sz = 0;
+ 			kernel_mach_header_t *kext_mh = (kernel_mach_header_t *) cur;
+ 
++			if (macho_list && (kext_mh->magic != MH_MAGIC_64 ||
++			    kext_mh->sizeofcmds > end - cur - sizeof(*kext_mh) ||
++			    kext_mh->ncmds > kext_mh->sizeofcmds / sizeof(struct load_command))) {
++				panic("kalloc_type_view_parse: malformed sparse component header");
++			}
+ 			if (kext_mh->magic == 0) {
+ 				/*
+ 				 * Assert that we have processed all kexts and all that is left
+@@ -1057,6 +1097,15 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+ 
+ 			for (uint32_t i = 0; i < kext_mh->ncmds && (vm_offset_t)lc < end;
+ 			    i++, lc = (struct load_command *)((vm_offset_t)lc + lc->cmdsize)) {
++				if (macho_list) {
++					vm_offset_t header_end = cur + sizeof(*kext_mh) + kext_mh->sizeofcmds;
++					if ((vm_offset_t)lc > header_end ||
++					    header_end - (vm_offset_t)lc < sizeof(*lc) ||
++					    lc->cmdsize < sizeof(*lc) || lc->cmdsize % sizeof(uintptr_t) ||
++					    lc->cmdsize > header_end - (vm_offset_t)lc) {
++						panic("kalloc_type_view_parse: malformed sparse load command");
++					}
++				}
+ 				if (lc->cmd == LC_SEGMENT_SPLIT_INFO) {
+ 					isSplitKext = true;
+ 					continue;
+@@ -1066,6 +1115,10 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+ 
+ 				kernel_segment_command_t *seg_cmd =
+ 				    (struct segment_command_64 *)(vm_offset_t)lc;
++				if (macho_list && (lc->cmdsize < sizeof(*seg_cmd) ||
++				    seg_cmd->nsects > (lc->cmdsize - sizeof(*seg_cmd)) / sizeof(kernel_section_t))) {
++					panic("kalloc_type_view_parse: malformed sparse segment");
++				}
+ 				/*
+ 				 * Parse kalloc_type section
+ 				 */
+@@ -1099,7 +1152,9 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
+ 				break;
+ 			}
+ 
+-			cur += ((kext_text_sz + (KEXT_ALIGN_BYTES - 1)) & (~KEXT_ALIGN_MASK));
++			if (!macho_list) {
++				cur += ((kext_text_sz + (KEXT_ALIGN_BYTES - 1)) & (~KEXT_ALIGN_MASK));
++			}
+ 		}
+ 	} else {
+ 		/*
