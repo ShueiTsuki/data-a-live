@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e0e0baf..085293c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -197,7 +197,17 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
++#if defined(PANDORA)
++	/*
++	 * The 17 Pro panel (1220x2656) is larger than the iPhone X one. Presented at its
++	 * own size, backboardd/UIKit have no layout for it and backboardd loops looking
++	 * for AppleM2ScalerCSCDriver. Present 1125x2436 and center it (47 px left/right,
++	 * 110 px top/bottom black border); the offsets below are then negative.
++	 */
++	if (!native) {
++#else
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++#endif
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+@@ -428,6 +438,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
++#if defined(PANDORA)
++			/* The border around the centered iPhone X area keeps the last console
++			 * text otherwise: clear the whole panel once. */
++			for (uint32_t y = 0; y < fHeight; y++) {
++				bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++			}
++#endif
+ 		}
+ 	}
+ 
