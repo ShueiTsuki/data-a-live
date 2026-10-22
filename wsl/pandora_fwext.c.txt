@@ -1,0 +1,97 @@
+#if defined(PANDORA)
+/*
+ * Firmware pack (tools/mkfwpack.py) in a third pinned userdata file (patch 0144): extents
+ * from /chosen pandora-fw-extents / pandora-fw-blocks, same {file, part, count} triples.
+ * Read only: pandora_fw_read() for bsd/dev/pandora_adsp.c.
+ */
+#define PF_MAX_EXTENTS 256
+static struct { uint64_t file, part, count; } pf_ext[PF_MAX_EXTENTS];
+static unsigned pf_next;
+static uint64_t pf_blocks;
+
+static void
+pf_load_extents(void)
+{
+	DTEntry chosen;
+	uint64_t const *ext = NULL, *blocks = NULL;
+	unsigned int size = 0, bsize = 0;
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "pandora-fw-extents", (void const **)&ext, &size) != kSuccess ||
+	    SecureDTGetProperty(chosen, "pandora-fw-blocks", (void const **)&blocks, &bsize) != kSuccess ||
+	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t)) ||
+	    size / (3 * sizeof(uint64_t)) > PF_MAX_EXTENTS) {
+		return;
+	}
+	unsigned n = size / (3 * sizeof(uint64_t));
+	uint64_t want = *blocks, pos = 0;
+	for (unsigned i = 0; i < n && pos < want; i++) {
+		uint64_t file = ext[3 * i], part = ext[3 * i + 1], count = ext[3 * i + 2];
+		if (file != pos || count == 0 || part >= fx_part_blocks || count > fx_part_blocks - part) {
+			printf("PANDORA FW: bad extent %u\n", i);
+			pf_next = 0;
+			return;
+		}
+		count = MIN(count, want - pos);
+		pf_ext[pf_next].file = file;
+		pf_ext[pf_next].part = part;
+		pf_ext[pf_next].count = count;
+		pf_next++;
+		pos += count;
+	}
+	if (pos != want) {
+		pf_next = 0;
+		printf("PANDORA FW: extents cover 0x%llx of 0x%llx blocks\n", pos, want);
+		return;
+	}
+	pf_blocks = want;
+	printf("PANDORA FW: firmware pack in userdata: %u extents, %llu blocks\n", pf_next, pf_blocks);
+}
+
+static bool
+pf_map(uint64_t blk, uint64_t *lba, uint64_t *run)
+{
+	for (unsigned i = 0; i < pf_next; i++) {
+		if (blk >= pf_ext[i].file && blk - pf_ext[i].file < pf_ext[i].count) {
+			uint64_t off = blk - pf_ext[i].file;
+			*lba = fx_part_first + pf_ext[i].part + off;
+			*run = pf_ext[i].count - off;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Copy len bytes at byte offset off of the firmware pack into dst. */
+int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+int
+pandora_fw_read(uint64_t off, void *dst, uint64_t len)
+{
+	if (!pf_next || off + len < off || off + len > pf_blocks * UFS_BLOCK) {
+		return EINVAL;
+	}
+	uint8_t *out = dst;
+	int error = 0;
+	lck_mtx_lock(&sweet_ufs_lock);
+	while (len && !error) {
+		uint64_t blk = off / UFS_BLOCK, lba, run;
+		uint32_t in = (uint32_t)(off % UFS_BLOCK);
+		if (!pf_map(blk, &lba, &run)) {
+			error = EINVAL;
+			break;
+		}
+		uint64_t need = (in + len + UFS_BLOCK - 1) / UFS_BLOCK;
+		uint32_t n = (uint32_t)MIN(MIN(need, run), (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+		error = ufs_read_blocks(lba, n);
+		if (error) {
+			break;
+		}
+		uint64_t got = MIN((uint64_t)n * UFS_BLOCK - in, len);
+		memcpy(out, (const uint8_t *)(su.dma + DMA_BOUNCE) + in, (size_t)got);
+		out += got;
+		off += got;
+		len -= got;
+	}
+	lck_mtx_unlock(&sweet_ufs_lock);
+	return error;
+}
+#endif /* PANDORA */

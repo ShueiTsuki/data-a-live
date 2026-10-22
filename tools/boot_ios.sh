@@ -4,9 +4,11 @@
 #
 #   tools/boot_ios.sh --file /data/local/tmp/iostest.img --run 19 [--cmdline "..."]
 #                     [--cpus 8] [--rd md0|ufsroot0] [--check pattern|hfsx|none]
-#                     [--log /data/local/tmp/ioslog.img] [--debug 0x8] [--dry-run]
+#                     [--log /data/local/tmp/ioslog.img] [--fw /data/local/tmp/adspfw.img]
+#                     [--debug 0x8] [--dry-run]
 #    (--rd ufsroot0: root on the pinned file itself, no RAM disk;
 #     --log: a second pinned file for the kernel console log, patch 0129, needs ufsrw=1;
+#     --fw: a pinned firmware pack (tools/mkfwpack.py) for patch 0144's ADSP loader;
 #     --debug 0x8: panics reset the phone instead of waiting, default 0xc)
 #
 # 1. Phone in Android (adb): each file must be pinned with no GC move failures; its extent
@@ -22,7 +24,7 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PT=/d/Android/platform-tools
 ADB="$PT/adb.exe" FB="$PT/fastboot.exe"
-FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0 RD=md0 LOG="" DEBUG=0xc
+FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0 RD=md0 LOG="" FW="" DEBUG=0xc
 while [ $# -gt 0 ]; do
 	case $1 in
 	--file) FILE=$2; shift 2 ;;
@@ -32,12 +34,13 @@ while [ $# -gt 0 ]; do
 	--cpus) CPUS=$2; shift 2 ;;
 	--check) CHECK=$2; shift 2 ;;
 	--log) LOG=$2; shift 2 ;;
+	--fw) FW=$2; shift 2 ;;
 	--debug) DEBUG=$2; shift 2 ;;
 	--dry-run) DRY=1; shift ;;
-	*) sed -n '2,19p' "$0"; exit 2 ;;
+	*) sed -n '2,21p' "$0"; exit 2 ;;
 	esac
 done
-[ -n "$FILE" ] && [ -n "$RUN" ] || { sed -n '2,19p' "$0"; exit 2; }
+[ -n "$FILE" ] && [ -n "$RUN" ] || { sed -n '2,21p' "$0"; exit 2; }
 P=/data/local/tmp/pinfile
 su() { "$ADB" shell su -c "'$*'" | tr -d '\r'; }
 
@@ -75,6 +78,10 @@ ADTFLAGS="--root-extents $(wslpath_of "$now")"
 if [ -n "$LOG" ]; then
 	lognow=$(pinned_extents "$LOG")
 	ADTFLAGS="$ADTFLAGS --log-extents $(wslpath_of "$lognow")"
+fi
+if [ -n "$FW" ]; then
+	fwnow=$(pinned_extents "$FW")
+	ADTFLAGS="$ADTFLAGS --fw-extents $(wslpath_of "$fwnow")"
 fi
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
