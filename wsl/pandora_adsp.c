@@ -10,7 +10,7 @@
  * like "nord_adsp_resource"/sm8550): AOP load_state "adsp" on (QMP), RPMh LCX and LMX
  * ARC levels up (DT cx/mx-supply "lcx.lvl"/"lmx.lvl", 384), then for the DTB image and
  * then the main image: metadata (ELF header + program headers, then the hash segment,
- * qcom_mdt_read_metadata) in memory registered with an SHM bridge, PAS_INIT_IMAGE,
+ * qcom_mdt_read_metadata) in plain contiguous memory (the hypervisor bridges it), PAS_INIT_IMAGE,
  * PAS_MEM_SETUP when relocatable, segments copied to the carveout (relocated to the
  * lowest segment address, qcom_mdt_load_no_init), PAS_AUTH_AND_RESET. Carveouts from the
  * DT: adspslpi 0xa1400000 + 0x5580000, q6_adsp_dtb 0xa1380000 + 0x80000. Firmware comes
@@ -455,14 +455,13 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 		return err;
 	}
 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+	/*
+	 * No SHM bridge of our own: the SM8850 kernel's qcom_scm_pas_init_image says the
+	 * hypervisor creates the bridge for PIL metadata itself and that a buffer already in
+	 * a bridge makes the call fail (it did: -3145738 from init_image).
+	 */
 	struct scm_res r;
-	scm_smc(SCM_FN(0xc, 0x1e), SCM_ARGS(4), md_pa | 6, md_pa | 6, md_size | (1ull << 9), 3, &r);
-	printf("PANDORA ADSP: shm bridge %#llx+%#llx -> a0 %#llx a1 %#llx handle %#llx\n", md_pa, md_size,
-	    r.a0, r.a1, r.a2);
-	if (r.a0 || r.a1) {
-		return EIO;
-	}
-	*bridge = r.a2;
+	*bridge = 0;
 	scm_smc(SCM_FN(2, 1), SCM_ARGS(2) | (SCM_RW << 6), pas, md_pa, 0, 0, &r);
 	printf("PANDORA ADSP: pas %u init_image (%u bytes) -> a0 %#llx (%d) a1 %#llx\n", pas,
 	    ehdr_size + hash_size, r.a0, (int)(int32_t)r.a0, r.a1);
@@ -557,8 +556,9 @@ adsp_boot(void)
 	}
 	printf("PANDORA ADSP: ADSP released from reset\n");
 	ad_sleep(2000);
-	scm_smc(SCM_FN(0xc, 0x1d), SCM_ARGS(1), b_main, 0, 0, 0, &r);
-	scm_smc(SCM_FN(0xc, 0x1d), SCM_ARGS(1), b_dtb, 0, 0, 0, &r);
+	(void)b_main;
+	(void)b_dtb;
+	(void)r;
 }
 
 static void
