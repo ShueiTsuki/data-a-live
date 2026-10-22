@@ -41,6 +41,11 @@ sub("""	if (!fk_setup()) {
 #endif
 	for (;;) {
 		uint8_t pon = 0, gpio = 1;
+#if defined(PANDORA)
+		if ((++pk_polls % 1500u) == 0) {        /* every 30 s: still polling */
+			printf("PANDORA KEYS: %u polls\\n", pk_polls);
+		}
+#endif
 		bool pok = fk_read(fk_pon_apid, FK_PON_RT, &pon);
 #if defined(PANDORA)
 		bool up = false, gok = pk_tlmm != 0 && pk_volup(&up);

@@ -18,6 +18,17 @@
 #define PK_MAX_APIDS   8192u
 
 static vm_offset_t pk_map, pk_own, pk_tlmm;
+static uint32_t pk_polls;
+static uint32_t pk_mask = 3;  /* boot-arg pandora_keys: bit 0 PMIC (power, volume down), bit 1 GPIO 101 */
+
+/* Before the first access to each register region: say which, then wait 2 s, so a reset
+ * from a protected region leaves its name on the screen. */
+static void
+pk_step(const char *what, uint32_t pa)
+{
+	printf("PANDORA KEYS: next: first read of %s at %#x\n", what, pa);
+	fk_sleep(2000);
+}
 
 static uint16_t
 pk_find_apid(uint16_t ppid, uint32_t count, unsigned *owner_out)
@@ -59,6 +70,12 @@ pk_setup(void)
 		printf("PANDORA KEYS: MMIO mapping failed\n");
 		return false;
 	}
+	(void)PE_parse_boot_argn("pandora_keys", &pk_mask, sizeof(pk_mask));
+	printf("PANDORA KEYS: pandora_keys=%u\n", pk_mask);
+	if (!(pk_mask & 1u)) {
+		goto gpio;
+	}
+	pk_step("arbiter core (version)", PK_CORE_PA);
 	uint32_t version = fk_rd(fk_core, 0);
 	uint32_t count = fk_rd(fk_core, 4) & 0x1fffu;
 	printf("PANDORA KEYS: arbiter version=%#x bus0 apids=%u\n", version, count);
@@ -67,23 +84,37 @@ pk_setup(void)
 		return false;
 	}
 	unsigned owner;
+	pk_step("APID map", PK_MAP_PA);
+	(void)fk_rd(pk_map, 0);
+	pk_step("bus 0 owner table", PK_OWN_PA);
+	(void)fk_rd(pk_own, 0);
 	fk_pon_apid = pk_find_apid(FK_PON_PPID, count, &owner);
+	printf("PANDORA KEYS: PON PPID 0x013 -> APID %u (owner ee%u)\n", fk_pon_apid, owner);
+	pk_step("observer channel of that APID", PK_OBS_PA + 0x20u * fk_pon_apid);
 	uint8_t ptype = 0, psub = 0, pon = 0;
 	bool pok = fk_read(fk_pon_apid, 0x04, &ptype) &&
 	    fk_read(fk_pon_apid, 0x05, &psub) &&
 	    fk_read(fk_pon_apid, FK_PON_RT, &pon);
-	uint32_t ctl = fk_rd(pk_tlmm, 0x0), io = fk_rd(pk_tlmm, 0x4);
-	printf("PANDORA KEYS: pon-apid=%u/ee%u ok=%d type=%#x subtype=%#x rt=%#x st=%#x gpio101 ctl=%#x io=%#x\n",
-	    fk_pon_apid, owner, pok, ptype, psub, pon, fk_last_status, ctl, io);
+	printf("PANDORA KEYS: pon-apid=%u/ee%u ok=%d type=%#x subtype=%#x rt=%#x st=%#x\n",
+	    fk_pon_apid, owner, pok, ptype, psub, pon, fk_last_status);
 	if (!pok) {
 		fk_pon_apid = FK_NO_APID;
 	}
+gpio:
+	if (!(pk_mask & 2u)) {
+		pk_tlmm = 0;
+		goto done;
+	}
+	pk_step("TLMM GPIO 101", PK_TLMM_GPIO);
+	uint32_t ctl = fk_rd(pk_tlmm, 0x0), io = fk_rd(pk_tlmm, 0x4);
+	printf("PANDORA KEYS: gpio101 ctl=%#x io=%#x\n", ctl, io);
 	/* GPIO 101 must be a GPIO input: FUNC (bits 2-5) 0, OE (bit 9) off. PULL (bits 0-1)
 	 * is only logged: the board may pull the key line up itself. */
 	if ((ctl & 0x3cu) != 0 || (ctl & 0x200u)) {
 		printf("PANDORA KEYS: gpio101 not a GPIO input; volume-up withheld\n");
 		pk_tlmm = 0;
 	}
+done:
 	if (fk_pon_apid == FK_NO_APID && !pk_tlmm) {
 		return false;
 	}
