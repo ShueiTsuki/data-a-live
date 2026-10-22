@@ -210,7 +210,7 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 3. 我们能不能直接配置 `0x3da0000` 那块 SMMU 的上下文。**已缩小** [实测，我们自己的补丁]：0114 从我们的内核读过 apps SMMU（`0x15000000`）的全局寄存器和上下文；0131 在 apps SMMU 里新增了流匹配项（SMR/S2CR，流 `0x536` 和 `0x523`），给触摸的 GPI DMA 用，触摸因此能工作。也就是说，在这台手机上，我们的内核写 arm,mmu-500 的寄存器是被允许、也有效的。GPU 的 SMMU 是同一种 IP 的另一个实例，区别是要先打开 GPUCC 的时钟才能访问（安卓设备树里它的供应者包括时钟控制器 `0x3d90000`）。安全上下文（secure）我们第一阶段用不上。
 4. GMU 固件 `gen80200_gmu.bin` 在我们按 Linux 顺序准备好的环境里，会不会报告初始化成功、会不会回复第一条 HFI 消息 `MSG_TABLE`。
 5. iOS 16 上 `_MTLDevice` 的实例大小（ios-fuxi 实测是 528），以及 NativeMetal 经 N1 移植后，真正的 backboardd 会不会再拒绝别的功能。
-6. 墙纸的 HEIC 图层：问题是出在 HEVC 解码，还是出在 CPU 画 YUV 图片。有了 GPU 能解决后者，解决不了前者。
+6. 墙纸的 HEIC 图层：问题是出在 HEVC 解码，还是出在 CPU 画 YUV 图片。有了 GPU 能解决后者，解决不了前者。补充 [读自我们的系统库和根盘]：iPhone X 的 HEVC 解码走硬件（系统库里是 `AppleD5500` / `AppleVXD393` 那一套，以及 `HEVCH8` 等解码器登记），我们的移植没有这个硬件驱动。按名字在系统库里没找到软件 HEVC 解码器；根盘 `/System/Library/VideoDecoders/` 下只有 `AV1SW.metallib`（AV1 软件解码要用的 GPU 着色器）。但主线日志里 mediaserverd 建了解码会话和 L008 缓冲区，CollectionsPoster 也建了 420f 缓冲区，所以解码有没有成功，要看系统日志里 VideoToolbox/ImageIO 的报错才能定。这一项交给主线会话确认。
 
 ## 7.6 别人实测踩过的坑（ios-fuxi，SM8550 / A740）[读到]
 
