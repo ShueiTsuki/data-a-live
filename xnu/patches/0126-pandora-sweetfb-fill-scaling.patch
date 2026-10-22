@@ -1,0 +1,83 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 085293c..d82f1b2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -120,6 +120,10 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++#if defined(PANDORA)
++	bool          fFill;                    /* sweetfb_fill=1: scale to the whole panel */
++	uint16_t      fFillX[2048];             /* panel x -> logical x */
++#endif
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -213,6 +217,19 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++#if defined(PANDORA)
++	/*
++	 * sweetfb_fill=1: instead of the centered 1125x2436 area with a black border,
++	 * scale the presented display to the whole 1220x2656 panel (nearest neighbour,
++	 * x 1.084 / y 1.090; the aspect ratios differ by 0.5 %).
++	 */
++	int fill = 0;
++	PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
++	fFill = fill != 0 && fLogicalW != fWidth && fWidth <= 2048;
++	for (uint32_t x = 0; fFill && x < fWidth; x++) {
++		fFillX[x] = (uint16_t)((uint64_t)x * fLogicalW / fWidth);
++	}
++#endif
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -483,6 +500,47 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++#if defined(PANDORA)
++		if (fFill) {
++			/* Clip in logical space, check the source, then for every panel pixel
++			 * whose logical position falls in the layer's rectangle copy that pixel. */
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
++			uint64_t lastf = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->memory != NULL && lastf <= s->memory->getLength()) {
++				uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
++				uint32_t px1 = (uint32_t)MIN(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW,
++				    (uint64_t)fWidth);
++				uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
++				uint32_t py1 = (uint32_t)MIN(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH,
++				    (uint64_t)fHeight);
++				for (uint32_t Y = py0; Y < py1; Y++) {
++					uint32_t ly = (uint32_t)((uint64_t)Y * fLogicalH / fHeight);
++					const uint32_t *srow = (const uint32_t *)(src + s->offset +
++					    (uint64_t)(sy + (int32_t)ly - dy) * s->bytesPerRow);
++					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)Y * fRowBytes);
++					for (uint32_t X = px0; X < px1; X++) {
++						drow[X] = srow[sx + (int32_t)fFillX[X] - dx];
++					}
++				}
++				cpuFrame = true;
++			}
++			s->release();
++			continue;
++		}
++#endif
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
