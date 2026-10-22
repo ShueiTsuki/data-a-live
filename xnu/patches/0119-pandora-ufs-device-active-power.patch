@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5eadbaa..4f29f0e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1133,6 +1133,23 @@ pandora_ufs_gpt(void)
+ 		    ufs_rd(REG_HCS), ufs_rd(REG_IS));
+ 		pandora_ufs_link("awake");
+ 	}
++	if (!error) {
++		/*
++		 * With the link awake LUN 0 answers TEST UNIT READY with CHECK CONDITION,
++		 * sense NOT READY 04/02 ("initializing command required"): the bootloader also
++		 * left the device in a low-power mode. START STOP UNIT, power condition ACTIVE,
++		 * to the UFS device well-known LUN 0xD0, exactly as Linux on resume
++		 * (ufshcd_set_dev_pwr_mode) and Fuxi's init; the only power command ufs_scsi's
++		 * filter lets through. No data.
++		 */
++		static const uint8_t active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		su.lun = 0xd0;
++		for (int i = 0; i < 3 && (error = ufs_scsi(active, sizeof(active), 0, false)); i++) {
++			printf("PANDORA UFS: START STOP UNIT (ACTIVE) try %d: %d\n", i + 1, error);
++		}
++		su.lun = 0;
++		printf("PANDORA UFS: START STOP UNIT (ACTIVE): %d\n", error);
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
