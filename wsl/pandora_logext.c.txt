@@ -1,0 +1,80 @@
+#if defined(PANDORA)
+/* Log file extents (see pandora_log_start): same {file, part, count} layout as fx_ext. */
+static bool
+pl_map(uint64_t blk, uint64_t *lba, uint64_t *run)
+{
+	for (unsigned i = 0; i < pl_next; i++) {
+		if (blk >= pl_ext[i].file && blk - pl_ext[i].file < pl_ext[i].count) {
+			uint64_t off = blk - pl_ext[i].file;
+			*lba = fx_part_first + pl_ext[i].part + off;
+			*run = pl_ext[i].count - off;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+pl_inside(uint64_t lba, uint64_t count)
+{
+	for (unsigned i = 0; i < pl_next; i++) {
+		uint64_t first = fx_part_first + pl_ext[i].part;
+		if (lba >= first && lba - first < pl_ext[i].count &&
+		    count <= pl_ext[i].count - (lba - first)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* After fx_load_extents: the log file must lie in userdata and not touch the root file. */
+static void
+pl_load_extents(void)
+{
+	DTEntry chosen;
+	uint64_t const *ext = NULL, *blocks = NULL;
+	unsigned int size = 0, bsize = 0;
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "pandora-log-extents", (void const **)&ext, &size) != kSuccess ||
+	    SecureDTGetProperty(chosen, "pandora-log-blocks", (void const **)&blocks, &bsize) != kSuccess ||
+	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t)) ||
+	    size / (3 * sizeof(uint64_t)) > PL_MAX_EXTENTS) {
+		printf("PANDORA LOG: no pandora-log-extents in /chosen\n");
+		return;
+	}
+	unsigned n = size / (3 * sizeof(uint64_t));
+	uint64_t want = *blocks, pos = 0;
+	if (want < 1 + (4u << 20) / UFS_BLOCK) {      /* header + 4 MiB ring (SWEET_LOG_SIZE) */
+		printf("PANDORA LOG: log file too small (%llu blocks)\n", want);
+		return;
+	}
+	for (unsigned i = 0; i < n && pos < want; i++) {
+		uint64_t file = ext[3 * i], part = ext[3 * i + 1], count = ext[3 * i + 2];
+		if (file != pos || count == 0 || part >= fx_part_blocks || count > fx_part_blocks - part) {
+			printf("PANDORA LOG: bad extent %u\n", i);
+			pl_next = 0;
+			return;
+		}
+		count = MIN(count, want - pos);
+		for (unsigned j = 0; j < fx_next; j++) {
+			if (part < fx_ext[j].part + fx_ext[j].count && fx_ext[j].part < part + count) {
+				printf("PANDORA LOG: extent %u overlaps the root file\n", i);
+				pl_next = 0;
+				return;
+			}
+		}
+		pl_ext[pl_next].file = file;
+		pl_ext[pl_next].part = part;
+		pl_ext[pl_next].count = count;
+		pl_next++;
+		pos += count;
+	}
+	if (pos != want) {
+		pl_next = 0;
+		printf("PANDORA LOG: extents cover 0x%llx of 0x%llx blocks\n", pos, want);
+		return;
+	}
+	pl_blocks = want;
+	printf("PANDORA LOG: log file in userdata: %u extents, %llu blocks\n", pl_next, pl_blocks);
+}
+#endif /* PANDORA */
