@@ -464,7 +464,8 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 	}
 	*bridge = r.a2;
 	scm_smc(SCM_FN(2, 1), SCM_ARGS(2) | (SCM_RW << 6), pas, md_pa, 0, 0, &r);
-	printf("PANDORA ADSP: pas %u init_image -> a0 %#llx a1 %#llx\n", pas, r.a0, r.a1);
+	printf("PANDORA ADSP: pas %u init_image (%u bytes) -> a0 %#llx (%d) a1 %#llx\n", pas,
+	    ehdr_size + hash_size, r.a0, (int)(int32_t)r.a0, r.a1);
 	if (r.a0 || r.a1) {
 		return EIO;
 	}
@@ -534,10 +535,20 @@ adsp_boot(void)
 	if ((err = qmp_send("{class: image, res: load_state, name: adsp, val: on}"))) {
 		printf("PANDORA ADSP: load_state failed %d\n", err);
 	}
+	/* Images the boot loaders may have left running (x1e80100: "lite" ADSP pas 0x1f and
+	 * DTB 0x29), and our own ids: shut down first, as qcom_pas_load does for lite ids. */
+	static const unsigned stop[] = {0x1f, 0x29, AD_PAS_MAIN, AD_PAS_DTB};
+	for (unsigned i = 0; i < 4; i++) {
+		struct scm_res s, q;
+		scm_smc(SCM_FN(2, 7), SCM_ARGS(1), stop[i], 0, 0, 0, &q);
+		scm_smc(SCM_FN(2, 6), SCM_ARGS(1), stop[i], 0, 0, 0, &s);
+		printf("PANDORA ADSP: pas %#x supported a0 %#llx a1 %#llx, shutdown -> a0 %#llx a1 %#llx\n",
+		    stop[i], q.a0, q.a1, s.a0, s.a1);
+	}
 	if ((err = pas_load("adsp_dtb", AD_PAS_DTB, AD_DTB_PA, AD_DTB_SIZE, &b_dtb)) ||
 	    (err = pas_auth(AD_PAS_DTB))) {
+		/* Go on with the main image anyway: its answer tells more. */
 		printf("PANDORA ADSP: DTB image failed %d\n", err);
-		return;
 	}
 	if ((err = pas_load("adsp", AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main)) ||
 	    (err = pas_auth(AD_PAS_MAIN))) {
