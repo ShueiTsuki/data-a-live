@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index eac90d7..757f23a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -388,6 +388,14 @@ pl_load_extents(void)
+ #endif /* PANDORA */
+ #endif
+ 
++#if defined(PANDORA)
++/* Disk statistics (pandora_iostats); absolute-time units, updated under sweet_ufs_lock. */
++static struct pandora_io {
++	uint64_t rd_cmds, rd_bytes, wr_cmds, wr_bytes, other_cmds;
++	uint64_t dev_time, scsi_time, lock_wait, max_dev, bufs;
++} pio;
++#endif
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -491,6 +499,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++#if defined(PANDORA)
++	uint64_t pio_t0 = mach_absolute_time();
++#endif
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -522,6 +533,22 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
++#if defined(PANDORA)
++	uint64_t pio_dev = mach_absolute_time() - pio_t0;
++	pio.dev_time += pio_dev;
++	if (pio_dev > pio.max_dev) {
++		pio.max_dev = pio_dev;
++	}
++	if (len && write) {
++		pio.wr_cmds++;
++		pio.wr_bytes += len;
++	} else if (len) {
++		pio.rd_cmds++;
++		pio.rd_bytes += len;
++	} else {
++		pio.other_cmds++;
++	}
++#endif
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -729,7 +756,15 @@ sweet_ufs_strategy(buf_t bp)
+ 		goto done;
+ 	}
+ 
++#if defined(PANDORA)
++	uint64_t pio_w = mach_absolute_time();
++#endif
+ 	lck_mtx_lock(&sweet_ufs_lock);
++#if defined(PANDORA)
++	uint64_t pio_in = mach_absolute_time();
++	pio.lock_wait += pio_in - pio_w;
++	pio.bufs++;
++#endif
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -772,6 +807,9 @@ sweet_ufs_strategy(buf_t bp)
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++#if defined(PANDORA)
++	pio.scsi_time += mach_absolute_time() - pio_in;
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	buf_unmap(bp);
+ 
+@@ -1920,11 +1958,42 @@ pandora_halt_restart(unsigned int type)
+ 	return 0;
+ }
+ 
++static uint64_t
++pio_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* One line per interval: the driver's work since the last line (sweet_ufs_lock held). */
++static void
++pio_print(uint64_t interval)
++{
++	static struct pandora_io last;
++	struct pandora_io d = {
++		.rd_cmds = pio.rd_cmds - last.rd_cmds, .rd_bytes = pio.rd_bytes - last.rd_bytes,
++		.wr_cmds = pio.wr_cmds - last.wr_cmds, .wr_bytes = pio.wr_bytes - last.wr_bytes,
++		.other_cmds = pio.other_cmds - last.other_cmds, .bufs = pio.bufs - last.bufs,
++		.dev_time = pio.dev_time - last.dev_time, .scsi_time = pio.scsi_time - last.scsi_time,
++		.lock_wait = pio.lock_wait - last.lock_wait,
++	};
++	last = pio;
++	uint64_t ms = pio_ms(interval), dev = pio_ms(d.dev_time);
++	printf("PANDORA IO: %llu ms: bufs %llu, read %llu cmds %llu KiB, write %llu cmds %llu KiB, "
++	    "other %llu; device %llu ms (%llu%%), max %llu us; driver %llu ms; lock wait %llu ms\n",
++	    ms, d.bufs, d.rd_cmds, d.rd_bytes >> 10, d.wr_cmds, d.wr_bytes >> 10, d.other_cmds,
++	    dev, ms ? dev * 100 / ms : 0, pio_ms(pio.max_dev * 1000), pio_ms(d.scsi_time),
++	    pio_ms(d.lock_wait));
++	pio.max_dev = 0;
++}
++
+ static void
+ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint32_t secs = 3, reboot_after = 0;
++	uint32_t secs = 3, reboot_after = 0, iostats = 30;
+ 	PE_parse_boot_argn("pandora_logsecs", &secs, sizeof(secs));
++	PE_parse_boot_argn("pandora_iostats", &iostats, sizeof(iostats));
+ 	PE_parse_boot_argn("pandora_reboot_after", &reboot_after, sizeof(reboot_after));
+ 	if (secs == 0) {
+ 		secs = 3;
+@@ -1935,9 +2004,16 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	printf("PANDORA LOG: console log to the pinned log file every %u s%s%u\n", secs,
+ 	    reboot_after ? ", reset after s " : "", reboot_after);
++	uint64_t io_every = 0, io_last = start;
++	nanoseconds_to_absolutetime((uint64_t)iostats * NSEC_PER_SEC, &io_every);
+ 	for (;;) {
+ 		(void)tsleep(&pl_chan, PZERO, "pandoralog", hz * (int)secs);
+ 		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t now = mach_absolute_time();
++		if (io_every && now - io_last >= io_every) {
++			pio_print(now - io_last);
++			io_last = now;
++		}
+ 		int error = pl_flush();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
