@@ -1,0 +1,160 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2f5cd69..3c0e85b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -805,6 +805,143 @@ pandora_ufs_probe(void)
+ 	}
+ }
+ 
++/*
++ * pandora_ufs_probe=2: first UFS data read on SM8850. The bootloader leaves the host
++ * enabled in legacy doorbell mode (MEM_CFG=0) with stream 0x60 on an SMMU bypass
++ * context (VA64, 36-bit OAS), see device/DT_FINDINGS.md, so no clock or SMMU write.
++ * Takes over the request list, then sends only TEST UNIT READY and READ(10) of LUN 0's
++ * GPT (ufs_scsi's FUXI filter refuses anything else; su.writable stays false), prints
++ * the partition table and stops.
++ */
++static int
++pandora_print_gpt(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t entry_lba, last_lba;
++	uint32_t nent, esz;
++	char pend[48] = "";
++	unsigned used = 0;
++	int error;
++
++	error = ufs_read_blocks(1, 1);
++	if (error) {
++		printf("PANDORA UFS: READ of block 1 failed: %d\n", error);
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("PANDORA UFS: block 1 is not a GPT header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++		return ENXIO;
++	}
++	memcpy(&last_lba, b + 48, 8);
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	printf("PANDORA UFS: LUN 0 GPT: %u entries x %u bytes at block %llu, last usable 0x%llx\n",
++	    nent, esz, entry_lba, last_lba);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (error) {
++		printf("PANDORA UFS: READ of the GPT entries failed: %d\n", error);
++		return error;
++	}
++	printf("PANDORA UFS: nr name           first     blocks   (4 KiB blocks, hex)\n");
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		bool empty = true;
++		for (int k = 0; k < 16; k++) {
++			if (e[k]) {
++				empty = false;
++			}
++		}
++		if (empty) {
++			continue;
++		}
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		char cur[48];
++		snprintf(cur, sizeof(cur), "%2u %-14.14s %8llx %8llx", i + 1, name, first,
++		    last >= first ? last - first + 1 : 0);
++		if (pend[0]) {
++			printf("%s  %s\n", pend, cur);
++			pend[0] = 0;
++		} else {
++			strlcpy(pend, cur, sizeof(pend));
++		}
++		used++;
++	}
++	if (pend[0]) {
++		printf("%s\n", pend);
++	}
++	printf("PANDORA UFS: %u partitions on LUN 0\n", used);
++	return 0;
++}
++
++static void
++pandora_ufs_gpt(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	ppnum_t pn = 0;
++	int error = ENXIO;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) || reg[0] != PU_UFS_PA) {
++		printf("PANDORA UFS: no /sweet-ufs node at 0x%x\n", PU_UFS_PA);
++		goto stop;
++	}
++	su.regs = ml_io_map(reg[0], reg[1]);
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("PANDORA UFS: no contiguous DMA memory\n");
++		goto stop;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	su.dma_pa = ptoa_64(pn);
++	if (!pn || ((su.dma_pa + DMA_SIZE - 1) >> 36)) {
++		printf("PANDORA UFS: DMA at 0x%llx is outside the SMMU's 36-bit range\n", su.dma_pa);
++		goto stop;
++	}
++	su.lun = 0;
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_take_over_host();
++	printf("PANDORA UFS: take over host: %d (DMA at 0x%llx)\n", error, su.dma_pa);
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* The first command after the bootloader may report a unit attention. */
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++		printf("PANDORA UFS: TEST UNIT READY: %d\n", error);
++	}
++	if (!error) {
++		error = pandora_print_gpt();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++stop:
++	printf("PANDORA UFS: GPT read %s (%d), nothing written. Hold power to reboot.\n",
++	    error ? "FAILED" : "done", error);
++	for (;;) {
++		delay(1000000);
++	}
++}
++
+ /* Not ported to SM8850 yet: the SM8550 init writes SM8550 GCC offsets. Non-const so the
+  * code below stays reachable for the compiler. */
+ static bool pandora_ufs_ported = false;
+@@ -976,7 +1113,10 @@ void fuxi_storage_probe(void)
+ {
+ #if defined(PANDORA)
+  uint32_t probe=0;
+- if (PE_parse_boot_argn("pandora_ufs_probe",&probe,sizeof(probe)) && probe==1) pandora_ufs_probe();
++ if (PE_parse_boot_argn("pandora_ufs_probe",&probe,sizeof(probe))) {
++  if (probe==1) pandora_ufs_probe();
++  if (probe==2) pandora_ufs_gpt();
++ }
+ #endif
+  uint32_t requested=0;
+  if (!PE_parse_boot_argn("fuxi_ufs_probe",&requested,sizeof(requested)) || requested!=1) return;
