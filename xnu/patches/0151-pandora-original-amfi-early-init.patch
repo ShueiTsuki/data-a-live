@@ -1,0 +1,107 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..b1a72fa 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -238,10 +238,19 @@ static const amfi_t sweet_amfi = {
+ 	},
+ };
+ 
++/* True when the built-in interface is the one in use (no original AMFI). */
++static SECURITY_READ_ONLY_LATE(bool) sweet_amfi_builtin;
++
+ __startup_func
+ static void
+ sweet_amfi_register(void)
+ {
++	if (amfi != NULL) {
++		/* The prelinked original AMFI registered first (PANDORA, tools/mkprelink.py). */
++		printf("SWEET AMFI: original AMFI interface present; built-in not registered\n");
++		return;
++	}
++	sweet_amfi_builtin = true;
+ 	amfi_interface_register(&sweet_amfi);
+ 	printf("SWEET AMFI: built-in interface registered (XML entitlements)\n");
+ }
+@@ -373,9 +382,14 @@ void sweet_amfi_policy_register(void);
+ void
+ sweet_amfi_policy_register(void)
+ {
+-	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+-	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+-	    error ? "NOT registered" : "registered", error);
++	int error = 0;
++	if (sweet_amfi_builtin) {
++		error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
++		printf("SWEET AMFI: platform binary policy %s (%d)\n",
++		    error ? "NOT registered" : "registered", error);
++	} else {
++		printf("SWEET AMFI: original AMFI policy in use; built-in policy not registered\n");
++	}
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 82661cf..a2065cc 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -73,6 +73,11 @@ extern "C" {
+ 
+ #include <libkern/OSKextLibPrivate.h>
+ #include <libkern/c++/OSKext.h>
++
++#if CONFIG_MACF
++extern "C" int mac_late;
++extern "C" __attribute__((used)) const uint32_t native_prelink_security_init_version = 1;
++#endif
+ #include <libkern/c++/OSLib.h>
+ 
+ #include <IOKit/IOLib.h>
+@@ -8286,6 +8291,48 @@ OSKext::start(bool startDependenciesFlag)
+ 		result = startfunc(kmod_info, kmodStartData);
+ 	}
+ 
++	/* From UniXNU NativePrelink: on PANDORA (tools/mkprelink.py) this runs the original
++	 * iOS 16 AMFI initializer that the original Sandbox kext would otherwise call while
++	 * the security extensions load, so AMFI's MAC policy and amfi interface exist before
++	 * trust_cache_runtime_init().
++	 *
++	 * An explicitly linked security initializer must run with its real
++	 * dependencies and constructors ready, before MAC policy lockdown.
++	 * It executes original component code; no policy result is supplied.
++	 */
++	{
++		OSObject *earlyInitProperty = getPropertyForHostArch("_NativePrelinkEarlySecurityInit");
++		if (result == KERN_SUCCESS && earlyInitProperty != NULL) {
++	#if CONFIG_MACF
++			OSNumber *earlyInit = OSDynamicCast(OSNumber, earlyInitProperty);
++			uintptr_t target = 0;
++			bool executable = false;
++			if (!earlyInit || !isPrelinked() || mac_late ||
++			    getPropertyForHostArch("AppleSecurityExtension") != kOSBooleanTrue ||
++			    __builtin_add_overflow((uintptr_t)earlyInit->unsigned64BitValue(),
++			    vm_kernel_slide, &target) || (target & 3)) {
++				panic("NativePrelink: invalid early security initializer or phase");
++			}
++			kernel_mach_header_t *header = (kernel_mach_header_t *)kmod_info->address;
++			for (kernel_segment_command_t *seg = firstsegfromheader(header);
++			    seg != NULL; seg = nextsegfromheader(header, seg)) {
++				if (seg->initprot == (VM_PROT_READ | VM_PROT_EXECUTE) &&
++				    !(seg->maxprot & VM_PROT_WRITE) && seg->vmsize >= 4 &&
++				    target >= seg->vmaddr && target - seg->vmaddr <= seg->vmsize - 4) {
++					executable = true;
++					break;
++				}
++			}
++			if (!executable) {
++				panic("NativePrelink: early security initializer outside module code");
++			}
++			((void (*)(void))target)();
++	#else
++			panic("NativePrelink: early security initializer requires MAC framework");
++	#endif
++		}
++	}
++
+ 	flags.starting = 0;
+ 
+ 	/* On success overlap the setting of started/starting. On failure just

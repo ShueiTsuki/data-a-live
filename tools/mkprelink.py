@@ -35,6 +35,10 @@ AMFI = 'com.apple.driver.AppleMobileFileIntegrity'
 KEEP_PERSONALITIES = {AMFI}
 RENAMES = {'com.apple.driver.AppleARMPlatform': {'AppleARMBacklight': 'XppleARMBacklight'}}
 SLIDE = -0x1000000
+# iOS 16 AMFI's exported initializer (registers its MAC policy and the amfi interface), which
+# the original Sandbox kext calls while the security extensions load. Without that kext the
+# kernel calls it (patch 0151, UniXNU's early security initializer) when it has the ABI marker.
+EARLY_SECURITY_INIT = {AMFI: 0xfffffff005704320}
 M64 = (1 << 64) - 1
 
 
@@ -138,7 +142,10 @@ def native_class_names(native, native_meta):
 
 def build(native, kc, roots, slide):
     native = clear_ctf(native)
-    image, report = epl.emit(native, kc, roots, slide)
+    names = {n for ns in npl.exports(native, npl.macho(native)).values() for n in ns}
+    early = EARLY_SECURITY_INIT if '_native_prelink_security_init_version' in names else {}
+    image, report = epl.emit(native, kc, roots, slide, early)
+    report['early_security_init_used'] = {k: hex(v) for k, v in early.items()}
     image = bytearray(image)
     kc_meta = npl.macho(kc)
     _, kc_info = info_segment(kc)
@@ -348,6 +355,14 @@ def verify(native, kc, image, slide):
                 break
     check(not bad_classes, f'{compared} kernel class vtables slot-compatible with the original '
           f'({len(bad_classes)} differ, first: {bad_classes[:3]})')
+
+    # Early security initializer: the original address plus the slide, inside AMFI's code.
+    early = new_entries[AMFI].get('_NativePrelinkEarlySecurityInit') if AMFI in new_entries else None
+    if early is not None:
+        check(early == EARLY_SECURITY_INIT[AMFI] + slide,
+              f'AMFI early security initializer {early:#x} (original {EARLY_SECURITY_INIT[AMFI]:#x})')
+    else:
+        lines.append('      no early security initializer (kernel without patch 0151)')
 
     # 7. Personalities: only the kept ones can start a driver.
     with_pers = sorted(i for i, e in new_entries.items() if e.get('IOKitPersonalities'))
