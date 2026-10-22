@@ -31,5 +31,6 @@ echo "back in Android after $(($(date +%s) - start)) s"
 sleep 5
 raw="$ROOT/device/logs/$NAME.raw"
 "$ADB" exec-out su -c "/data/local/tmp/pinfile rawread /data/local/tmp/ioslog.img /dev/block/sda34 2>/dev/null" > "$raw"
-python -I "$ROOT/tools/pandora_log.py" "$(cygpath -w "$raw")" "$(cygpath -w "$ROOT/device/logs/$NAME.txt")"
+winp() { echo "$1" | sed -E 's|^/([a-z])/|\1:/|'; }
+python -I "$(winp "$ROOT/tools/pandora_log.py")" "$(winp "$raw")" "$(winp "$ROOT/device/logs/$NAME.txt")"
 rm -f "$raw"
