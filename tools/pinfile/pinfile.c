@@ -13,6 +13,13 @@
  *                                  file (N = all for every block) on DEV, bypassing the
  *                                  filesystem, then read them back from disk
  *   pinfile rawcheck PATH [DEV]    read-only: which blocks carry the test pattern on disk
+ *   pinfile rawwrite PATH DEV N --yes
+ *                                  copy standard input (an image) into the first N 4 KiB blocks
+ *                                  of the file (N = all) on DEV, bypassing the filesystem; a
+ *                                  short last block is zero-padded, input shorter than N stops
+ *   pinfile rawhash PATH [DEV] [BYTES]
+ *                                  read-only: SHA-256 of the file's first BYTES (default: all)
+ *                                  read raw from DEV in file order, to compare with the image
  *   pinfile fsread  PATH           read-only: drop the file's cached pages and read it through
  *                                  the filesystem; blocks written raw no longer read as zeros
  *                                  (the filesystem decrypts our plaintext into noise), which
@@ -520,6 +527,201 @@ static int cmd_rawcheck(const char *path, const char *dev)
 	return badc ? 1 : 0;
 }
 
+/* ---- SHA-256 (FIPS 180-4), for rawhash: the binary is static, no libcrypto ---- */
+struct sha256 { uint32_t h[8]; uint64_t len; unsigned char buf[64]; unsigned n; };
+
+static const uint32_t K256[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static void sha256_block(struct sha256 *c, const unsigned char *p)
+{
+	uint32_t w[64], a, b, d, e, f, g, h, cc, t1, t2;
+	for (int i = 0; i < 16; i++)
+		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
+		    (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+	for (int i = 16; i < 64; i++)
+		w[i] = (ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10)) + w[i - 7] +
+		    (ROR(w[i - 15], 7) ^ ROR(w[i - 15], 18) ^ (w[i - 15] >> 3)) + w[i - 16];
+	a = c->h[0]; b = c->h[1]; cc = c->h[2]; d = c->h[3];
+	e = c->h[4]; f = c->h[5]; g = c->h[6]; h = c->h[7];
+	for (int i = 0; i < 64; i++) {
+		t1 = h + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i];
+		t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & cc) ^ (b & cc));
+		h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+	}
+	c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+	c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
+}
+
+static void sha256_init(struct sha256 *c)
+{
+	static const uint32_t iv[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+		0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+	memcpy(c->h, iv, sizeof iv);
+	c->len = 0;
+	c->n = 0;
+}
+
+static void sha256_update(struct sha256 *c, const unsigned char *p, size_t len)
+{
+	c->len += len;
+	while (len) {
+		unsigned take = 64 - c->n < len ? 64 - c->n : (unsigned)len;
+		memcpy(c->buf + c->n, p, take);
+		c->n += take;
+		p += take;
+		len -= take;
+		if (c->n == 64) {
+			sha256_block(c, c->buf);
+			c->n = 0;
+		}
+	}
+}
+
+static void sha256_final(struct sha256 *c, unsigned char out[32])
+{
+	uint64_t bits = c->len * 8;
+	unsigned char pad = 0x80, zero = 0, lenb[8];
+	sha256_update(c, &pad, 1);
+	while (c->n != 56)
+		sha256_update(c, &zero, 1);
+	for (int i = 0; i < 8; i++)
+		lenb[i] = (unsigned char)(bits >> (56 - 8 * i));
+	sha256_update(c, lenb, 8);
+	for (int i = 0; i < 8; i++) {
+		out[4 * i] = (unsigned char)(c->h[i] >> 24);
+		out[4 * i + 1] = (unsigned char)(c->h[i] >> 16);
+		out[4 * i + 2] = (unsigned char)(c->h[i] >> 8);
+		out[4 * i + 3] = (unsigned char)c->h[i];
+	}
+}
+
+/* Read exactly n bytes from fd unless EOF comes first; returns bytes read or -1. */
+static ssize_t read_full(int fd, unsigned char *p, size_t n)
+{
+	size_t got = 0;
+	while (got < n) {
+		ssize_t r = read(fd, p + got, n - got);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (r == 0)
+			break;
+		got += (size_t)r;
+	}
+	return (ssize_t)got;
+}
+
+static int cmd_rawwrite(const char *path, const char *dev, const char *count)
+{
+	uint64_t limit = UINT64_MAX;
+	if (strcmp(count, "all") != 0) {
+		char *end;
+		limit = strtoull(count, &end, 10);
+		if (*end || limit == 0)
+			return fail("N must be a positive number of blocks or 'all'");
+	}
+	int wfd = open(dev, O_RDWR | O_DIRECT | O_SYNC | O_CLOEXEC);
+	if (wfd < 0)
+		return die("open DEV for writing");
+	if (checked_layout(path, dev, wfd))
+		return 1;
+	unsigned char *b;
+	if (posix_memalign((void **)&b, BLK, BLK))
+		return die("posix_memalign");
+	struct sha256 h;
+	sha256_init(&h);
+	uint64_t written = 0;
+	int eof = 0;
+	for (int i = 0; i < nL && written < limit && !eof; i++)
+		for (uint64_t off = 0; off < L[i].length && written < limit; off += BLK) {
+			ssize_t got = read_full(0, b, BLK);
+			if (got < 0)
+				return die("read standard input");
+			if (got == 0) {
+				eof = 1;
+				break;
+			}
+			if (got < (ssize_t)BLK) {
+				memset(b + got, 0, BLK - (size_t)got);
+				eof = 1;
+			}
+			uint64_t phys = L[i].physical + off;
+			if (!inside_one_extent(phys, BLK))
+				return fail("internal: write outside the extents");
+			if (pwrite(wfd, b, BLK, (off_t)phys) != BLK)
+				return die("pwrite");
+			sha256_update(&h, b, BLK);
+			written++;
+			if (eof)
+				break;
+		}
+	if (fsync(wfd) < 0)
+		return die("fsync DEV");
+	close(wfd);
+	free(b);
+	unsigned char d[32];
+	sha256_final(&h, d);
+	printf("wrote %llu blocks (%llu bytes); sha256 of what was written: ",
+	    (unsigned long long)written, (unsigned long long)written * BLK);
+	for (int i = 0; i < 32; i++)
+		printf("%02x", d[i]);
+	printf("\n");
+	return 0;
+}
+
+static int cmd_rawhash(const char *path, const char *dev, const char *bytes_arg)
+{
+	int rfd = open(dev, O_RDONLY | O_DIRECT | O_CLOEXEC);
+	if (rfd < 0)
+		return die("open DEV (read-only)");
+	if (checked_layout(path, dev, rfd))
+		return 1;
+	uint64_t want = UINT64_MAX;
+	if (bytes_arg) {
+		char *end;
+		want = strtoull(bytes_arg, &end, 0);
+		if (*end || want == 0)
+			return fail("BYTES must be a positive number");
+	}
+	unsigned char *b;
+	if (posix_memalign((void **)&b, BLK, CHUNK))
+		return die("posix_memalign");
+	struct sha256 h;
+	sha256_init(&h);
+	uint64_t done = 0;
+	for (int i = 0; i < nL && done < want; i++)
+		for (uint64_t off = 0; off < L[i].length && done < want;) {
+			uint64_t n = L[i].length - off < CHUNK ? L[i].length - off : CHUNK;
+			if (pread(rfd, b, (size_t)n, (off_t)(L[i].physical + off)) != (ssize_t)n)
+				return die("pread");
+			uint64_t use = want - done < n ? want - done : n;
+			sha256_update(&h, b, (size_t)use);
+			done += use;
+			off += n;
+		}
+	close(rfd);
+	free(b);
+	unsigned char d[32];
+	sha256_final(&h, d);
+	for (int i = 0; i < 32; i++)
+		printf("%02x", d[i]);
+	printf("  %s raw, first %llu bytes\n", path, (unsigned long long)done);
+	return 0;
+}
+
 /* Read-only through the filesystem: which 4 KiB blocks are no longer all zero. */
 static int cmd_fsread(const char *path)
 {
@@ -560,6 +762,10 @@ int main(int argc, char **argv)
 		return cmd_rawtest(argv[2], argv[3], argv[4]);
 	if (argc == 3 && !strcmp(argv[1], "fsread"))
 		return cmd_fsread(argv[2]);
+	if (argc == 6 && !strcmp(argv[1], "rawwrite") && !strcmp(argv[5], "--yes"))
+		return cmd_rawwrite(argv[2], argv[3], argv[4]);
+	if (argc >= 3 && argc <= 5 && !strcmp(argv[1], "rawhash"))
+		return cmd_rawhash(argv[2], argc >= 4 ? argv[3] : DEFAULT_DEV, argc == 5 ? argv[4] : NULL);
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "rawcheck"))
 		return cmd_rawcheck(argv[2], argc == 4 ? argv[3] : DEFAULT_DEV);
 	if (argc >= 4 && !strcmp(argv[1], "create"))
@@ -572,6 +778,7 @@ int main(int argc, char **argv)
 		return cmd_compare(argv[2], argc == 4 ? argv[3] : DEFAULT_DEV);
 	fprintf(stderr,
 	    "usage: pinfile create PATH SIZE_MB | status PATH | extents PATH [--json] | compare PATH [DEV]\n"
-	    "       pinfile rawtest PATH DEV N|all --yes | rawcheck PATH [DEV] | fsread PATH\n");
+	    "       pinfile rawtest PATH DEV N|all --yes | rawcheck PATH [DEV] | fsread PATH\n"
+	    "       pinfile rawwrite PATH DEV N|all --yes < IMAGE | rawhash PATH [DEV] [BYTES]\n");
 	return 2;
 }
