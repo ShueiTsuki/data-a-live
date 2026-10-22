@@ -11,7 +11,7 @@
  * bits 22-26, SE0 RCG 0xa9014); GENI and SPI registers as Linux qcom-geni-se.c and
  * spi-geni-qcom.c; TouchComm as Synaptics' syna_c10 driver (tcm/*.c).
  *
- * Boot-arg pandora_touch (bit mask, default 0 = off):
+ * Boot-arg pandora_touch (bit mask, default 0xf; 0 = off):
  *   bit 0  probe: print GCC, SE and pin state (votes the wrapper 4 clocks on)
  *   bit 1  vote L4I_E0 on (1.8 V, high power mode) through RPMh, apps RSC DRV 2
  *   bit 2  run: SPI set-up, avdd, reset, TouchComm identify, application info, touch
@@ -1555,7 +1555,7 @@ pt_ic_start(void)
 static void
 pt_thread(void *arg, wait_result_t result)
 {
-	unsigned mask = 0, delay_s = 5;
+	unsigned mask = 0xf, delay_s = 5;
 	(void)arg;
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_touch", &mask, sizeof(mask));
@@ -1674,7 +1674,7 @@ void
 pandora_touch_init(void)
 {
 	thread_t thread;
-	unsigned mask = 0;
+	unsigned mask = 0xf;
 	if (pt.started) {
 		return;
 	}

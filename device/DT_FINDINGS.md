@@ -96,3 +96,14 @@
 - 背屏 = FocalTech（`focaltech,fts`，驱动 focaltech_ts），SPI 0x1988000（qupv3_3，spi15），irq GPIO 201、reset GPIO 185；display-coords 90400×57200；`Xiaomi_Touch_Input_1`（904×572 ×100）。
 - 所以 ios-fuxi 的 fuxi_touch（FTS）在 17 Pro 上对应背屏；主屏要新写 Synaptics TouchComm 驱动（第 7 步）。
 - 按键：gpio-keys（音量+）、pmk8850 pon_hlos@1300 的 pwrkey / resin（电源、音量-），与之前设备树结论一致。
+
+## 按键 / 触摸 / 功放的真机结果（2026-10-22，补丁 0128–0134，无人值守测试 t2–t5）
+- **TLMM 真实基址是 0x0f100000**，不是设备树写的 0x0f000000：手机自带 pinctrl-canoe.ko（vendor_boot 内）的引脚表里，GPIO n 的寄存器是 0x100000 + 0x1000·n。读 0x0f065000 会让总线卡死、整机重启（t2 测试）。改成 0x0f165000 后音量+ 读到 ctl=0x3 io=0x1（输入、上拉、未按下）。
+- 电源/音量-：SPMI 仲裁器 v8，PON PPID 0x013 → APID 465（ee0），type 0x1 subtype 0x9，RT_STS 空闲 0x10。三颗键在 iOS 里连续轮询 4 分钟无错误（t3）。按下事件还要人按一下确认。
+- 触摸 SPI 控制器（QUP4 SE0，0x1a80000）固件 fw=0x102（SPI），**GENI_IF_DISABLE_RO=1：只能走 GPI DMA**，FIFO 不可用。GPI：qcom,gpi-dma@1a00000，ee-offset 0x10000，HLOS 可用 gpii 1–4；用 GPII 1（窗口 0x1a14000）可以正常收发。GPI 流 0x536 和 QUP 流 0x523 原先没有 SMMU 登记，补登到 UFS 的直通上下文（S2CR=0）后 DMA 正常。
+- 时钟：wrapper 4 投票 0x52018 bit 22–26 后各分支打开；SE0 RCG 0xa9014 开了 DFS，第 0 级 = XO/1（19.2 MHz）。
+- 触摸供电：avdd = GPIO 117 拉高；iovdd = RPMh "L4I_E0"（cmd-db 地址 0x40d00）。apps RSC drv-2（0x18920000）版本 **v4.3**，按上游 Linux 用 3.0 寄存器布局（major ≥ 3），ACTIVE TCS0 发 1800 mV / 模式 7 / 使能，三条命令都完成。
+- 触摸芯片：复位后第一包 `a5 10 1c 00` → **TouchComm v1**，无 CRC；identify：part "S3910VA0A0-15.20"，build 4551391，应用固件模式；app info：坐标 1200×2608，最多 10 指，图像 16×35。触摸报告格式：gesture id 8 位、gesture data 48 位、活动数 8 位，然后每个活动对象：index 4、分类 4、x 16、y 16、z 16、宽 8、高 8。
+- 复位后固件持续推送小米 THP 原始帧（报告码 0xc0，1496 字节：64 字节帧头 `a5 5a 14 00 …`，接着 16×35 个 int16 电容差值，空闲时在 ±10 内，后面还有约 300 字节附加数据）。`CMD_DISABLE_REPORT 0xc0`、`CMD_ENABLE_REPORT 0x11` 都回 OK，之后不再有原始帧（t5）。是否真的出 0x11 触摸报告要人摸屏验证；备用：pandora_touch 第 3 位从原始帧自己找手指。
+- 功放：QUP3 SE0 I2C（0x1980000，fw=0x301 I2C，FIFO 可用），复位脚 GPIO 10/54 拉高后两颗 CS35L43（0x40 底部、0x42 顶部）都回 DEVID 0x35a43、REVID 0xb1。
+- 功放的音频输入是 TDM0（GPIO 122 SCK、123 数据入、124 数据出、125 帧同步），这四个脚只能复用为 LPASS I2S0 或 qup2_se3；qup2_se3 的 SPI 时钟脚落在 124（功放的数据输出），接不上。功放锁相环要求 SCLK ≥ 705.6 kHz（cs35l43 驱动 fs_mon 表），CPU 翻 GPIO 做不到。所以要出声需要音频 DSP（ADSP + AudioReach）驱动 I2S0。
