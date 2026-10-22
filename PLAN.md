@@ -131,6 +131,13 @@
   - 真机 `cpus=8`：cpu1–5（0x100–0x500）和 cpu6/7（0x10000/0x10100）全部 PSCI 唤醒成功，"8/8 CPUs initialized, SGI1 verified"，"mcache: 8 CPU(s)"，测试程序 PID 1 心跳正常。
   - **第 3 步全部完成。**
 
+## 第 4 步进展（2026-10-22，真机，只读）
+- 探测（0114）：SMMU 已给存储（流 0x60）留了直通上下文；控制器开着、传统单门铃模式、时钟开着。
+- 诊断（0116/0117）：交接时连接在 HIBERN8、自动休眠关，命令发不出去；见 device/DT_FINDINGS.md。
+- 修法：0118 DME_HIBERNATE_EXIT；0119 对设备 WLUN 发 START STOP UNIT（ACTIVE）。
+- 结果（构建 #17，`pandora_ufs_probe=2`）：TEST UNIT READY 成功，**读出 LUN 0 的分区表，34 个分区的名字、起点、大小与安卓里导出的 device/partitions.txt 全部一致**（如 userdata 起点 0x35f200、0x77501fb 块；super 0x320000 块）。全程只发了"准备好了吗"、"切到工作状态"、读两次分区表，没有写。
+- 剩下：把这套初始化（退出休眠 + ACTIVE）放进正式驱动 sweet_ufs_init（目前 PANDORA 下仍拒绝启动），并去掉 SM8550 的时钟写入；之后才轮到 iOS 根文件系统怎么放（单独讨论）。
+
 ## 主要风险
 - CPU 是高通自研 Oryon 核心（8 Elite Gen 5，6 个性能核 + 2 个超大核），ios-sweet（Cortex-A55/A76）和 UniXNU（骁龙 8 Gen 2，ARM 公版核心）都没在它上面跑过，目前没有苹果内核在 Oryon 上运行的先例。
 - 存储、地址转换单元、总线、显示控制器、虚拟化层这些高通自家部件，骁龙 8 Gen 2（UniXNU）比 732G（ios-sweet）更接近 17 Pro，但仍要对照设备树逐项核实。
