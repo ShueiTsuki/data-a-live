@@ -73,4 +73,4 @@ echo "== 3. fastboot boot"
 "$ADB" reboot bootloader
 for _ in $(seq 1 30); do sleep 2; "$FB" devices | grep -q fastboot && break; done
 [ "$("$FB" getvar product 2>&1 | sed -n 's/^product: //p' | tr -d '\r')" = pandora ] || { echo "fastboot device is not pandora"; exit 1; }
-"$FB" boot "$ROOT/shim/loader/out/loader-boot.img"
+"$FB" boot "$(cygpath -w "$ROOT/shim/loader/out/loader-boot.img")"
