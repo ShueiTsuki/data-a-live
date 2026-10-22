@@ -1,0 +1,44 @@
+p = 'iokit/Kernel/arm/SweetFramebuffer.cpp'
+s = open(p).read()
+
+
+def sub(o, n):
+    global s
+    assert s.count(o) == 1, o[:80]
+    s = s.replace(o, n)
+
+
+sub("""	uint64_t frac = ~0ULL;      /* 0..1000 */
+	if (num && key->isEqualTo("brightness")) {
+		frac = v * 1000 / 65536;
+	} else if (num && key->isEqualTo("BrightnessMilliNits")) {
+		frac = v / 500;
+	} else if (num && key->isEqualTo("brightness-nits")) {
+		frac = (v >> 16) * 1000 / 500;
+	}
+	if (frac != ~0ULL) {
+		frac = frac > 1000 ? 1000 : frac;
+		uint32_t dim = (uint32_t)(frac * 256 / 1000);
+		sweet_fb_dim = dim < 16 ? 16 : dim;""", """	/* CoreBrightness writes "brightness" 0..65536 (the slider; 32768 at first boot) and
+	 * also brightness-nits / backlight-level / DisplayBrightness, which stay 0 or copy it
+	 * here: only "brightness" counts. Pixel scale = 256 * sqrt(brightness), at least 32,
+	 * so the middle of the slider is not half as bright. */
+	uint64_t frac = ~0ULL;      /* 0..65536 */
+	if (num && key->isEqualTo("brightness") && depth == 0) {
+		frac = v;
+	}
+	if (frac != ~0ULL) {
+		frac = frac > 65536 ? 65536 : frac;
+		uint32_t r = 0;                 /* isqrt(frac << 16): 0..65536 */
+		for (uint64_t bit = 1ULL << 32, x = frac << 16; bit; bit >>= 2) {
+			if (x >= r + bit) {
+				x -= r + bit;
+				r = (uint32_t)((r >> 1) + bit);
+			} else {
+				r >>= 1;
+			}
+		}
+		uint32_t dim = r >> 8;          /* 0..256 */
+		sweet_fb_dim = dim < 32 ? 32 : (dim > 256 ? 256 : dim);""")
+open(p, 'w').write(s)
+print('patched')
