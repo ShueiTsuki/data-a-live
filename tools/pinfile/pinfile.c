@@ -59,7 +59,7 @@
 
 #define BLK        4096u
 #define CHUNK      (1u << 20)
-#define MAX_EXT    4096u
+#define MAX_EXT    65536u
 #define DEFAULT_DEV "/dev/block/by-name/userdata"
 
 static int die(const char *what)
@@ -633,40 +633,44 @@ static int cmd_rawwrite(const char *path, const char *dev, const char *count)
 		if (*end || limit == 0)
 			return fail("N must be a positive number of blocks or 'all'");
 	}
-	int wfd = open(dev, O_RDWR | O_DIRECT | O_SYNC | O_CLOEXEC);
+	int wfd = open(dev, O_RDWR | O_DIRECT | O_CLOEXEC);
 	if (wfd < 0)
 		return die("open DEV for writing");
 	if (checked_layout(path, dev, wfd))
 		return 1;
 	unsigned char *b;
-	if (posix_memalign((void **)&b, BLK, BLK))
+	if (posix_memalign((void **)&b, BLK, CHUNK))
 		return die("posix_memalign");
 	struct sha256 h;
 	sha256_init(&h);
 	uint64_t written = 0;
 	int eof = 0;
 	for (int i = 0; i < nL && written < limit && !eof; i++)
-		for (uint64_t off = 0; off < L[i].length && written < limit; off += BLK) {
-			ssize_t got = read_full(0, b, BLK);
+		for (uint64_t off = 0; off < L[i].length && written < limit && !eof;) {
+			uint64_t blocks = (L[i].length - off) / BLK;
+			if (blocks > CHUNK / BLK)
+				blocks = CHUNK / BLK;
+			if (blocks > limit - written)
+				blocks = limit - written;
+			ssize_t got = read_full(0, b, (size_t)(blocks * BLK));
 			if (got < 0)
 				return die("read standard input");
-			if (got == 0) {
-				eof = 1;
+			if (got == 0)
 				break;
-			}
-			if (got < (ssize_t)BLK) {
-				memset(b + got, 0, BLK - (size_t)got);
+			if ((uint64_t)got < blocks * BLK) {
+				/* Input ended: zero-pad the last block, write only what holds data. */
+				blocks = ((uint64_t)got + BLK - 1) / BLK;
+				memset(b + got, 0, (size_t)(blocks * BLK - (uint64_t)got));
 				eof = 1;
 			}
-			uint64_t phys = L[i].physical + off;
-			if (!inside_one_extent(phys, BLK))
+			uint64_t phys = L[i].physical + off, len = blocks * BLK;
+			if (!inside_one_extent(phys, len))
 				return fail("internal: write outside the extents");
-			if (pwrite(wfd, b, BLK, (off_t)phys) != BLK)
+			if (pwrite(wfd, b, (size_t)len, (off_t)phys) != (ssize_t)len)
 				return die("pwrite");
-			sha256_update(&h, b, BLK);
-			written++;
-			if (eof)
-				break;
+			sha256_update(&h, b, (size_t)len);
+			written += blocks;
+			off += len;
 		}
 	if (fsync(wfd) < 0)
 		return die("fsync DEV");
