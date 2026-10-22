@@ -155,7 +155,7 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 1. 从 fastboot 启动到我们内核接手时，GPU 的时钟和电源处于什么状态。**已缩小** [读到 ios-fuxi 在 SM8550 上的实测，同样是 fastboot boot、不带安卓]：他们按"上一级确认有电，才读下一级"的顺序读（`gcc_gpu_cfg_ahb` 使能位为 1 才读 GPUCC；CX GDSC 和 SMMU 投票时钟开着才读 SMMU；CX 和 GX 都开才读 GPU 核心寄存器），全程没出事。时钟起来后，GMU 处于复位中，HFI 未就绪，GX 的电从不由 CPU 直接打开。读时钟状态要看使能位：有硬件门控时 CLK_OFF 位会显示 1，但时钟其实是开的（UniXNU 读到 `0x80000003`）。接管瞬间的原始寄存器值两边都没导出，840 上要我们自己读。
 2. 没有安卓内核时两个安全调用能不能成功。**已缩小一半**：
    - zap（PAS 13）：ios-fuxi 在 SM8550 上从 XNU 里调用成功 [读到]。init_image、mem_setup、auth 三步都返回 0，之后 TRUST_CNTL 从 1 变成 0，GPU 的写入才生效；不装 zap 时，GPU 的 2D 写入会被静默丢弃。他们的做法：SMC64 + SIP 调用，不用 SHM bridge，元数据放在一块固定的、4K 对齐、物理连续、不走缓存的保留内存里，一直留到复位。另外 `is_supported(13)` 返回 0，不能当真，直接调用就行。我们的 ADSP PAS 调用也已经在这台手机上做通过。
-   - `GPU_INIT_REGS`：两个项目都没用过，这符合 Linux 只在 750 和 a8xx 上调用它的规则。对 840 来说仍然是没人在苹果内核里试过的一步。
+   - `GPU_INIT_REGS`：两个项目都没用过，这符合 Linux 只在 750 和 a8xx 上调用它的规则。不过这台手机的安卓 KGSL 驱动里有 `gen8_scm_gpu_init_cx_regs`、`gen8_scm_gpu_tsense_default`、`gen8_scm_gpu_tsense_work`，以及报错字符串 "Scm call for requests:0x%x failed" [实测，`/vendor/lib/modules/msm_kgsl.ko` 的字符串]。说明这台手机的安全世界支持这个调用，安卓每次开机都在用。剩下的不确定只是"从我们的内核调用行不行"，这和我们已经做通的 ADSP 安全调用是同一类事。
    - 投票：ios-fuxi 在 CPU 侧不发任何 RPMh 或互连投票，沿用 ABL 留下的状态，电压和带宽表通过 HFI 交给 GMU 去投。而 Linux 在 GMU 启动前会先投一次带宽。840 上要不要先投，由我们自己实测决定。
 3. 我们能不能直接配置 `0x3da0000` 那块 SMMU 的上下文。**已缩小** [实测，我们自己的补丁]：0114 从我们的内核读过 apps SMMU（`0x15000000`）的全局寄存器和上下文；0131 在 apps SMMU 里新增了流匹配项（SMR/S2CR，流 `0x536` 和 `0x523`），给触摸的 GPI DMA 用，触摸因此能工作。也就是说，在这台手机上，我们的内核写 arm,mmu-500 的寄存器是被允许、也有效的。GPU 的 SMMU 是同一种 IP 的另一个实例，区别是要先打开 GPUCC 的时钟才能访问（安卓设备树里它的供应者包括时钟控制器 `0x3d90000`）。安全上下文（secure）我们第一阶段用不上。
 4. GMU 固件 `gen80200_gmu.bin` 在我们按 Linux 顺序准备好的环境里，会不会报告初始化成功、会不会回复第一条 HFI 消息 `MSG_TABLE`。
