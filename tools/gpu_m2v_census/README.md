@@ -23,6 +23,20 @@ Inputs (Apple files, never committed): `QuartzCore.framework/default.metallib` (
 5. `run_plib.sh PROFILE` / `retry_plib.sh`: the same for the 451 pipeline-library records,
    fragments paired with the specialized `fixed_vert_lph_gen` record.
 
+6. `emit_all.sh OUTDIR` (profile from `M2V_PROFILE`, default lavapipe): translates everything
+   once more with the first passing probe configuration, keeping the SPIR-V and an
+   `--emit-meta` file per pipeline.
+7. Turnip on an emulated Adreno 840: Mesa main built in WSL with
+   `-Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm -Dtools=drm-shim -Dgallium-drivers= -Dplatforms=`;
+   `src/freedreno/drm-shim/freedreno_noop.c` got a local entry `{ .gpu_id = 840,
+   .chip_id = 0x44050a31, .gmem_size = 18 * 1024 * 1024 }`. `/opt/work/m2vtest/tu_icd.json` is the
+   build's ICD JSON with `library_path` pointing at the built `libvulkan_freedreno.so`.
+   Turnip's real capabilities: `vulkaninfo --json` under the shim → `turnip_a840.json`; use it as
+   `M2V_PROFILE` for step 6.
+8. `run_tu.sh DIR [CHIP_ID]`: one process per meta runs `vk_pipeline.py`, which creates the
+   Vulkan pipeline (layouts, push constants, specialization, vertex input, dynamic rendering) and
+   prints Turnip's per-stage instruction counts (VK_KHR_pipeline_executable_properties).
+
 Zero constants are diagnostic inputs, not CoreAnimation's runtime values; pairings and vertex
 layouts are probe inputs, not recovered CA pipelines. PASS means metal2vulkan translated and
 verified the pipeline and `spirv-val` accepted it; it does not mean Turnip compiled it to A840 code

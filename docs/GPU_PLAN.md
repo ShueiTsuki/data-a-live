@@ -86,7 +86,17 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 
   其余失败都是测试参数的问题，补齐后就通过：顶点和片元要配对得上；部分片元要第二、第三个颜色附件（`path_blit` 用 BGRA8、BGRA8、R32Float）；6 个万能着色器要给出函数常量（顶点 4 到 5 个，片元 38 个，实验里全填 0）。
 - Turnip 对所有 Adreno 都无条件声明了 `VK_EXT_rasterization_order_attachment_access`（颜色、深度、模板三种），主线和 85fda3b 都是 [读到 `src/freedreno/vulkan/tu_device.cc`]。ios-fuxi 统计里那 181 个"帧缓冲读取"拒绝，正是因为他们用的设备描述没开这个扩展。
-- 没验证到的：这里只到 SPIR-V 为止，没有用 Turnip 编成 840 的机器码，也没有执行。Mesa 主线已经没有单独的 SPIR-V 转 Adreno 指令的命令行工具，要做就得用 drm-shim 模拟设备再写 Vulkan 程序。UniXNU 已经在真机 A740 上用 Turnip 编译并运行了 iPadOS 17 的 CoreAnimation 着色器，gen8 的 ir3 编译器也在 Mesa 主线里，所以剩余风险是"个别着色器只在 gen8 上编不过"，概率小。
+- **再往下一层：用 Turnip 编成 Adreno 840 的机器码 [实测]。** 用 Mesa 主线（64245a2）编出 Turnip 和 freedreno 的 drm-shim。drm-shim 在电脑上冒充一块 GPU，Mesa 官方 CI 也这样用。我在本地副本里给它加了一条 840（`chip_id 0x44050a31`、18 MiB GMEM），Turnip 认出的设备是 "Adreno (TM) 840"，Vulkan 1.4。再用 `vulkaninfo --json` 从这台模拟设备导出 Turnip 的真实能力描述，用它重新翻译全部着色器；然后 `tools/gpu_m2v_census/vk_pipeline.py` 按每条管线的 meta 建真正的 Vulkan 管线，Turnip 在建管线时把着色器编成 840 的指令。通过 `VK_KHR_pipeline_executable_properties` 读到编译后的指令数，例如 axial_shading：顶点 78 条、片元 189 条。
+
+| 用 Turnip 在 840 上的真实能力描述 | 结果 |
+| --- | --- |
+| metal2vulkan 翻译 | 592 个里 **590** 个通过 |
+| Turnip 编成 840 机器码 | 这 590 个**全部成功**，0 失败，0 崩溃 |
+| 唯一的缺口 | `inplace_copy_lpf` / `inplace_copy_lph` 两个：用了 Metal 的光栅顺序组（raster order groups），翻译到 Vulkan 需要片元着色器像素互锁，Turnip 不支持 |
+
+- 关于这个缺口：iOS 16 的 CoreAnimation 会先查询设备支不支持光栅顺序组 [读到 ios-fuxi `metal-m6.md:29`，"Observed CA capability queries"]。UniXNU 的 NativeMetal 按 Turnip 的真实能力回答"不支持"（`bridge/NativeMetalObjects.rs:426`），iPadOS 17 的 backboardd 照样用 GPU 合成跑通了桌面。所以 CoreAnimation 很可能在不支持时就不用 `inplace_copy`，改走别的路 [推断，要真机确认]。
+- 早先用 lavapipe 的描述时，`inplace_copy` 会被翻译成"互锁 + 片元写图像"的方案（lavapipe 支持互锁），Turnip 编译它时崩溃。这说明**测试必须用目标驱动的真实能力描述**，用别的驱动的描述会得出错误结论。
+- 没验证到的：着色器在 840 上的执行结果是否正确（drm-shim 不执行任何命令）；函数常量全填 0 的那 6 个万能着色器，CoreAnimation 运行时实际会用别的常量组合。
 
 ## 3. iOS 16 这一侧怎么接入 [读到，苹果二进制]
 
