@@ -107,7 +107,7 @@ void pandora_touch_init(void);
 #define SE_HW_PARAM0     0xe24u
 #define SE_HW_PARAM1     0xe28u
 #define PT_SPI_DIV       4u            /* 19.2 MHz XO / 4 = 4.8 MHz (IC allows 15 MHz) */
-#define PT_XFER_MAX      2048u
+#define PT_XFER_MAX      4096u        /* DMA TX 0x2000-0x2fff, RX 0x3000-0x3fff */
 
 /* TouchComm */
 #define TC_MARKER        0xa5u
@@ -120,12 +120,14 @@ void pandora_touch_init(void);
 #define TC_TOUCH         0x11u
 #define CMD_IDENTIFY     0x02u
 #define CMD_ENABLE_REPORT 0x05u
+#define CMD_DISABLE_REPORT 0x06u
+#define TC_THP_FRAME     0xc0u        /* Xiaomi THP raw frame, streamed after reset */
 #define CMD_V2_ACK       0x07u
 #define CMD_V2_RETRY     0x08u
 #define CMD_V2_GET_REPORT 0x0au
 #define CMD_APP_INFO     0x20u
 #define CMD_GET_TOUCH_CONFIG 0x25u
-#define PT_MSG_MAX       1024u
+#define PT_MSG_MAX       4000u
 
 static struct {
 	vm_offset_t gcc, se, tlmm;
@@ -1044,7 +1046,16 @@ tc_report(uint8_t code)
 	if (!(pt.codes_seen[code >> 5] & (1u << (code & 31)))) {
 		pt.codes_seen[code >> 5] |= 1u << (code & 31);
 		printf("PANDORA TOUCH: first report %#x\n", code);
-		tc_hex("report", pt.msg, pt.msg_len);
+		/* The whole first THP frame, for its layout; other reports: the start. */
+		if (!pt.msg_len) {
+			tc_hex("report", pt.msg, 0);
+		}
+		for (unsigned o = 0; o < pt.msg_len; o += 64) {
+			tc_hex("report", pt.msg + o, pt.msg_len - o < 64 ? pt.msg_len - o : 64);
+			if (code != TC_THP_FRAME) {
+				break;
+			}
+		}
 	}
 }
 
@@ -1219,7 +1230,18 @@ tc_setup(void)
 	pt.config_len = pt.msg_len < sizeof(pt.config) ? pt.msg_len : sizeof(pt.config);
 	memcpy(pt.config, pt.msg, pt.config_len);
 	tc_hex("touch report config", pt.config, pt.config_len);
-	return pt.config_len ? 0 : EIO;
+	if (!pt.config_len) {
+		return EIO;
+	}
+	/* After reset the firmware streams Xiaomi THP frames (report 0xc0, about 1.5 KB each)
+	 * for the host's touch algorithm. Stop those and ask for its own touch reports. */
+	uint8_t r = TC_THP_FRAME;
+	err = tc_command(CMD_DISABLE_REPORT, &r, 1, &code);
+	printf("PANDORA TOUCH: disable report %#x -> %d (code %#x)\n", r, err, code);
+	r = TC_TOUCH;
+	err = tc_command(CMD_ENABLE_REPORT, &r, 1, &code);
+	printf("PANDORA TOUCH: enable report %#x -> %d (code %#x)\n", r, err, code);
+	return 0;
 }
 
 /* syna_tcm_get_touch_data: little-endian bit field at a bit offset. */
@@ -1358,6 +1380,19 @@ done:
 
 /* ---- thread -------------------------------------------------------------------- */
 
+/* Hardware reset (reset low 10 ms, 200 ms before the first read), identify, set-up. */
+static int
+pt_ic_start(void)
+{
+	pt_gpio(PT_RESET, 0, 0, 2, 0);
+	pt_sleep(10);
+	pt_gpio(PT_RESET, 0, 0, 2, 1);
+	pt_sleep(200);
+	pt.active = 0;
+	int err = tc_detect();
+	return err ? err : tc_setup();
+}
+
 static void
 pt_thread(void *arg, wait_result_t result)
 {
@@ -1412,21 +1447,17 @@ pt_thread(void *arg, wait_result_t result)
 	}
 	pt_gpio(PT_AVDD, 0, 0, 2, 1);
 	pt_sleep(50);
-	pt_gpio(PT_RESET, 0, 0, 2, 0);
-	pt_sleep(10);
-	pt_gpio(PT_RESET, 0, 0, 2, 1);
-	pt_sleep(200);
-	pt_pins_dump("after reset");
-	if ((err = tc_detect()) || (err = tc_setup())) {
+	if ((err = pt_ic_start())) {
 		printf("PANDORA TOUCH: TouchComm set-up failed %d\n", err);
 		goto out;
 	}
+	pt_pins_dump("after reset");
 	printf("PANDORA TOUCH: running, polling GPIO %u\n", PT_IRQ);
 	uint64_t active_abs, idle_abs, next = mach_absolute_time(), last_irq = 0, recent_abs;
 	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &active_abs);
 	nanoseconds_to_absolutetime(8 * NSEC_PER_MSEC, &idle_abs);
 	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &recent_abs);
-	unsigned errors = 0, polls = 0;
+	unsigned errors = 0, polls = 0, bad = 0;
 	for (;;) {
 		uint64_t now = mach_absolute_time();
 		if (++polls % 15000u == 0) {
@@ -1443,8 +1474,15 @@ pt_thread(void *arg, wait_result_t result)
 				if (pt.active) {
 					tc_touch_report(NULL, 0);
 				}
+				/* Out of step with the IC (a message read half): start it again. */
+				if (++bad >= 20) {
+					bad = 0;
+					err = pt_ic_start();
+					printf("PANDORA TOUCH: IC reset after read errors -> %d\n", err);
+				}
 				break;
 			}
+			bad = 0;
 			if (code >= TC_IDENTIFY) {
 				tc_report(code);
 			} else if (code == 0 || code == TC_NO_REPORT) {
