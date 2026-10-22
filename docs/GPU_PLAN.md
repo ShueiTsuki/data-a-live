@@ -65,6 +65,11 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 ### ios-sweet [读到]
 `ref/ios-sweet/site/future.html` 只说 GPU 加速"可能"做，没人给 Adreno 在 iOS 下做过 Metal。
 
+### Turnip 的 Darwin 接口用在 840 上要改什么 [读到，UniXNU `patches/mesa/turnip-darwin-kmd.patch` 和 Mesa 85fda3b；详见调研笔记 `turnip_darwin_a840.md`]
+- Mesa 这一侧基本不挑 GPU 代际：芯片编号、GMEM 大小和地址、UBWC 参数都从内核的设备信息调用读取，命令生成由 Turnip 自己按代际处理，85fda3b 已有完整的 gen8 分支（清屏、拷贝、绘制、计算）。要改的只有：去掉把 `0x43050a01` 当作 740 的特例；先用 `TU_DEBUG=sysmem,nocb` 关掉并行分箱（UniXNU、ios-fuxi 和社区 gen8 分支都碰到过 BV/BR 互相卡住）；补上 A8XX 无绑定描述符失效的修复（上游 MR 45129）；确认 CPU 缓存行确实是 64 字节。
+- 内核报给用户态的芯片编号必须是 `0x44050a31`（Mesa 只认这个），另报 18 MiB GMEM、GMEM 起始地址 64 MiB。
+- A740 专用的东西集中在内核的命令环（UniXNU `NativeAdrenoRing.cpp`）：BR/BV 包装和 Linux A8XX 用的一样，但几个寄存器编号要换成 A8XX 的。例如：写栅栏号 `0x885 → 0x82c`；CP 计时器 `0x980 → 0x8e7`；GMU 计时器 `0x1f888 → 0x1f840`（还要按 GMU 基地址重新算偏移）；性能计数器的清零和状态寄存器也要换；另外新设 BV 读指针 `0x808`。非上下文寄存器、UCHE、UBWC、分片数按 Linux `a8xx_hw_init` 写。
+
 ## 3. iOS 16 这一侧怎么接入 [读到，苹果二进制]
 
 （详细地址和符号见调研笔记。）
@@ -98,7 +103,12 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 
 不碰手机的准备：
 1. 整理 gen8 资料：Linux `a8xx_gpu.c`、`a6xx_gmu.c` 和 `a6xx_hfi.c` 里的 gen8 分支、`a6xx_catalog.c` 的 a840 表（上电寄存器表、GBIF、保护寄存器）；SM8850 设备树里 GPU、GMU、GPUCC、RPMh 投票相关节点（安卓 `/proc/device-tree` 只读导出，存到 `device/`，不进 git）。
-2. 离线解析 `gen80200_gmu.bin` 的分块布局（只在本地，不提交固件）。
+2. ~~离线解析 `gen80200_gmu.bin` 的分块布局~~ 已完成 [实测]：固件从手机只读复制到 `device/gpufw/`（被 git 忽略，不提交）。它用的就是 Linux `a6xx_gmu.c` 的 `block_header` 格式（地址、长度、类型、值，后面跟"长度"个字节；长度为 0 的项是开头的目录，装载时跳过）。实际数据只有 4 块：
+   - `0x0`，长 `0x1fc` → GMU 指令内存（ITCM，0–16 KB）；
+   - `0x4000`，长 `0x1b40c` → Linux 为 gen8 分配的 icache 区（GMU 地址 `0x4000` 起，16 MB 减 16 KB）；
+   - `0x10007f98`，长 `0x28`，以及 `0x10007fdc`，长 `0x18` → GMU 数据内存（DTCM，`0x10004000` 起）。
+
+   目录里类型 7 的预留区 `0x60000000`、`0x60001000`、`0x60003000`，落在 Linux 的 dummy 区（`0x60000000`，16 KB）里。结论：Linux 现成的装载规则可以直接照搬。前提是 GMU 通过 SMMU 的流编号 5 访问这些地址，所以 GMU 启动前要先配好 SMMU。
 3. 寄存器头文件尽量从 Mesa 的寄存器 XML（MIT）生成，避开 GPL-only 的来源。
 
 手机上的步骤（每一步都要先问用户再上机）：
