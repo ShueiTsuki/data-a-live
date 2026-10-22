@@ -2,7 +2,7 @@
 # Translate every pipeline-library record (fragments paired with the specialized fixed vertex record).
 T=/opt/work/m2v/target/release/metal2vulkan; D=/opt/work/m2vtest/plib; MAIN=/opt/work/m2vtest/qc_default.metallib
 P=/opt/work/m2v/crates/metal2vulkan-validation/profiles/$1.json; O=/opt/work/m2vtest/plib_out_$1; rm -rf $O; mkdir -p $O
-L=/mnt/c/Users/MSI-PC/AppData/Local/Temp/claude/D--DeepSeekHarness-claude/0c6fe11f-a60e-42c6-9d52-feb15149f6f0/scratchpad/m2vtest/mtlb_list.py
+L=$(cd "$(dirname "$0")" && pwd)/mtlb_list.py
 VREC=$(for f in $D/*.metallib; do python3 $L $f | grep -q "vertex fixed_vert_lph_gen" && echo $f; done | head -1)
 export METAL2VULKAN_REPRO_DIR=$O/repro T D MAIN P O L VREC
 one() {
