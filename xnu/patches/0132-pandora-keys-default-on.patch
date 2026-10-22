@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/fuxi_keys.c b/bsd/dev/fuxi_keys.c
+index 3845903..c0985e5 100644
+--- a/bsd/dev/fuxi_keys.c
++++ b/bsd/dev/fuxi_keys.c
+@@ -425,8 +425,8 @@ void
+ fuxi_keys_init(void)
+ {
+ #if defined(PANDORA)
+-	/* Xiaomi 13 (SM8550) register addresses; the 17 Pro's differ. Off unless fuxikeys=1. */
+-	int enabled = 0;
++	/* 17 Pro: pk_setup() (SPMI arbiter v8, TLMM GPIO 101). Off with fuxikeys=0. */
++	int enabled = 1;
+ #else
+ 	int enabled = 1;
+ #endif
