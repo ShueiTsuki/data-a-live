@@ -73,6 +73,21 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 - 内核报给用户态的芯片编号必须是 `0x44050a31`（Mesa 只认这个），另报 18 MiB GMEM、GMEM 起始地址 64 MiB。
 - A740 专用的东西集中在内核的命令环（UniXNU `NativeAdrenoRing.cpp`）：BR/BV 包装和 Linux A8XX 用的一样，但几个寄存器编号要换成 A8XX 的。例如：写栅栏号 `0x885 → 0x82c`；CP 计时器 `0x980 → 0x8e7`；GMU 计时器 `0x1f888 → 0x1f840`（还要按 GMU 基地址重新算偏移）；性能计数器的清零和状态寄存器也要换；另外新设 BV 读指针 `0x808`。非上下文寄存器、UCHE、UBWC、分片数按 Linux `a8xx_hw_init` 写。
 
+### 着色器翻译实验（不用手机，在 WSL 里实际跑过）[实测]
+目的：确认 iOS 16 的 CoreAnimation 着色器能不能被 metal2vulkan 翻译成 Vulkan 能用的 SPIR-V。脚本和说明在 `tools/gpu_m2v_census/`。
+- 输入：我们根盘里的 `QuartzCore.framework/default.metallib`（SHA-256 `11c74cc4…`，和 ios-fuxi 记录的是同一个文件）有 141 个入口函数（39 顶点、95 片元、7 计算）；`default.pipelinelib/functions` 拆出 451 条已特化的单函数记录。
+- 工具：metal2vulkan（a2c440b）的命令行，Rust 1.99.1 编译；每个输出都用 `spirv-val`（SPIRV-Tools 2025.1）按 Vulkan 1.2 和 1.4 校验。
+- 结果：
+
+| 设备描述 | 主库 141 个 | 预编译库 451 条 | "帧缓冲读取"拒绝 |
+| --- | --- | --- | --- |
+| 不带"按光栅化顺序访问附件"扩展（vk12-floor） | 未补参数时 65 通过 | 290 通过 | 20 + 161 = 181 |
+| 带这个扩展（lavapipe，和 Turnip 一样） | **141 全部通过** | **451 全部通过** | 0 |
+
+  其余失败都是测试参数的问题，补齐后就通过：顶点和片元要配对得上；部分片元要第二、第三个颜色附件（`path_blit` 用 BGRA8、BGRA8、R32Float）；6 个万能着色器要给出函数常量（顶点 4 到 5 个，片元 38 个，实验里全填 0）。
+- Turnip 对所有 Adreno 都无条件声明了 `VK_EXT_rasterization_order_attachment_access`（颜色、深度、模板三种），主线和 85fda3b 都是 [读到 `src/freedreno/vulkan/tu_device.cc`]。ios-fuxi 统计里那 181 个"帧缓冲读取"拒绝，正是因为他们用的设备描述没开这个扩展。
+- 没验证到的：这里只到 SPIR-V 为止，没有用 Turnip 编成 840 的机器码，也没有执行。Mesa 主线已经没有单独的 SPIR-V 转 Adreno 指令的命令行工具，要做就得用 drm-shim 模拟设备再写 Vulkan 程序。UniXNU 已经在真机 A740 上用 Turnip 编译并运行了 iPadOS 17 的 CoreAnimation 着色器，gen8 的 ir3 编译器也在 Mesa 主线里，所以剩余风险是"个别着色器只在 gen8 上编不过"，概率小。
+
 ## 3. iOS 16 这一侧怎么接入 [读到，苹果二进制]
 
 （详细地址和符号见调研笔记。）
