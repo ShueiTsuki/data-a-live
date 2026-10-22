@@ -105,6 +105,9 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 - **不一致，写驱动时以原厂为准**：非上下文寄存器里有几项不同，`RB_RBP_CNTL` 原厂 `0x60`、Linux `0x20`，`SP_CHICKEN_BITS` 和 `SP_CHICKEN_BITS_2` 也不同，两边还各有几项对方没有；GBIF 原厂多一项 `GMUCX_MRC_GBIF_QOS_CTRL=0x33`；时钟门控 `GMUAO_CGC_MODE_CNTL` 原厂 `0x02220000`；UBWC 的 `RB_CMP_NC_MODE_CNTL` 原厂 `0x28040`、Linux `0x28046`。安卓设备树里 `qcom,min-access-length` 是 32（不是 64）[实测]，所以 UBWC 模式寄存器里和它有关的那一位保持默认。
 - **通信方式**：原厂驱动用"硬件调度"模式，命令由 GMU 接收；Linux 用老式 HFI，命令走 CP 命令环。固件里的版本字段 [实测]：手机这份 `gen80200_gmu.bin` 的 HFI 版本是 `0x20070001`（固件块类型 6，定义见 KGSL `kgsl_gmu_core.h`，`GMU_BLK_TYPE_HFI_VER`），和 linux-firmware 里的 `gen80200_gmu.bin` **完全相同**；GMU 核心版本手机是 `0x50030027`，linux-firmware 是 `0x50030017`，手机的稍新。Linux 主线正是用 linux-firmware 这份、按老式 HFI 跑 840 的，所以协议版本这一层兼容。后备方案：linux-firmware 的 `gen80200_*` 可公开再分发，AQE 和手机上的完全相同（SHA-256 一致），GMU、SQE 版本稍旧。
 
+### CPU 和 GPU 之间的缓存一致 [读到]
+Linux 的 a840 条目带 `ADRENO_QUIRK_HAS_CACHED_COHERENT`（`a6xx_catalog.c`），主线设备树里 GPU 的 SMMU 标了 `dma-coherent`，安卓设备树的 kgsl-smmu 节点也有 `dma-coherent`。Linux 因此允许 `MSM_BO_CACHED_COHERENT` 缓冲区（`msm_gem.c:1211-1220`）：GPU 读写 CPU 缓存里的数据时，由硬件保证一致。推断：只要 SMMU 页表把这些映射设成可缓存、可共享的属性，iOS 的 IOSurface 交给 GPU 读写、再交给我们的 AppleCLCD 显示时，不必每次手动刷缓存。ios-fuxi 目前在每次提交前手动刷缓存，那是更保守、更慢的做法。
+
 ## 3. iOS 16 这一侧怎么接入 [读到，苹果二进制]
 
 （详细地址和符号见调研笔记。）
