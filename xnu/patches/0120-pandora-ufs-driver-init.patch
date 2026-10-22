@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 4f29f0e..26717eb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1173,21 +1173,12 @@ stop:
+ 	}
+ }
+ 
+-/* Not ported to SM8850 yet: the SM8550 init writes SM8550 GCC offsets. Non-const so the
+- * code below stays reachable for the compiler. */
+-static bool pandora_ufs_ported = false;
+ #endif /* PANDORA */
+ 
+ static int
+ sweet_ufs_init(void)
+ {
+-#if defined(PANDORA)
+-	if (!pandora_ufs_ported) {
+-		printf("PANDORA UFS: driver not ported to SM8850 yet\n");
+-		return ENXIO;
+-	}
+-#endif
+-#if defined(FUXI)
++#if defined(FUXI) && !defined(PANDORA)
+     uint32_t requested=0;
+     if (!PE_parse_boot_argn("fuxi_ufs_probe", &requested, sizeof(requested)) || requested!=1)
+         return ENXIO;
+@@ -1213,7 +1204,7 @@ sweet_ufs_init(void)
+ 	int error;
+ 
+ 
+-#if defined(FUXI)
++#if defined(FUXI) && !defined(PANDORA)
+     const char *ufs_node="/fuxi-ufs";
+ #else
+     const char *ufs_node="/sweet-ufs";
+@@ -1248,6 +1239,12 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
++#if defined(PANDORA)
++	if ((su.dma_pa + DMA_SIZE - 1) >> 36) {
++		printf("PANDORA UFS: DMA at 0x%llx is outside the SMMU's 36-bit range\n", su.dma_pa);
++		return ENXIO;
++	}
++#endif
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+@@ -1257,6 +1254,12 @@ sweet_ufs_init(void)
+         ufs_rd(REG_CAP),ufs_rd(REG_HCS),ufs_rd(REG_HCE),su.dma_pa);
+ #endif
+     error = ufs_take_over_host();
++#if defined(PANDORA)
++    if (!error) {
++        error = pandora_h8_exit();
++        printf("PANDORA UFS: hibernate exit: %x\n", error);
++    }
++#endif
+ #if defined(FUXI)
+     if (!error) {
+         static const uint8_t active[6]={0x1b,0,0,0,0x10,0};
+@@ -1338,6 +1341,39 @@ sweet_ufs_init(void)
+ 	return 0;
+ }
+ 
++#if defined(PANDORA)
++/*
++ * pandora_ufs_probe=3: the real driver init (partition from boot-arg ufsroot, read-only
++ * unless ufsrw=1), then one READ of the partition's block 1. For ufsroot=super that block
++ * holds the Android logical-partition geometry, magic "gDla" = 67 44 6c 61. Stops for the
++ * photo.
++ */
++static void
++pandora_ufs_driver_test(void)
++{
++	int error = sweet_ufs_init();
++	printf("PANDORA UFS: driver init: %d\n", error);
++	if (!error) {
++		const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++		lck_mtx_lock(&sweet_ufs_lock);
++		error = ufs_read_blocks(su.first_block + 1, 1);
++		printf("PANDORA UFS: partition block 1 (device block 0x%llx) read: %d\n",
++		    su.first_block + 1, error);
++		if (!error) {
++			printf("PANDORA UFS: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
++			    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
++	printf("PANDORA UFS: driver test %s (%d), %s. Hold power to reboot.\n",
++	    error ? "FAILED" : "done", error, su.writable ? "WRITABLE" : "read-only");
++	for (;;) {
++		delay(1000000);
++	}
++}
++#endif
++
+ #if defined(FUXI)
+ void fuxi_storage_probe(void);
+ void fuxi_storage_probe(void)
+@@ -1347,6 +1383,7 @@ void fuxi_storage_probe(void)
+  if (PE_parse_boot_argn("pandora_ufs_probe",&probe,sizeof(probe))) {
+   if (probe==1) pandora_ufs_probe();
+   if (probe==2) pandora_ufs_gpt();
++  if (probe==3) pandora_ufs_driver_test();
+  }
+ #endif
+  uint32_t requested=0;

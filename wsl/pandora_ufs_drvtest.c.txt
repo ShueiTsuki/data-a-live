@@ -1,0 +1,33 @@
+#if defined(PANDORA)
+/*
+ * pandora_ufs_probe=3: the real driver init (partition from boot-arg ufsroot, read-only
+ * unless ufsrw=1), then one READ of the partition's block 1. For ufsroot=super that block
+ * holds the Android logical-partition geometry, magic "gDla" = 67 44 6c 61. Stops for the
+ * photo.
+ */
+static void
+pandora_ufs_driver_test(void)
+{
+	int error = sweet_ufs_init();
+	printf("PANDORA UFS: driver init: %d\n", error);
+	if (!error) {
+		const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+		lck_mtx_lock(&sweet_ufs_lock);
+		error = ufs_read_blocks(su.first_block + 1, 1);
+		printf("PANDORA UFS: partition block 1 (device block 0x%llx) read: %d\n",
+		    su.first_block + 1, error);
+		if (!error) {
+			printf("PANDORA UFS: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+			    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+		}
+		lck_mtx_unlock(&sweet_ufs_lock);
+	}
+	printf("PANDORA UFS: driver test %s (%d), %s. Hold power to reboot.\n",
+	    error ? "FAILED" : "done", error, su.writable ? "WRITABLE" : "read-only");
+	for (;;) {
+		delay(1000000);
+	}
+}
+#endif
+
