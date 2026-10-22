@@ -126,7 +126,12 @@ Linux 的 a840 条目带 `ADRENO_QUIRK_HAS_CACHED_COHERENT`（`a6xx_catalog.c`�
 - **UniXNU 的 iPadOS 17 专用做法**（读 QuartzCore 内部字段、vm_read 等）在 N1 里都已经去掉 [读自源码]。
 - **缺口**：CoreAnimation 判断图像格式（能否生成 mip、IOSurface 能否当纹理）时，会通过 Metal 的格式查询问设备 `isMsaa32bSupported`、`isFloat32FilteringSupported`、`supportsASTCTextureCompression`、`supportsBCTextureCompression`（偶尔还有 `retainedLabel`）。N1 都没实现。设备收到没实现的方法会算一次失败，backboardd 会被记过。上机前要给它们补上固定答案。另一个没实现的 `newRenderPipelineStateWithTileDescriptor:...` 受 `supportsTileShaders` 控制，N1 回答"否"，会跳过。
 - **行为差异** [推断]：N1 的 Rust 桥接层按 iPad 的 A10X 回答 GPU 家族（Apple1–3），而我们的系统是 iPhone X（A11，属于 Apple4）。系统有些判断可能会走和原机不同的分支。
-- 没查到的：CoreImage、RenderBox 等别的 Metal 使用者会问设备哪些方法。
+- **别的 Metal 使用者** [读自二进制，详见同一份笔记的 "Other Metal clients"]：
+  - **CoreImage 是最大的缺口**：图标服务、CoreUI、墙纸渲染都要经过它。它编译滤镜有三条路，默认的 `newLibraryWithImageFilterFunctionsSPI:…`、函数拼接（`newDagStringWithGraphs:`、`newLibraryWithDescriptorSPI:error:`、动态库），以及运行时编译源代码 `newLibraryWithSource:options:error:`。N1 一个都没实现，UniXNU 的 NativeMetal 也没有；metal2vulkan 的覆盖表里，源代码编译明确不在支持范围内，函数拼接还没做（`docs/METAL-COVERAGE.md:58,1419-1422`）。
+  - **MPS**：第一次用时会问 5 个 N1 没回答的特性（`supportsArrayOfTextures`、`supportsQuadShufflesAndBroadcast`、`supportsSIMDShufflesAndBroadcast`、`supportsReadWriteTextureArgumentsTier2`、`supportsNorm16BCubicFiltering`）。
+  - **PhotosUICore**：`limits` 返回空时调用方会直接崩溃，只有用到照片渲染的墙纸才会碰到。
+  - **没有缺口的**：PaperBoardUI、PosterBoard、WallpaperKit、CoreMaterial、SpringBoardHome、ImageIO、MPSImage；小组件相关框架不直接调用设备方法。
+  - **怎么应对** [推断]：UniXNU 的做法是 Metal 设备默认只发给渲染服务（backboardd），别的进程要列进名单才有（`--publish` / `--clients`），没拿到设备的进程照旧走 CPU。所以第一阶段只给 backboardd，CoreImage 的缺口碰不到。以后要让图标、墙纸也用 GPU，再补这几个方法：最小的办法是实现 `newLibraryWithImageFilterFunctionsSPI:`，把 CoreImage 自带的 AIR 滤镜函数（`ci_stdlib*.metallib` 等）链接成一个库后交给 metal2vulkan。这一步要自己写，没人做过。
 
 ## 4. 三条路线比较
 
