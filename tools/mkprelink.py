@@ -32,7 +32,8 @@ import native_prelink as npl  # noqa: E402
 import emit_prelink as epl  # noqa: E402
 
 AMFI = 'com.apple.driver.AppleMobileFileIntegrity'
-KEEP_PERSONALITIES = {AMFI}
+# AppleImage4's IOService start opens the nonce gate launchd's ignition waits on (0155).
+KEEP_PERSONALITIES = {AMFI, 'com.apple.security.AppleImage4'}
 RENAMES = {'com.apple.driver.AppleARMPlatform': {'AppleARMBacklight': 'XppleARMBacklight'}}
 SLIDE = -0x1000000
 # iOS 16 AMFI's exported initializer (registers its MAC policy and the amfi interface), which
