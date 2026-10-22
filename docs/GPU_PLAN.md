@@ -21,6 +21,8 @@
 | GPU 的 SMMU | `kgsl-smmu@3da0000`（qsmmu-v500 / adreno-smmu，安卓由 `arm-smmu` 驱动绑定） | 设备树、`/sys/bus/platform/devices` |
 | GPU 时钟控制器 | `0x3d90000`（SMMU 的供应者之一） | `/sys/bus/platform/devices/3da0000.kgsl-smmu` |
 | UBWC | 版本 6 | `qcom,ubwc-mode` |
+| zap 保留内存 | `gpu_microcode_region@9959a000`，长 `0x2000`，no-map；在 4 GB 以下，不在给 iOS 的 5 GB（`0x8c0000000` 起）里，不冲突 | zap-shader 的 `memory-region` → `/reserved-memory` |
+| 频率表 | 主线 `kaanapali.dtsi` 的 `gpu_opp_table`（160 MHz 起），和速度档 `gpu_speed_bin` 有关 | 主线设备树 |
 | 固件 | `/vendor/firmware/gen80200_sqe.fw`、`gen80200_gmu.bin`、`gen80200_aqe.fw`；zap：`/odm/firmware/gen80200_zap.mbn` | 文件列表 + 安卓 `msm_kgsl.ko` 里的字符串 `adreno_gpu_core_gen8_2_1` |
 
 ## 2. 已有的开源工作
