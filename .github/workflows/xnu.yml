@@ -107,6 +107,33 @@ jobs:
           done
           ls -la out/kdk-libs
 
+      - name: Package objects for local relinks
+        if: always()
+        run: |
+          # Every object, file list and export list of the kernel link, plus the two link
+          # libraries that only Xcode/blacktop have: wsl/local_relink.sh recompiles changed
+          # files and relinks with cctools-port ld64 on Linux.
+          O=dxb/build/xnu.obj
+          mkdir -p linklibs
+          cp dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a linklibs/ || true
+          TC=$(dirname "$(xcrun --find clang)")/..
+          find "$TC" "$(xcrun --sdk macosx --show-sdk-path)" -name '*cc_kext*' 2>/dev/null | tee linklibs/cc_kext_paths.txt
+          while read -r f; do cp "$f" linklibs/ || true; done < linklibs/cc_kext_paths.txt
+          (cd $O && find . -type f \( -name '*.o' -o -name '*.filelist' -o -name '*.exp' -o -name 'symbolsets.plist' \)) > objlist.txt
+          wc -l objlist.txt
+          tar czf objects.tgz -C $O -T objlist.txt
+          tar czf linklibs.tgz linklibs
+          ls -la objects.tgz linklibs.tgz linklibs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-objects
+          path: |
+            objects.tgz
+            linklibs.tgz
+          retention-days: 7
+
       - name: Collect
         if: always()
         run: |
