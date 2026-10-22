@@ -119,7 +119,7 @@ jobs:
           TC=$(dirname "$(xcrun --find clang)")/..
           find "$TC" "$(xcrun --sdk macosx --show-sdk-path)" -name '*cc_kext*' 2>/dev/null | tee linklibs/cc_kext_paths.txt
           while read -r f; do cp "$f" linklibs/ || true; done < linklibs/cc_kext_paths.txt
-          (cd $O && find . -type f \( -name '*.o' -o -name '*.filelist' -o -name '*.exp' -o -name 'symbolsets.plist' \)) > objlist.txt
+          (cd $O && find . -type f \( -name '*.o' -o -name '*.cpo' -o -name '*.filelist' -o -name '*.exp' -o -name 'symbolsets.plist' \)) > objlist.txt
           wc -l objlist.txt
           tar czf objects.tgz -C $O -T objlist.txt
           tar czf linklibs.tgz linklibs

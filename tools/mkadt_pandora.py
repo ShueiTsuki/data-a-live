@@ -173,6 +173,13 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # Read by the original AppleImage4 (prelinked, tools/mkprelink.py) at start-up,
+        # which panics without them ("failed to get mix-n-match policy: 2"). Both are
+        # iBoot-filled placeholders in the iPhone X device tree: 0 = mix-n-match allowed
+        # (AppleImage4 takes status == 0 as allowed); the AP security mode matches
+        # certificate-security-mode above.
+        ('mix-n-match-prevention-status', u32(0)),
+        ('effective-security-mode-ap', u32(1)),
     ] + list(root_props), [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel

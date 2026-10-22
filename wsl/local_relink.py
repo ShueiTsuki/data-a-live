@@ -7,8 +7,10 @@ LOG       CI log of an xnu.yml run (for the four link-only objects and the ld co
 BUILDTREE extracted xnu-buildtree artifact, xnu/ = the patched source to build
 OBJDIR    objects from `XNU_CC_OBJDIR=OBJDIR xnu-cc.py LOG BUILDTREE` (named after the source)
 OUT       kernel.development.pandora.unstripped is written here; strip -S gives the kernel
---lib     directories with libcc_kext.a / libfirehose_kernel.a (from the CI xnu-objects
-          artifact); without them the link reports the missing symbols.
+--lib     directories with libcc_kext.a / libfirehose_kernel.a; without them the link
+          reports the missing symbols.
+--ci DIR  use the CI xnu-objects artifact (DIR/obj, DIR/linklibs) first; --local SRC (repeatable)
+          takes that object from OBJDIR instead.
 """
 import os
 import re
@@ -79,6 +81,16 @@ def main():
     log, bt, objdir, out = sys.argv[1:5]
     objdir, out = os.path.abspath(objdir), os.path.abspath(out)
     libs = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == '--lib']
+    # --ci DIR: the CI xnu-objects artifact (objects.tgz unpacked into DIR/obj, linklibs.tgz
+    # into DIR): its Xcode-built objects are used first, local ones only for what it lacks
+    # or for sources named with --local (files changed since that CI run).
+    ci = next((os.path.abspath(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == '--ci'), None)
+    local_only = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == '--local']
+    if ci:
+        libs.append(os.path.join(ci, 'linklibs'))
+        cc = os.path.join(ci, 'linklibs', 'libcc_kext.a')
+        if not os.path.exists(cc):
+            os.symlink('libclang_rt.cc_kext.a', cc)
     bt = os.path.abspath(bt)
     # Locally compiled objects by component and object name.
     have = {}
@@ -98,13 +110,24 @@ def main():
             continue
         comp = path.split('/' + CONFIG.split('/')[-1] + '/')[1].split('/')[0]
         stem = os.path.splitext(os.path.basename(path))[0]
+        if ci and not any(stem == os.path.splitext(os.path.basename(l))[0] for l in local_only):
+            cip = os.path.join(ci, 'obj', path.split('/build/xnu.obj/')[1])
+            if os.path.exists(cip):
+                filelist.append(cip)
+                continue
         cands = have.get((comp, stem)) or have.get((None, stem), [])
         if len(cands) != 1:
             missing.append((path.split(CONFIG)[1], len(cands)))
             continue
         filelist.append(cands[0])
     print(f'link.filelist: {len(filelist)} objects found, {len(missing)} not: {missing[:8]}')
-    extra = extra_objects(log, bt, objdir)
+    if ci:
+        n_ci = sum(1 for f in filelist if f.startswith(ci))
+        print(f'  {n_ci} from CI, {len(filelist) - n_ci} local')
+        extra = {n: os.path.join(ci, 'obj', CONFIG.split('/')[-1], n)
+                 for n in ('version.o', 'lastkerneldataconst.o', 'lastkernelconstructor.o', 'nonlto.o')}
+    else:
+        extra = extra_objects(log, bt, objdir)
     os.makedirs(out, exist_ok=True)
     fl = os.path.join(out, 'link.filelist')
     open(fl, 'w').write('\n'.join(filelist) + '\n')
