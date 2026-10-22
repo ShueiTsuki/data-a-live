@@ -118,6 +118,16 @@ Linux 的 a840 条目带 `ADRENO_QUIRK_HAS_CACHED_COHERENT`（`a6xx_catalog.c`�
 - CoreAnimation（QuartzCore）：必须加载 `default.metallib`（里面有 141 段 AIR [实测]）。预编译管线按设备的 `targetDeviceInfo.name` 找 `default.pipelinelib/pipelines.<名字>`；名字不认识就自动改为从 AIR 现场编译（苹果自己的虚拟机也走这条路）。之后还会查询 GPU 家族、FP16、YCbCr 格式等能力。
 - 现在手机走的是软件回退：Metal 和 GLES 上下文都建不起来时，由 `CA::WindowServer::Server::sw_renderer()` 用 CPU 光栅化。主屏墙纸的 HEIC/YUV 图层画不出来、图标画不全，都发生在这条 CPU 路径上 [推断]。
 
+### NativeMetal 的 iOS 16 移植（ios-fuxi N1）和我们系统库的对照 [详见调研笔记 `n1_private_api_check.md`]
+检查对象：UniXNU NativeMetal 固定版本 a96fece，打上 ios-fuxi 的三个补丁（都能干净打上）。
+- **都存在** [读自我们的 dyld 共享缓存]：N1 子类化或查找的私有类、协议（`_MTLDevice`、MTLDevice、MTLDeviceSPI 等），用到的 C 函数（`sys_dcache_flush`、IOSurface、IOKit 等）。N1 没有链接任何 Metal 私有 C 函数。
+- **`_MTLDevice` 实例大小 528 字节**，直接从我们的系统库读出，和 N1 写死的值一致。
+- **iOS 16 的设备登记流程** [读自二进制]：`_MTLAddDevice` 只检查两个协议，再调 `initLimits` 和 `initFeatureQueries`。N1 两样都有。
+- **UniXNU 的 iPadOS 17 专用做法**（读 QuartzCore 内部字段、vm_read 等）在 N1 里都已经去掉 [读自源码]。
+- **缺口**：CoreAnimation 判断图像格式（能否生成 mip、IOSurface 能否当纹理）时，会通过 Metal 的格式查询问设备 `isMsaa32bSupported`、`isFloat32FilteringSupported`、`supportsASTCTextureCompression`、`supportsBCTextureCompression`（偶尔还有 `retainedLabel`）。N1 都没实现。设备收到没实现的方法会算一次失败，backboardd 会被记过。上机前要给它们补上固定答案。另一个没实现的 `newRenderPipelineStateWithTileDescriptor:...` 受 `supportsTileShaders` 控制，N1 回答"否"，会跳过。
+- **行为差异** [推断]：N1 的 Rust 桥接层按 iPad 的 A10X 回答 GPU 家族（Apple1–3），而我们的系统是 iPhone X（A11，属于 Apple4）。系统有些判断可能会走和原机不同的分支。
+- 没查到的：CoreImage、RenderBox 等别的 Metal 使用者会问设备哪些方法。
+
 ## 4. 三条路线比较
 
 ### (a) Metal → Vulkan（Turnip）→ 我们内核里的 Adreno 驱动 —— 推荐
