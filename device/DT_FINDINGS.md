@@ -90,3 +90,9 @@
 - /data = dm-62 `userdata`：`0-1000869848: default-key aes-xts-plain64 ... 259:18 0 ... sector_size:4096 iv_large_sectors wrappedkey_v0`（覆盖整个 sda34，无偏移）。f2fs 挂载选项含 inlinecrypt、discard、background_gc=on。
 - sda34 的第二个占用者 dm-63 `cust`：`0-5533696: linear, 259:18 3186688`——小米把 cust 放在 userdata 内部一段连续区域，绕过 default-key 直接线性映射原始块（libfiemap 机制，/data/gsi/{dsu,ota,remount} 也属于它）。说明"userdata 里钉住文件 + 直接访问其原始块"是这台手机系统自己在用的做法。
 - root 能以读写模式打开 /dev/block/sda34（只打开立即关闭，未写）。
+
+## 触摸（2026-10-22，安卓里只读：/proc/bus/input/devices、getevent -p、/sys/bus/spi、设备树）
+- 主屏 = **Synaptics TCM**（`synaptics,tcm-spi`，驱动 synaptics_tcm_spi），SPI 0x1a80000（qupv3_4，spi19），irq GPIO 158、reset GPIO 66；设备树 max-x 1220、max-y 2656、super-resolution-factor 100；安卓输入设备 `Xiaomi_Touch_Input_0`（ABS_MT 0..121999 × 0..265599）。
+- 背屏 = FocalTech（`focaltech,fts`，驱动 focaltech_ts），SPI 0x1988000（qupv3_3，spi15），irq GPIO 201、reset GPIO 185；display-coords 90400×57200；`Xiaomi_Touch_Input_1`（904×572 ×100）。
+- 所以 ios-fuxi 的 fuxi_touch（FTS）在 17 Pro 上对应背屏；主屏要新写 Synaptics TouchComm 驱动（第 7 步）。
+- 按键：gpio-keys（音量+）、pmk8850 pon_hlos@1300 的 pwrkey / resin（电源、音量-），与之前设备树结论一致。
