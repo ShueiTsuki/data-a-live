@@ -144,7 +144,8 @@
 - 阶段 A：/data/local/tmp/iostest.img，64 MiB，钉住，23 段（2 MiB 对齐），避开 cust（0x61400000–0x10a200000）。
 - 阶段 B：直接写 sda34 上第 0 块 → 通过文件系统读只有第 0 块变成乱码，证明位置就是这个文件自己的块。
 - 阶段 C：写满 16384 块，从存储读回全部一致；通过文件系统读 16384 块全部变化；文件仍钉住，GC 未动；dmesg 无 f2fs/IO 错误。块位置存档 device/iostest-extents-20261022.json。
-- 阶段 D（进行中）：第 1 次重启后复查通过（仍钉住、GC 未动、23 段位置与存档完全一致、16384 块测试内容全在、dmesg 无 f2fs/IO 错误）。待：正常使用几天、多次重启后再查；用苹果内核按块位置只读读出比对。
+- 阶段 D（进行中）：第 1 次重启后复查通过（仍钉住、GC 未动、23 段位置与存档完全一致、16384 块测试内容全在、dmesg 无 f2fs/IO 错误）。待：正常使用几天、多次重启后再查。
+- 苹果内核读这个文件（0121，构建 #19，`pandora_ufs_probe=4`，ADT 由 `mkadt_pandora.py --root-extents device/iostest-extents-20261022.json` 生成）：正式驱动以只读打开 userdata，载入 23 段 16384 块；第 0 块开头读出 `IOSPANDORA RAWTEST v1 L=0000000000000000 P=000000005fe00000`；**16384 块全部与 pinfile 写入的内容一致，0 块不一致**。免清数据方案的整条读路径打通。
 
 ## 主要风险
 - CPU 是高通自研 Oryon 核心（8 Elite Gen 5，6 个性能核 + 2 个超大核），ios-sweet（Cortex-A55/A76）和 UniXNU（骁龙 8 Gen 2，ARM 公版核心）都没在它上面跑过，目前没有苹果内核在 Oryon 上运行的先例。
