@@ -28,6 +28,10 @@ pandora_ufs_probe(void)
 	printf("PANDORA SMMU: IDR2=%08x IDR7=%08x sGFSR=%08x\n", idr2, idr7, gfsr);
 
 	unsigned nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
+	if (idr0 == 0 || idr0 == 0xffffffffu) {
+		printf("PANDORA SMMU: IDR0 reads %08x: registers not readable, scan skipped\n", idr0);
+		nsmr = 0;
+	}
 	uint32_t pgsize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
 	uint32_t cb_base = (1u << (((idr1 >> 28) & 7) + 1)) * pgsize;
 	unsigned valid = 0, shown = 0, ufs = 0;
@@ -40,16 +44,20 @@ pandora_ufs_probe(void)
 		uint32_t s2cr = pu_rd(smmu, 0xc00 + 4 * i);
 		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
 		bool is_ufs = ((id ^ PU_UFS_SID) & ~mask) == 0;
-		if (!is_ufs && shown >= 6) {
+		if (is_ufs) {
+			ufs++;
+		}
+		if (is_ufs ? ufs > 4 : shown >= 6) {
 			continue;
 		}
-		shown++;
+		if (!is_ufs) {
+			shown++;
+		}
 		printf("PANDORA SMMU: SMR%u id=%04x mask=%04x S2CR=%08x%s\n",
 		    i, id, mask, s2cr, is_ufs ? " <- UFS" : "");
 		if (!is_ufs) {
 			continue;
 		}
-		ufs++;
 		unsigned type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
 		if (type == 0 && cb < ncb && cb_base + (cb + 1) * pgsize <= PU_SMMU_SIZE) {
 			vm_offset_t c = smmu + cb_base + cb * pgsize;
