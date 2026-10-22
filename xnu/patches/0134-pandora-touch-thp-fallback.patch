@@ -1,0 +1,317 @@
+diff --git a/bsd/dev/pandora_touch.c b/bsd/dev/pandora_touch.c
+index b7cee69..3eb7f58 100644
+--- a/bsd/dev/pandora_touch.c
++++ b/bsd/dev/pandora_touch.c
+@@ -16,6 +16,12 @@
+  *   bit 1  vote L4I_E0 on (1.8 V, high power mode) through RPMh, apps RSC DRV 2
+  *   bit 2  run: SPI set-up, avdd, reset, TouchComm identify, application info, touch
+  *          report config, then report touches to SweetHIDTouch
++ *   bit 3  also keep the firmware's THP frames (report 0xc0: 64-byte header, then the
++ *          16 x 35 signed 16-bit capacitance deltas) and find fingers in them here, for
++ *          a firmware that leaves touch positions to the host. Its own touch reports
++ *          (0x11) win when they come. pandora_thp_thr (default 200) is the finger
++ *          threshold, pandora_thp_swap=1 reads the deltas as 35 rows of 16,
++ *          pandora_thp_flip bit 0 / bit 1 mirror x / y.
+  * pandora_steps=MS: before the first access to each new register region print its
+  * name and wait MS (default 0), so a bus hang leaves the name in the log file.
+  */
+@@ -106,7 +112,7 @@ void pandora_touch_init(void);
+ #define SE_IRQ_EN        0xe1cu
+ #define SE_HW_PARAM0     0xe24u
+ #define SE_HW_PARAM1     0xe28u
+-#define PT_SPI_DIV       4u            /* 19.2 MHz XO / 4 = 4.8 MHz (IC allows 15 MHz) */
++#define PT_SPI_DIV       2u            /* 19.2 MHz XO / 2 = 9.6 MHz (IC allows 15 MHz) */
+ #define PT_XFER_MAX      4096u        /* DMA TX 0x2000-0x2fff, RX 0x3000-0x3fff */
+ 
+ /* TouchComm */
+@@ -138,12 +144,17 @@ static struct {
+ 	unsigned max_rd, max_wr;
+ 	unsigned max_x, max_y, max_objects;
+ 	bool fill;
++	bool thp;                              /* bit 3: fingers from THP frames too */
++	unsigned rows, cols;                   /* THP image: 16 x 35 */
++	unsigned thp_thr, thp_swap, thp_flip, thp_logs;
++	uint64_t last_ic_touch;                /* last 0x11 report with a finger */
+ 	uint8_t msg[PT_MSG_MAX];
+ 	unsigned msg_len;
+ 	uint8_t config[256];
+ 	unsigned config_len;
+ 	uint32_t active;
+-	int x[PT_MAX], y[PT_MAX];
++	int x[PT_MAX], y[PT_MAX];               /* last delivered, presented display */
++	int px[PT_MAX], py[PT_MAX];             /* the same in panel pixels */
+ 	uint32_t codes_seen[8];                /* bitmap of report codes already logged */
+ 	unsigned reports, touch_reports;
+ } pt;
+@@ -1033,6 +1044,7 @@ tc_read(uint8_t *code)
+ }
+ 
+ static void tc_touch_report(const uint8_t *r, unsigned n);
++static void tc_thp_frame(const uint8_t *f, unsigned n);
+ 
+ static void
+ tc_report(uint8_t code)
+@@ -1043,6 +1055,9 @@ tc_report(uint8_t code)
+ 		tc_touch_report(pt.msg, pt.msg_len);
+ 		return;
+ 	}
++	if (code == TC_THP_FRAME && pt.thp) {
++		tc_thp_frame(pt.msg, pt.msg_len);
++	}
+ 	if (!(pt.codes_seen[code >> 5] & (1u << (code & 31)))) {
+ 		pt.codes_seen[code >> 5] |= 1u << (code & 31);
+ 		printf("PANDORA TOUCH: first report %#x\n", code);
+@@ -1217,6 +1232,8 @@ tc_setup(void)
+ 	printf("PANDORA TOUCH: app info: version %u status %u max %u x %u objects %u image %u x %u\n",
+ 	    le16(pt.msg), le16(pt.msg + 2), pt.max_x, pt.max_y, pt.max_objects,
+ 	    pt.msg_len >= 44 ? le16(pt.msg + 40) : 0, pt.msg_len >= 44 ? le16(pt.msg + 42) : 0);
++	pt.rows = pt.msg_len >= 44 ? le16(pt.msg + 40) : 16;
++	pt.cols = pt.msg_len >= 44 ? le16(pt.msg + 42) : 35;
+ 	if (pt.max_objects == 0 || pt.max_objects > PT_MAX) {
+ 		pt.max_objects = PT_MAX;
+ 	}
+@@ -1236,8 +1253,12 @@ tc_setup(void)
+ 	/* After reset the firmware streams Xiaomi THP frames (report 0xc0, about 1.5 KB each)
+ 	 * for the host's touch algorithm. Stop those and ask for its own touch reports. */
+ 	uint8_t r = TC_THP_FRAME;
+-	err = tc_command(CMD_DISABLE_REPORT, &r, 1, &code);
+-	printf("PANDORA TOUCH: disable report %#x -> %d (code %#x)\n", r, err, code);
++	if (pt.thp) {
++		printf("PANDORA TOUCH: keeping THP frames (fingers found here too)\n");
++	} else {
++		err = tc_command(CMD_DISABLE_REPORT, &r, 1, &code);
++		printf("PANDORA TOUCH: disable report %#x -> %d (code %#x)\n", r, err, code);
++	}
+ 	r = TC_TOUCH;
+ 	err = tc_command(CMD_ENABLE_REPORT, &r, 1, &code);
+ 	printf("PANDORA TOUCH: enable report %#x -> %d (code %#x)\n", r, err, code);
+@@ -1262,6 +1283,40 @@ tc_bits(const uint8_t *r, unsigned n, unsigned off, unsigned bits)
+ 	return out;
+ }
+ 
++/* Fingers in panel pixels (1220 x 2656) -> SweetHIDTouch, which on PANDORA takes the
++ * presented 1125 x 2436 display's pixels (stretched with sweetfb_fill=1, else centred). */
++static void
++pt_deliver(uint32_t mask, const int *px, const int *py)
++{
++	if (sweet_fb_display_off) {
++		mask = 0;
++	}
++	for (unsigned id = 0; id < PT_MAX; id++) {
++		if (!(mask & (1u << id))) {
++			continue;
++		}
++		int x, y;
++		if (pt.fill) {
++			x = px[id] * 1125 / 1220;
++			y = py[id] * 2436 / 2656;
++		} else {
++			x = px[id] - (1220 - 1125) / 2;
++			y = py[id] - (2656 - 2436) / 2;
++		}
++		pt.px[id] = px[id];
++		pt.py[id] = py[id];
++		pt.x[id] = x;
++		pt.y[id] = y;
++		sweet_hid_touch((int)id, 1, x, y);
++	}
++	for (unsigned id = 0; id < PT_MAX; id++) {
++		if ((pt.active & (1u << id)) && !(mask & (1u << id))) {
++			sweet_hid_touch((int)id, 0, pt.x[id], pt.y[id]);
++		}
++	}
++	pt.active = mask;
++}
++
+ /* Touch report, decoded with the IC's own report config (syna_tcm_parse_touch_report). */
+ static void
+ tc_touch_report(const uint8_t *r, unsigned n)
+@@ -1341,41 +1396,145 @@ tc_touch_report(const uint8_t *r, unsigned n)
+ 		}
+ 	}
+ done:
+-	if (sweet_fb_display_off) {
+-		return;
+-	}
++	;
+ 	uint32_t mask = 0;
++	int px[PT_MAX], py[PT_MAX];
+ 	for (unsigned id = 0; id < PT_MAX; id++) {
+ 		/* finger, glove, stylus, eraser, small object */
+ 		if (status[id] < 1 || status[id] > 5) {
+ 			continue;
+ 		}
+ 		mask |= 1u << id;
+-		/* IC units -> the presented 1125x2436 display (SweetHID.cpp on PANDORA). */
+-		uint64_t px = (uint64_t)xs[id] * 1220 / (pt.max_x + 1);
+-		uint64_t py = (uint64_t)ys[id] * 2656 / (pt.max_y + 1);
+-		int x, y;
+-		if (pt.fill) {
+-			x = (int)((uint64_t)xs[id] * 1125 / (pt.max_x + 1));
+-			y = (int)((uint64_t)ys[id] * 2436 / (pt.max_y + 1));
+-		} else {
+-			x = (int)px - (1220 - 1125) / 2;
+-			y = (int)py - (2656 - 2436) / 2;
+-		}
+-		pt.x[id] = x;
+-		pt.y[id] = y;
+-		sweet_hid_touch((int)id, 1, x, y);
++		/* IC units (0..max) -> panel pixels, 1220 x 2656 */
++		px[id] = (int)((uint64_t)xs[id] * 1220 / (pt.max_x + 1));
++		py[id] = (int)((uint64_t)ys[id] * 2656 / (pt.max_y + 1));
+ 	}
+-	for (unsigned id = 0; id < PT_MAX; id++) {
+-		if ((pt.active & (1u << id)) && !(mask & (1u << id))) {
+-			sweet_hid_touch((int)id, 0, pt.x[id], pt.y[id]);
+-		}
++	if (mask) {
++		pt.last_ic_touch = mach_absolute_time();
+ 	}
+ 	if (mask != pt.active && pt.touch_reports <= 20) {
+ 		printf("PANDORA TOUCH: report %u: fingers %#x (first %u,%u raw)\n", pt.touch_reports,
+ 		    mask, xs[0], ys[0]);
+ 	}
+-	pt.active = mask;
++	pt_deliver(mask, px, py);
++}
++
++/*
++ * Fingers from a THP frame: cells at or above pandora_thp_thr that are the largest in
++ * their 3 x 3 neighbourhood, position = weighted centroid of that neighbourhood, ids kept
++ * by nearest previous position. Panel pixels as tc_touch_report.
++ */
++static void
++tc_thp_frame(const uint8_t *f, unsigned n)
++{
++	unsigned rows = pt.rows, cols = pt.cols, cells = rows * cols;
++	if (rows == 0 || cols == 0 || n < 64 + 2 * cells) {
++		return;
++	}
++	const uint8_t *d = f + 64;
++#define THP(r, c) ((int)(int16_t)(d[2 * ((r) * cols + (c))] | (d[2 * ((r) * cols + (c)) + 1] << 8)))
++	int thr = (int)pt.thp_thr, found = 0, fx[PT_MAX], fy[PT_MAX], fv[PT_MAX];
++	for (unsigned r = 0; r < rows && found < (int)PT_MAX; r++) {
++		for (unsigned c = 0; c < cols && found < (int)PT_MAX; c++) {
++			int v = THP(r, c);
++			if (v < thr) {
++				continue;
++			}
++			bool peak = true;
++			long sw = 0, sr = 0, sc = 0;
++			for (int dr = -1; dr <= 1; dr++) {
++				for (int dc = -1; dc <= 1; dc++) {
++					int rr = (int)r + dr, cc = (int)c + dc;
++					if (rr < 0 || cc < 0 || rr >= (int)rows || cc >= (int)cols) {
++						continue;
++					}
++					int w = THP(rr, cc);
++					/* ties: the first cell in scan order is the peak */
++					if (w > v || (w == v && (dr < 0 || (dr == 0 && dc < 0)))) {
++						peak = false;
++					}
++					w -= thr / 2;
++					if (w > 0) {
++						sw += w;
++						sr += (long)w * (2 * rr + 1);
++						sc += (long)w * (2 * cc + 1);
++					}
++				}
++			}
++			if (!peak || sw == 0) {
++				continue;
++			}
++			/* centre of the cell, in units of 1/16 cell: (2i+1)/2 */
++			long rpos = sr * 8 / sw, cpos = sc * 8 / sw;     /* 1/16 cell */
++			long xc = pt.thp_swap ? cpos : rpos, yc = pt.thp_swap ? rpos : cpos;
++			unsigned xn = pt.thp_swap ? cols : rows, yn = pt.thp_swap ? rows : cols;
++			if (pt.thp_flip & 1u) {
++				xc = (long)xn * 16 - xc;
++			}
++			if (pt.thp_flip & 2u) {
++				yc = (long)yn * 16 - yc;
++			}
++			fx[found] = (int)(xc * 1220 / ((long)xn * 16));
++			fy[found] = (int)(yc * 2656 / ((long)yn * 16));
++			fv[found] = v;
++			if (pt.thp_logs < 40) {
++				printf("PANDORA TOUCH: THP peak cell %u,%u value %d -> panel %d,%d\n", r, c, v,
++				    fx[found], fy[found]);
++			}
++			found++;
++		}
++	}
++#undef THP
++	if (pt.thp_logs < 40 && (found || pt.active)) {
++		pt.thp_logs++;
++	}
++	/* The firmware's own reports win while they come. */
++	uint64_t recent;
++	nanoseconds_to_absolutetime(300 * NSEC_PER_MSEC, &recent);
++	if (pt.last_ic_touch && mach_absolute_time() - pt.last_ic_touch < recent) {
++		return;
++	}
++	/* Keep ids: each previous finger takes its nearest peak (within 200 px). */
++	uint32_t mask = 0, used = 0;
++	int px[PT_MAX], py[PT_MAX];
++	for (unsigned id = 0; id < PT_MAX; id++) {
++		if (!(pt.active & (1u << id))) {
++			continue;
++		}
++		int best = -1;
++		long bd = 200L * 200L;
++		for (int k = 0; k < found; k++) {
++			if (used & (1u << k)) {
++				continue;
++			}
++			long dx = fx[k] - pt.px[id], dy = fy[k] - pt.py[id], dd = dx * dx + dy * dy;
++			if (dd < bd) {
++				bd = dd;
++				best = k;
++			}
++		}
++		if (best >= 0) {
++			used |= 1u << best;
++			mask |= 1u << id;
++			px[id] = fx[best];
++			py[id] = fy[best];
++		}
++	}
++	for (int k = 0; k < found; k++) {
++		if (used & (1u << k)) {
++			continue;
++		}
++		for (unsigned id = 0; id < PT_MAX; id++) {
++			if (!(mask & (1u << id)) && !(pt.active & (1u << id))) {
++				mask |= 1u << id;
++				px[id] = fx[k];
++				py[id] = fy[k];
++				break;
++			}
++		}
++	}
++	(void)fv;
++	pt_deliver(mask, px, py);
+ }
+ 
+ /* ---- thread -------------------------------------------------------------------- */
+@@ -1405,6 +1564,11 @@ pt_thread(void *arg, wait_result_t result)
+ 	int fill = 0;
+ 	(void)PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
+ 	pt.fill = fill != 0;
++	pt.thp = (mask & 8u) != 0;
++	pt.thp_thr = 200;
++	(void)PE_parse_boot_argn("pandora_thp_thr", &pt.thp_thr, sizeof(pt.thp_thr));
++	(void)PE_parse_boot_argn("pandora_thp_swap", &pt.thp_swap, sizeof(pt.thp_swap));
++	(void)PE_parse_boot_argn("pandora_thp_flip", &pt.thp_flip, sizeof(pt.thp_flip));
+ 	printf("PANDORA TOUCH: pandora_touch=%#x, starting in %u s\n", mask, delay_s);
+ 	pt_sleep(delay_s * 1000u);
+ 	pt.gcc = ml_io_map(PT_GCC_PA, 0x1f0000);
+@@ -1472,7 +1636,7 @@ pt_thread(void *arg, wait_result_t result)
+ 					printf("PANDORA TOUCH: read error %d (%u)\n", err, errors);
+ 				}
+ 				if (pt.active) {
+-					tc_touch_report(NULL, 0);
++					pt_deliver(0, NULL, NULL);
+ 				}
+ 				/* Out of step with the IC (a message read half): start it again. */
+ 				if (++bad >= 20) {
