@@ -22,4 +22,15 @@ patch('libkern/libkern/c++/OSMetaClass.h', [
 #if !XNU_TARGET_OS_OSX || defined(PANDORA)
 #define APPLE_KEXT_VTABLE_PADDING   0"""),
 ])
+
+# The macOS arm64 export lists name those padding methods; without them the build's
+# export check fails ("exported name not in import list"). No kext we load links against
+# the reserved slots, so drop them from the lists for every machine config.
+import glob
+for f in sorted(glob.glob('config/*.arm64*.MacOSX.exports')):
+    lines = open(f).read().split('\n')
+    kept = [l for l in lines if '_RESERVED' not in l]
+    if len(kept) != len(lines):
+        open(f, 'w').write('\n'.join(kept))
+        print(f, len(lines) - len(kept), 'reserved names removed')
 print('patched')
