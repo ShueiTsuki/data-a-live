@@ -147,6 +147,13 @@
 - 阶段 D（进行中）：第 1 次重启后复查通过（仍钉住、GC 未动、23 段位置与存档完全一致、16384 块测试内容全在、dmesg 无 f2fs/IO 错误）。待：正常使用几天、多次重启后再查。
 - 苹果内核读这个文件（0121，构建 #19，`pandora_ufs_probe=4`，ADT 由 `mkadt_pandora.py --root-extents device/iostest-extents-20261022.json` 生成）：正式驱动以只读打开 userdata，载入 23 段 16384 块；第 0 块开头读出 `IOSPANDORA RAWTEST v1 L=0000000000000000 P=000000005fe00000`；**16384 块全部与 pinfile 写入的内容一致，0 块不一致**。免清数据方案的整条读路径打通。
 
+## iOS 系统镜像（2026-10-22，电脑上，未放进手机）
+- 固件：D:/ClaudeAre/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw（d22ap，OS 087-86698-044 / SystemOS 087-86593-047 / AppOS 087-86715-047）。
+- WSL 内核没有 HFS+：wsl/prep_root_tools.sh 编了同版本 WSL 内核取 hfsplus.ko（vermagic 一致）并加载；apfs-fuse 现编。
+- ios-fuxi mkiosroot.sh → 16 GiB 区分大小写带日志 HFS+（用 12 GB），fsck 通过；fuxi-stage-root.py；sweet-root-tweaks.py 基础修改（launchd 7 处 _PanicOnCrash、删 2 个 CommCenter 任务、containers、迁移、音频、MediaToolbox、SpringBoard 看门狗、跳过设置向导）。mobileactivationd 系统容器不存在，激活数据包跳过（激活靠 ADT 的安全状态属性）。
+- 结果：WSL /opt/work/iosroot/ios-root.img（HFSX 签名 HX），SHA-256 62c712f35248d68570977bfb7bf7cbdab1f7835121d6aa1af7412e2f61c42994；未修改的副本 ios-root-base.img。
+- d22ap 的 Apple 硬件说明已取出：/opt/work/ipsw/d22ap.adt（mkadt_pandora.py 的 /product 节点从这里来）。
+
 ## 第 6 步方案草稿（放正式 iOS 系统，未执行，等用户确认）
 1. 电脑上做系统镜像：ios-fuxi mkiosroot.sh（三个 APFS 镜像 → 16 GiB 区分大小写、带日志的 HFS+）+ sweet-root-tweaks.py（与手机无关的用户态修改）+ fuxi-stage-root.py。WSL 内核无 HFS+，现编 hfsplus.ko（wsl/prep_root_tools.sh）。镜像算好 SHA-256。
 2. 手机上建钉住文件：`pinfile create /data/local/tmp/iosroot.img 16384`（16 GiB，剩余空间 164 GB），status / extents / rawcheck 彩排同 64 MB 测试。
