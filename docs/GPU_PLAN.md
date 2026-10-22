@@ -131,7 +131,7 @@ Linux 的 a840 条目带 `ADRENO_QUIRK_HAS_CACHED_COHERENT`（`a6xx_catalog.c`�
   - **MPS**：第一次用时会问 5 个 N1 没回答的特性（`supportsArrayOfTextures`、`supportsQuadShufflesAndBroadcast`、`supportsSIMDShufflesAndBroadcast`、`supportsReadWriteTextureArgumentsTier2`、`supportsNorm16BCubicFiltering`）。
   - **PhotosUICore**：`limits` 返回空时调用方会直接崩溃，只有用到照片渲染的墙纸才会碰到。
   - **没有缺口的**：PaperBoardUI、PosterBoard、WallpaperKit、CoreMaterial、SpringBoardHome、ImageIO、MPSImage；小组件相关框架不直接调用设备方法。
-  - **怎么应对** [推断]：UniXNU 的做法是 Metal 设备默认只发给渲染服务（backboardd），别的进程要列进名单才有（`--publish` / `--clients`），没拿到设备的进程照旧走 CPU。所以第一阶段只给 backboardd，CoreImage 的缺口碰不到。以后要让图标、墙纸也用 GPU，再补这几个方法：最小的办法是实现 `newLibraryWithImageFilterFunctionsSPI:`，把 CoreImage 自带的 AIR 滤镜函数（`ci_stdlib*.metallib` 等）链接成一个库后交给 metal2vulkan。这一步要自己写，没人做过。
+  - **怎么应对** [推断]：UniXNU 的做法是 Metal 设备默认只发给渲染服务（backboardd），别的进程要列进名单才有（`--publish` / `--clients`），没拿到设备的进程照旧走 CPU。所以第一阶段只给 backboardd，CoreImage 的缺口碰不到。核实过 [读自二进制]：QuartzCore 只链接了 Metal、没有链接 CoreImage，引用的类里也没有任何 `CIContext`、`CIImage`、`CIFilter`；`/usr/libexec/backboardd` 链接的是 QuartzCore 和 Metal，同样没有 CoreImage。以后要让图标、墙纸也用 GPU，再补这几个方法：最小的办法是实现 `newLibraryWithImageFilterFunctionsSPI:`，把 CoreImage 自带的 AIR 滤镜函数（`ci_stdlib*.metallib` 等）链接成一个库后交给 metal2vulkan。这一步要自己写，没人做过。
 
 ## 4. 三条路线比较
 
