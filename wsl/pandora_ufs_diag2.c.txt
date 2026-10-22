@@ -1,0 +1,105 @@
+/*
+ * UIC DME_GET (UFSHCI 5.6.x): a query of one UniPro/M-PHY attribute, no state change.
+ * ARG1 = attribute << 16 | selector, result code in ARG2[7:0] (0 = success), value in
+ * ARG3. Completion is IS.UCCS (bit 10). Attribute numbers as in Linux include/ufs/unipro.h.
+ */
+#define PU_REG_UICCMD   0x90
+#define PU_IS_UCCS      (1u << 10)
+#define PU_HCS_UCRDY    (1u << 3)
+
+static int
+pandora_dme_get(uint16_t attr, uint16_t sel, uint32_t *val)
+{
+	if (!(ufs_rd(REG_HCS) & PU_HCS_UCRDY)) {
+		return EBUSY;
+	}
+	ufs_wr(REG_IS, PU_IS_UCCS);
+	ufs_wr(PU_REG_UICCMD + 4, (uint32_t)attr << 16 | sel);
+	ufs_wr(PU_REG_UICCMD + 8, 0);
+	ufs_wr(PU_REG_UICCMD + 12, 0);
+	ufs_wr(PU_REG_UICCMD, 0x01);                    /* DME_GET */
+	for (int i = 0; i < 100000 && !(ufs_rd(REG_IS) & PU_IS_UCCS); i++) {
+		delay(1);
+	}
+	if (!(ufs_rd(REG_IS) & PU_IS_UCCS)) {
+		return ETIMEDOUT;
+	}
+	ufs_wr(REG_IS, PU_IS_UCCS);
+	uint32_t rc = ufs_rd(PU_REG_UICCMD + 8) & 0xff;
+	*val = ufs_rd(PU_REG_UICCMD + 12);
+	return rc ? (int)(0x100 | rc) : 0;
+}
+
+/* Link state: M-PHY TX/RX FSM per lane (1 = HIBERN8, 2 = SLEEP, 4 = LS burst,
+ * 5 = HS burst), PA_PWRMODE, connected/active TX lanes, TX gear. */
+static void
+pandora_ufs_link(const char *when)
+{
+	static const struct { const char *name; uint16_t attr, sel; } q[] = {
+		{ "txfsm0", 0x0041, 0 }, { "txfsm1", 0x0041, 1 },
+		{ "rxfsm0", 0x00c1, 4 }, { "rxfsm1", 0x00c1, 5 },
+		{ "pwrmode", 0x1571, 0 }, { "conntx", 0x1561, 0 },
+		{ "acttx", 0x1560, 0 }, { "txgear", 0x1568, 0 },
+	};
+	char line[160];
+	size_t n = (size_t)snprintf(line, sizeof(line), "PANDORA LINK %s:", when);
+	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && n < sizeof(line); i++) {
+		uint32_t v = 0;
+		int e = pandora_dme_get(q[i].attr, q[i].sel, &v);
+		n += (size_t)(e ? snprintf(line + n, sizeof(line) - n, " %s=E%x", q[i].name, e) :
+		    snprintf(line + n, sizeof(line) - n, " %s=%x", q[i].name, v));
+	}
+	printf("%s\n", line);
+	printf("PANDORA UFS %s: AHIT=%08x UTRIACR=%08x EXTCAP=%08x PID=%08x MID=%08x\n", when,
+	    ufs_rd(0x18), ufs_rd(0x4c), ufs_rd(0x0c), ufs_rd(0x10), ufs_rd(0x14));
+}
+
+/*
+ * One TEST UNIT READY to LUN 0 in slot 0, built like ufs_scsi() (hard-coded opcode 0x00,
+ * no data), then DBR/CNR/IS sampled at 1 ms, 10 ms, 100 ms, 1 s and 5 s. No UTRLCLR:
+ * the slot is left as the host has it, so CNR shows what the host itself did.
+ */
+static int
+pandora_ufs_tur_sampled(void)
+{
+	static const uint32_t at_us[] = { 1000, 10000, 100000, 1000000, 5000000 };
+	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
+	uint32_t dbr[5], cnr[5], is[5], waited = 0;
+
+	bzero(utrd, sizeof(*utrd));
+	bzero(ucd, sizeof(*ucd));
+	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU, no data, LUN 0 */
+	ucd->cmd[3] = ++su.tag;
+	/* cmd[16..]: CDB = TEST UNIT READY, all zero */
+	utrd->dw0 = (1u << 28) | (1u << 24);    /* UFS storage command, interrupt */
+	utrd->dw2 = 0x0f;                       /* OCS invalid until the host updates it */
+	utrd->ucdba = (uint32_t)ucd_pa;
+	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+	utrd->resp = (512u / 4) << 16 | (512u / 4);
+	dma_sync(DMA_UTRL, sizeof(*utrd));
+	dma_sync(DMA_UCD, sizeof(*ucd));
+	__builtin_arm_dsb(0xf);
+
+	printf("PANDORA UFS: ring slot 0 (CNR before %08x)\n", ufs_rd(0x64));
+	ufs_wr(REG_UTRLDBR, 1);
+	for (int i = 0; i < 5; i++) {
+		delay(at_us[i] - waited);
+		waited = at_us[i];
+		dbr[i] = ufs_rd(REG_UTRLDBR);
+		cnr[i] = ufs_rd(0x64);
+		is[i] = ufs_rd(REG_IS);
+	}
+	printf("PANDORA UFS: DBR %x %x %x %x %x  CNR %x %x %x %x %x\n", dbr[0], dbr[1], dbr[2],
+	    dbr[3], dbr[4], cnr[0], cnr[1], cnr[2], cnr[3], cnr[4]);
+	printf("PANDORA UFS: IS %x %x %x %x %x (at 1ms 10ms 100ms 1s 5s)\n", is[0], is[1], is[2],
+	    is[3], is[4]);
+	dma_sync(DMA_UTRL, sizeof(*utrd));
+	dma_sync(DMA_UCD, sizeof(*ucd));
+	printf("PANDORA UFS: UTRD dw2=%08x (OCS %02x) resp %02x %02x %02x %02x\n",
+	    utrd->dw2, utrd->dw2 & 0xff, ucd->resp[0], ucd->resp[1], ucd->resp[6], ucd->resp[7]);
+	bool done = !(dbr[4] & 1) && (utrd->dw2 & 0xff) == 0 && ucd->resp[0] == 0x21;
+	return done ? 0 : ETIMEDOUT;
+}
+
