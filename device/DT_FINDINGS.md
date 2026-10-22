@@ -84,3 +84,9 @@
 - 修法 1（0118）：DME_HIBERNATE_EXIT → UCCS、UHXS、UPMCRS=PWR_LOCAL，通道变成 5（HS burst）。
 - 之后 LUN 0 的 TEST UNIT READY 回 CHECK CONDITION，sense 70/key 2 NOT READY/ASC 04 ASCQ 02（initializing command required）：存储芯片本身也被留在省电状态。
 - 修法 2（0119）：对设备管理 WLUN 0xD0 发 START STOP UNIT，电源状态 ACTIVE（1b 00 00 00 10 00），和 Linux 恢复、Fuxi 初始化一样。
+
+## /data 加密层与原始分区（2026-10-22，安卓里只读检查）
+- 内核 6.12.69-android16 GKI 4k；CONFIG_BLK_DEV_WRITE_MOUNTED=y（允许写正在使用的分区）、CONFIG_BLK_INLINE_ENCRYPTION=y、CONFIG_DM_DEFAULT_KEY=y。
+- /data = dm-62 `userdata`：`0-1000869848: default-key aes-xts-plain64 ... 259:18 0 ... sector_size:4096 iv_large_sectors wrappedkey_v0`（覆盖整个 sda34，无偏移）。f2fs 挂载选项含 inlinecrypt、discard、background_gc=on。
+- sda34 的第二个占用者 dm-63 `cust`：`0-5533696: linear, 259:18 3186688`——小米把 cust 放在 userdata 内部一段连续区域，绕过 default-key 直接线性映射原始块（libfiemap 机制，/data/gsi/{dsu,ota,remount} 也属于它）。说明"userdata 里钉住文件 + 直接访问其原始块"是这台手机系统自己在用的做法。
+- root 能以读写模式打开 /dev/block/sda34（只打开立即关闭，未写）。
