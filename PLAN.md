@@ -195,3 +195,12 @@
 - 扬声器：两颗 CS35L43 功放 I2C 应答正常（只探测，`pandora_amp=1`）。出声需要音频 DSP 驱动 I2S0，加上 iOS 能识别的音频驱动接口，没做。
 - 摄像头：iOS 相机依赖苹果 ISP 和私有驱动接口，高通 CAMSS 接不进去，没做。
 - 无人值守测试：`tools/ios_test.sh 名字 内核号 秒数 "附加参数"`，到时自动重启回安卓并取回日志 device/logs/名字.txt；日志文件 /data/local/tmp/ioslog.img（8 MiB，可删）。
+
+## 扬声器路线（调查结果，2026-10-22，未开始）
+功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
+1. 固件：/vendor/firmware_mnt/image/adsp.mdt + adsp.b00–b40（约 30 MB）和 adsp_dtb.mdt，装进 pinned 文件，内核按扩展区读入保留内存（adspslpi_region@0xa1400000、q6_adsp_dtb_region@0xa1380000）。
+2. 安全世界启动：SCM PAS 调用（init_image / mem_setup / auth_and_reset，两个镜像），这代芯片的元数据缓冲要先通过 SHM bridge 登记；通过 AOP 的 QMP 消息给 ADSP 上电，RPMh 投 LCX/LMX 电压。
+3. 通信：SMP2P 等待 ADSP 就绪，SMEM 上的 GLINK、rpmsg 通道、GPR 协议。
+4. 音频图：AudioReach APM 命令建播放图（共享内存端点、PCM 解码、TDM0 硬件端点），参数来自 /vendor/etc/acdbdata 的校准数据；同时把 CS35L43 配成接收 TDM、不跑或跑功放自己的扬声器保护固件。
+5. iOS 侧：实现 iOS 音频守护进程能认的内核音频驱动接口（苹果私有，要逆向 iOS 16 的音频框架）。
+摄像头同理不可行：iOS 相机依赖 A11 的 ISP 和 AppleH10CamIn 系列私有接口。
