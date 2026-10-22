@@ -1,0 +1,19 @@
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index c53d45d..2ce1842 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -263,6 +263,14 @@ __startup_func
+ static void
+ sweet_prng_startup(void)
+ {
++	/*
++	 * A prelinked original corecrypto kext (tools/mkprelink.py) installs the kernel PRNG
++	 * itself when IOKit loads it, which is before this EARLY_BOOT step: keep Apple's.
++	 */
++	if (prng_ready) {
++		kprintf("SWEET PRNG: kernel PRNG already installed (corecrypto kext); built-in not registered\n");
++		return;
++	}
+ 	/* Ensure the boot seed exists before registration erases the early DRBG. */
+ 	(void)early_random();
+ 	const struct cckprng_funcs funcs = {
