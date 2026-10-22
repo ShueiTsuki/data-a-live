@@ -33,13 +33,13 @@ Inputs (Apple files, never committed): `QuartzCore.framework/default.metallib` (
    build's ICD JSON with `library_path` pointing at the built `libvulkan_freedreno.so`.
    Turnip's real capabilities: `vulkaninfo --json` under the shim → `turnip_a840.json`; use it as
    `M2V_PROFILE` for step 6.
-8. `run_tu.sh DIR [CHIP_ID]` (`MESA_BUILD` picks the Mesa build): one process per meta runs `vk_pipeline.py`, which creates the
-   Vulkan pipeline (layouts, push constants, specialization, vertex input, dynamic rendering) and
+8. `run_tu.sh DIR [CHIP_ID]` (`MESA_BUILD` picks the Mesa build): one process per meta runs
+   `vk_pipeline.py`, which creates the Vulkan pipeline (layouts, push constants, specialization, vertex input, dynamic rendering) and
    prints Turnip's per-stage instruction counts (VK_KHR_pipeline_executable_properties).
+9. `run_kernels.sh PROFILE OUTDIR LIB...`: every compute kernel of the given metallibs (used for
+   CoreImage's own kernels), then `run_tu.sh OUTDIR`.
 
 Zero constants are diagnostic inputs, not CoreAnimation's runtime values; pairings and vertex
 layouts are probe inputs, not recovered CA pipelines. PASS means metal2vulkan translated and
 verified the pipeline and `spirv-val` accepted it; it does not mean Turnip compiled it to A840 code
 or that it renders correctly.
-9. `run_kernels.sh PROFILE OUTDIR LIB...`: every compute kernel of the given metallibs (used for
-   CoreImage's own kernels), then `run_tu.sh OUTDIR`.
