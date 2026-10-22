@@ -159,6 +159,13 @@
 - pinfile 段数上限改为 65536；rawwrite 按段内 ≤1 MiB 成批写；内核 0122：位置表上限 16384、二分查找、排序后查重叠（电脑上 800 万次随机查询与逐段对照一致）。
 - 先写第 0 块：文件系统读只有第 0 块变化，原始块前 4 KiB SHA-256 与镜像一致；再整个写入（adb exec-in 传输，4 分 15 秒），写入内容与从原始块重读的 SHA-256 都是 62c712f3…2994，与电脑上的镜像一致。安卓 dmesg 无 f2fs/IO 错误。
 
+## 第 6 步：iOS 启动（2026-10-22，真机，tools/boot_ios.sh，rd=ufsroot0）
+- 只读启动：HFS+ 日志区要在第一次挂载时初始化（mkfs 只留了"待初始化"标记，Linux 不碰日志），只读模式写不了 → 挂载失败。加 ufsrw=1 后日志初始化成功，根卷挂上，launchd 作为 PID 1 运行。
+- launchd 加载 libSystem 失败：共享缓存签名是 16K 页（"disallowing unsupported code signature page shift: 14"），4K 内核不认 → 0124 打开 UniXNU 的 XNU_NATIVE_CS_HASH_CACHE（先按 16K 核对苹果原签名，再算 4K 校验值）。代价：每次开机要读一遍约 3.3 GB 共享缓存，有一段明显停顿。
+- 之后 launchd 拉起大量服务（xpcproxy、backboardd、medialibraryd、bluetoothd、fairplayd.H2…）；backboardd 一直找 AppleM2ScalerCSCDriver。原因：SweetFramebuffer 只在屏幕比 iPhone X 小时才报告 1125x2436，17 Pro 比它大 → 报告了 1220x2656。0125 改为报告 1125x2436；0126 新增 sweetfb_fill=1，用 CPU 最近邻放大铺满 1220x2656（不加则居中留黑边）。
+- 0123：pandora_initwait=N，launchd 退出时先停 N 秒再 panic，方便拍照。ci_fetch.sh 改为每 10 秒查一次、只下载内核。
+- **可写启动（ufsrw=1 rootrw=1 sweetfb_noconsole=1 sweetfb_fill=1，构建 #24）：进入苹果标志。** 日志区重放正常（上次写入的内容恢复）。
+
 ## 第 6 步方案草稿（放正式 iOS 系统，未执行，等用户确认）
 1. 电脑上做系统镜像：ios-fuxi mkiosroot.sh（三个 APFS 镜像 → 16 GiB 区分大小写、带日志的 HFS+）+ sweet-root-tweaks.py（与手机无关的用户态修改）+ fuxi-stage-root.py。WSL 内核无 HFS+，现编 hfsplus.ko（wsl/prep_root_tools.sh）。镜像算好 SHA-256。
 2. 手机上建钉住文件：`pinfile create /data/local/tmp/iosroot.img 16384`（16 GiB，剩余空间 164 GB），status / extents / rawcheck 彩排同 64 MB 测试。
