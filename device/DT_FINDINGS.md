@@ -77,3 +77,10 @@
   → 引导程序已经给存储留了直通通道，存储控制器可以直接用物理地址（36 位以内，即 64 GB 以下）做 DMA，不用改 SMMU。
 - UFS 主机（0x1d84000）：CAP=0xd5c7031f（32 个请求槽，支持 64 位地址，支持 MCQ）；MCQCAP=0x20e0071f；VER=0x400（UFSHCI 4.0）；HCS=0x10f（设备在、各列表就绪）；HCE=1；IS=0x400（UIC 命令完成位未清）；IE=0；UTRLBA=0xc25b1000（引导程序的请求表）；DBR=0；RSR=1；**MEM_CFG=0（没开 MCQ，用传统单门铃方式）**；MCQ_CFG=0x1f00。
   → 时钟开着（读寄存器没卡住），控制器已开启、就绪、没有未完成的请求。现有驱动的传统方式可以直接用。
+
+## 存储交接状态（2026-10-22，真机，补丁 0116–0118 诊断）
+- 时钟（Linux 主线 gcc-kaanapali.c 的偏移；设备树写 qcom,canoe-gcc，寄存器范围 0x1f4200 与驱动一致）：UFS GDSC=0xfa22f000、物理层 GDSC=0xfa222800（都开着）；aggre_axi/ahb/axi/aux/rx0/rx1/tx0/unipro=0x00000001、ice=0x00004001（都在运行，不是硬件自动开关）。
+- 连接：交接时 M-PHY 4 条通道全部 HIBERN8（txfsm/rxfsm=1），PA_PWRMODE=0x11（双向快速模式），2 条通道，HS-G5；AHIT=0（自动休眠关）。所以门铃按下后命令一直不发出（DBR 一直为 1，CNR=0，IS=0）。之前看到的 CNR=1 是 UTRLCLR 取消造成的。
+- 修法 1（0118）：DME_HIBERNATE_EXIT → UCCS、UHXS、UPMCRS=PWR_LOCAL，通道变成 5（HS burst）。
+- 之后 LUN 0 的 TEST UNIT READY 回 CHECK CONDITION，sense 70/key 2 NOT READY/ASC 04 ASCQ 02（initializing command required）：存储芯片本身也被留在省电状态。
+- 修法 2（0119）：对设备管理 WLUN 0xD0 发 START STOP UNIT，电源状态 ACTIVE（1b 00 00 00 10 00），和 Linux 恢复、Fuxi 初始化一样。
