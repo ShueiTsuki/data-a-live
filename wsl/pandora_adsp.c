@@ -315,7 +315,7 @@ struct fw_ent {
 	char name[48];
 	uint64_t off, size;
 };
-static struct fw_ent ad_dir[62];
+static struct fw_ent ad_dir[63];
 static unsigned ad_nfiles;
 
 static int
@@ -329,7 +329,7 @@ fw_dir(void)
 	}
 	uint32_t n;
 	memcpy(&n, blk + 8, 4);
-	if (memcmp(blk, "PANDFW01", 8) || n == 0 || n > 62) {
+	if (memcmp(blk, "PANDFW01", 8) || n == 0 || n > 63) {
 		printf("PANDORA ADSP: no firmware pack header\n");
 		return EINVAL;
 	}

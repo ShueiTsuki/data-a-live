@@ -4,14 +4,14 @@
   mkfwpack.py OUT.img FILE...
 
 Block 0 (4 KiB): "PANDFW01" | u32 count | u32 reserved | count x {char name[48]; u64 offset;
-u64 size} (64 bytes each, at most 62). Files follow, each starting on a 4 KiB boundary.
+u64 size} (64 bytes each, at most 63). Files follow, each starting on a 4 KiB boundary.
 """
 import os
 import struct
 import sys
 
 out, files = sys.argv[1], sys.argv[2:]
-assert 0 < len(files) <= 62, 'at most 62 files'
+assert 0 < len(files) <= 63, 'at most 63 files'
 entries, blobs, off = [], [], 4096
 for f in files:
     data = open(f, 'rb').read()
