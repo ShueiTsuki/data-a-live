@@ -85,7 +85,9 @@ if [ -n "$FW" ]; then
 fi
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
-wsl -d Ubuntu-24.04 -u root -- bash -c "ADTFLAGS='$ADTFLAGS' CPUS=$CPUS RD=$RD DEBUG=$DEBUG NAME=out \
+# KERNEL=/opt/work/plk/kN-amfi.macho (tools/mkprelink.py) and TRUSTCACHE="IPSW trust cache..."
+# pass through to make_phone_payload.sh.
+wsl -d Ubuntu-24.04 -u root -- bash -c "KERNEL='${KERNEL:-}' TRUSTCACHE='${TRUSTCACHE:-}' ADTFLAGS='$ADTFLAGS' CPUS=$CPUS RD=$RD DEBUG=$DEBUG NAME=out \
 	bash <(tr -d '\r' < /mnt/d/DeepSeekHarness/claude/ios_pandora/wsl/make_phone_payload.sh) /opt/work/run$RUN '$CMDLINE'" 2>&1 |
 	grep -v NodeJS | tail -3
 bash "$ROOT/shim/loader/build.sh" | tail -1
