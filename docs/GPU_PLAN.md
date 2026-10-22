@@ -17,7 +17,8 @@
 | 频率 | 160–1200 MHz，18 档 | `gpu_available_frequencies` |
 | GPU 寄存器 | `0x3d00000`，长 `0x40000`；另有 rscc、cx_dbgc、cx_misc | 设备树 `reg`/`reg-names` |
 | GMU | `0x3d37000`，compatible `qcom,gen8-gmu` | `qcom,gmu@3d37000` |
-| GPU 的 SMMU | `kgsl-smmu@3da0000` | 设备树 |
+| GPU 的 SMMU | `kgsl-smmu@3da0000`（qsmmu-v500 / adreno-smmu，安卓由 `arm-smmu` 驱动绑定） | 设备树、`/sys/bus/platform/devices` |
+| GPU 时钟控制器 | `0x3d90000`（SMMU 的供应者之一） | `/sys/bus/platform/devices/3da0000.kgsl-smmu` |
 | UBWC | 版本 6 | `qcom,ubwc-mode` |
 | 固件 | `/vendor/firmware/gen80200_sqe.fw`、`gen80200_gmu.bin`、`gen80200_aqe.fw`；zap：`/odm/firmware/gen80200_zap.mbn` | 文件列表 + 安卓 `msm_kgsl.ko` 里的字符串 `adreno_gpu_core_gen8_2_1` |
 
@@ -108,10 +109,10 @@
 ## 7. 主要风险
 
 - **整机重启**：访问没上电的 GPU 模块会直接让手机重启（不伤数据，但每次都要重新进 iOS）。上电顺序必须照 Linux gen8 代码，先只读、后写。
-- **SMMU 归属**：kgsl-smmu 可能由高通的虚拟化层（Gunyah）管理，内核不能直接写页表时要改走别的办法。
+- **SMMU 归属**：安卓侧 [实测] `3da0000.kgsl-smmu` 由安卓内核自己的 `arm-smmu` 驱动绑定（compatible `qcom,qsmmu-v500`、`qcom,adreno-smmu`，带 `qcom,use-3-lvl-tables`、`qcom,actlr`），GMU（`3d37000`）和 GPU 的 user/secure/lpac 三个地址空间都是它的使用者，所以上下文页表由普通内核直接编程，不是完全交给虚拟化层 Gunyah。安全上下文（secure）仍可能由安全世界管。风险从"可能整个用不了"降为"要照安卓的做法配置"。
 - **gen8 资料只有 Linux 一份**：UniXNU 和 ios-fuxi 都只做过 A740，840 的每个寄存器都要对照 Linux 核实。
 - **backboardd 最后一段没人做通过**：ios-fuxi 卡在这里；UniXNU 在 iPadOS 17 上通过，但用了写内存的办法，iOS 16 不能照搬。
-- **构建链**：需要 Xcode 工具链编 iOS 16 的插件、Rust 和 Mesa；可以用 GitHub 的 macOS 机器（仓库是公开的，编译不限额）。
+- **构建链**：需要 Xcode 工具链编 iOS 16 的插件、Rust 和 Mesa。ios-fuxi 的做法 [读到 `.github/workflows/fuxi-build.yml`]：Metal 插件、metal2vulkan 桥接库在 GitHub 的 `macos-14` 机器上编（带 cargo 缓存），其余在 `ubuntu-latest` 上编。我们的仓库是公开的，编译不限额，可以照做。
 - **墙纸**：7400 墙纸的图片是 HEIC（HEVC 视频编码）[读到 ios-fuxi]。HEVC 解码和 GPU 是两块不同的硬件。有了 GPU，CoreAnimation 可以在着色器里直接画 YUV 图片 [推断]，但如果问题出在解码这一步，GPU 解决不了，要另外确认。
 
 ## 8. 许可
