@@ -147,6 +147,14 @@
 - 阶段 D（进行中）：第 1 次重启后复查通过（仍钉住、GC 未动、23 段位置与存档完全一致、16384 块测试内容全在、dmesg 无 f2fs/IO 错误）。待：正常使用几天、多次重启后再查。
 - 苹果内核读这个文件（0121，构建 #19，`pandora_ufs_probe=4`，ADT 由 `mkadt_pandora.py --root-extents device/iostest-extents-20261022.json` 生成）：正式驱动以只读打开 userdata，载入 23 段 16384 块；第 0 块开头读出 `IOSPANDORA RAWTEST v1 L=0000000000000000 P=000000005fe00000`；**16384 块全部与 pinfile 写入的内容一致，0 块不一致**。免清数据方案的整条读路径打通。
 
+## 第 6 步方案草稿（放正式 iOS 系统，未执行，等用户确认）
+1. 电脑上做系统镜像：ios-fuxi mkiosroot.sh（三个 APFS 镜像 → 16 GiB 区分大小写、带日志的 HFS+）+ sweet-root-tweaks.py（与手机无关的用户态修改）+ fuxi-stage-root.py。WSL 内核无 HFS+，现编 hfsplus.ko（wsl/prep_root_tools.sh）。镜像算好 SHA-256。
+2. 手机上建钉住文件：`pinfile create /data/local/tmp/iosroot.img 16384`（16 GiB，剩余空间 164 GB），status / extents / rawcheck 彩排同 64 MB 测试。
+3. 写入：给 pinfile 加 `rawwrite`（从 adb 标准输入读镜像，按块位置写 sda34，每块写前做 inside_one_extent 检查），写完 `rawhash` 在手机上按块位置算 SHA-256，与电脑上一致才算成功。先写第 0 块并 fsread 验证位置，再写全部（同 64 MB 测试的顺序）。
+4. 第一次启动只读：`rd=ufsroot0`，不加 ufsrw / rootrw，手机存储零写入，看 launchd 能走到哪。
+5. 之后可写启动：`rd=ufsroot0 ufsrw=1 rootrw=1`；写入只能落在这个文件的块里（fx_write_allowed + ufs_scsi 过滤层）。每次都用 tools/boot_ios.sh（复查钉住和位置、HFSX 签名）。
+6. 撤销：安卓里删掉 iosroot.img，f2fs 收回空间；其余不受影响。
+
 ## 主要风险
 - CPU 是高通自研 Oryon 核心（8 Elite Gen 5，6 个性能核 + 2 个超大核），ios-sweet（Cortex-A55/A76）和 UniXNU（骁龙 8 Gen 2，ARM 公版核心）都没在它上面跑过，目前没有苹果内核在 Oryon 上运行的先例。
 - 存储、地址转换单元、总线、显示控制器、虚拟化层这些高通自家部件，骁龙 8 Gen 2（UniXNU）比 732G（ios-sweet）更接近 17 Pro，但仍要对照设备树逐项核实。
