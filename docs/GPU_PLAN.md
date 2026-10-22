@@ -129,7 +129,7 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 
 按 Linux gen8 的顺序（完整的寄存器级清单在调研笔记 `gen8_bringup_sequence.md`，每一项都标了 Linux 文件和行号）：
 1. 投 RPMh 的 CX 电压和总线带宽（解析 cmd-db，复用 0143–0146 的代码），打开 GPUCC 的 PLL、GMU 时钟源、hub 时钟和各分支时钟，打开 `GPU_CC_CX_GDSC`。**在这之前不能碰 GMU、GBIF、RSCC、cx_misc 和 SMMU 的任何寄存器，否则整机重启。**
-   Linux 启动 GMU 前的顺序是 [读到 `a6xx_gmu_resume()`]：打开电源域 → GMU 核心时钟设 200 MHz、hub 时钟设 150 或 200 MHz 并打开 → `a6xx_gmu_set_initial_bw()` 按 GPU 频率表投一次内存总线带宽 → 装固件、启动 GMU → HFI。所以**带宽要在 GMU 启动前投好**。840 要投的总线节点是 catalog 里列的 SH0、MC0、ACV，都是 RPMh 的 BCM 投票，和我们给 ADSP 做的 RPMh 投票走同一个硬件通道。
+   Linux 启动 GMU 前的顺序是 [读到 `a6xx_gmu_resume()`]：打开电源域 → GMU 核心时钟设 200 MHz、hub 时钟设 150 或 200 MHz 并打开 → `a6xx_gmu_set_initial_bw()` 按 GPU 频率表投一次内存总线带宽 → 装固件、启动 GMU → HFI。所以**带宽要在 GMU 启动前投好**。840 要投的总线节点是 catalog 里列的 SH0、MC0、ACV，都是 RPMh 的 BCM 投票，和我们给 ADSP 做的 RPMh 投票走同一个硬件通道。我们内核里已有现成实现 [读到]：ios-fuxi 的 Wi-Fi 补丁 0099 里的 `wl_bcm_lookup`、`wl_bcm_bandwidth`、`wl_bcm_encode` 按 Linux 规则查 cmd-db、编码并提交 SH0、MC0、ACV 的带宽投票（0099 第 385–534 行），GPU 可以照搬。
 2. SMC 调用 `GPU_INIT_REGS`：750 和 a8xx 上 Linux 都会请求常开电源和温度传感器 [读到 `a6xx_gmu.c:1211-1235`]。
 3. 配置 GPU 的 SMMU：流 5 给 GMU，把 GMU 地址空间映射好（icache `0x4000`，dummy `0x60000000`，debug `0x60400000`，log 和 hfi 两块各 16 KB）。
 4. 按 `block_header` 格式装入 `gen80200_gmu.bin`（见第 5 节第 2 条），启动 GMU，等它报告初始化完成。
