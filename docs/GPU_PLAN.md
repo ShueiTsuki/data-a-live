@@ -72,7 +72,7 @@
 - 已有：除了"gen8 的上电和寄存器"以外，每一层都有在苹果系统上跑通过的实现（UniXNU 在 iPadOS 17，ios-fuxi 在 iOS 16）。
 - 最难的点：
   1. **gen8 上电**：SM8850 的 GPU 时钟、电源、RPMh 投票、GMU 固件格式、HFI 表格式都和 A740 不同，只能照 Linux a8xx 代码重写；读到没上电的模块会让整机重启。
-  2. **真正的 backboardd**：ios-fuxi 卡在三个功能上（mip 层数、memoryless RGBA16Float、第二个颜色附件），我们得在 NativeMetal 或 metal2vulkan 里补上。
+  2. **真正的 backboardd**：ios-fuxi 卡在三个功能上（mip 层数、memoryless RGBA16Float、第二个颜色附件）。这三次拒绝来自他们自己写的较小前端 FuxiMetal：`tools/fuxi-metal/Frontend.mm` 里 `textureDescriptorAccepted()` 用白名单检查格式、mip 层数、存储方式 [读到]。UniXNU 的 NativeMetal 本身支持 memoryless 渲染目标（`bridge/NativeMetalObjects.rs:317,431`）、mip（`NativeBridgeMetalFrontend.mm:200`）和多个颜色附件（`bridge/quartzcore_blur_host.mm:43`）[读到]，iPadOS 17 的 backboardd 正是靠它跑通的。ios-fuxi 最新的 N1 就是把 NativeMetal 移植到 iOS 16（`tools/build-fuxi-nativemetal.sh`），但还没上过真机。**所以选 NativeMetal（经 N1 的 iOS 16 移植），不选 FuxiMetal**；backboardd 这一段的风险主要剩下 iOS 16 与 17 的差别。
   3. **构建环境**：插件（Objective-C++）、Rust 库、Mesa 都要编成 iOS 16 arm64 的二进制，需要 Xcode 工具链（GitHub 的 macOS 机器上有）。
 
 ### (b) 模拟苹果 GPU（让苹果原装 AGX 驱动跑，内核把 AGX 命令翻译成 Adreno 命令）—— 不推荐
