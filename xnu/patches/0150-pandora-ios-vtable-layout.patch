@@ -1,0 +1,19 @@
+diff --git a/libkern/libkern/c++/OSMetaClass.h b/libkern/libkern/c++/OSMetaClass.h
+index 78315a2..8b75002 100644
+--- a/libkern/libkern/c++/OSMetaClass.h
++++ b/libkern/libkern/c++/OSMetaClass.h
+@@ -162,7 +162,13 @@ class OSInterface
+ 
+ #ifdef XNU_KERNEL_PRIVATE
+ 
+-#if !XNU_TARGET_OS_OSX
++/*
++ * PANDORA builds with the macOS SDK (XNU_TARGET_OS_OSX) but runs original iOS kexts
++ * prelinked from the iPhone X kernelcache (tools/mkprelink.py). They call our IOKit and
++ * libkern objects by vtable slot, so our classes need iOS's vtable layout: no reserved
++ * padding slots. Container alignment is already the same (1) on both.
++ */
++#if !XNU_TARGET_OS_OSX || defined(PANDORA)
+ #define APPLE_KEXT_VTABLE_PADDING   0
+ #else /* !XNU_TARGET_OS_OSX */
+ #define APPLE_KEXT_VTABLE_PADDING   1

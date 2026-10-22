@@ -319,11 +319,41 @@ def verify(native, kc, image, slide):
             seen[n] = ident
     check(len(ctor) == 1 and not clashes, f'{len(seen)} original classes, none clash with our {len(ours)} classes: {clashes}')
 
-    # 6. Personalities: only the kept ones can start a driver.
+    # 6. C++ ABI: the kexts call methods of our kernel's IOKit/libkern objects by vtable slot,
+    #    so every kernel class vtable must list the same methods in the same slots as the
+    #    original kernel's (an XNU_TARGET_OS_OSX build adds 16 reserved slots per class).
+    oby = {n: a for a, ns in kc_exports.items() for n in ns}
+    nby = {n: a for a, ns in native_exports.items() for n in ns}
+    k_text = [s for s in km['segments'] if s['name'] == '__TEXT_EXEC']
+
+    def kc_code(v):
+        return any(s['va'] <= v < s['va'] + s['size'] for s in k_text)
+
+    def rd(img, meta, va):
+        return struct.unpack_from('<Q', img, npl.backed_offset(meta['segments'], va, 8, len(img)))[0]
+
+    compared, bad_classes = 0, []
+    for name, ova in sorted(oby.items()):
+        if not name.startswith('__ZTV') or name not in nby:
+            continue
+        compared += 1
+        for slot in range(512):
+            ot = rd(kc, km, ova + 16 + slot * 8)
+            if not kc_code(ot):
+                break
+            onames = set(kc_exports.get(ot, []))
+            nnames = set(native_exports.get(rd(image, om, nby[name] + 16 + slot * 8), []))
+            if onames and not onames & nnames:
+                bad_classes.append((name, slot, sorted(onames)[0], sorted(nnames)[:1]))
+                break
+    check(not bad_classes, f'{compared} kernel class vtables slot-compatible with the original '
+          f'({len(bad_classes)} differ, first: {bad_classes[:3]})')
+
+    # 7. Personalities: only the kept ones can start a driver.
     with_pers = sorted(i for i, e in new_entries.items() if e.get('IOKitPersonalities'))
     check(set(with_pers) <= KEEP_PERSONALITIES, f'IOKit personalities only in {with_pers}')
 
-    # 7. Layout: the kexts sit below our kernel and above nothing of ours.
+    # 8. Layout: the kexts sit below our kernel and above nothing of ours.
     low = min(s['va'] for s in om['segments'] if s['size'])
     lines.append(f'      lowest VA {low:#x}; our __TEXT {nm["segments"][0]["va"]:#x}; '
                  f'image {len(image)} bytes')
