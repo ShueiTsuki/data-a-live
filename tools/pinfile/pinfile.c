@@ -351,9 +351,12 @@ static int checked_layout(const char *path, const char *dev, int devfd)
 	uint64_t next = 0;
 	for (int i = 0; i < nL; i++) {
 		/* DATA_ENCRYPTED only says the filesystem encrypts the contents (FBE); the
-		 * block positions are what matter here. */
-		uint32_t bad = L[i].flags & ~(uint32_t)(FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_LAST |
-		    FIEMAP_EXTENT_DATA_ENCRYPTED);
+		 * block positions are what matter here. fiemap_fill_next_extent() adds ENCODED
+		 * to every DATA_ENCRYPTED extent, so ENCODED is accepted only together with it. */
+		uint32_t ok = FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_DATA_ENCRYPTED;
+		if (L[i].flags & FIEMAP_EXTENT_DATA_ENCRYPTED)
+			ok |= FIEMAP_EXTENT_ENCODED;
+		uint32_t bad = L[i].flags & ~ok;
 		if (bad)
 			return fail("extent with an unexpected flag (unwritten/encoded/inline/...)");
 		if (L[i].logical != next || L[i].logical % BLK || L[i].physical % BLK ||
