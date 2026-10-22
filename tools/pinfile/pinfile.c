@@ -8,21 +8,30 @@
  *   pinfile extents PATH [--json]  block positions (FIEMAP), partition-relative bytes
  *   pinfile compare PATH [DEV]     read-only: file bytes through the filesystem vs raw
  *                                  bytes of DEV (default userdata) at the same positions
- *   pinfile rawtest PATH DEV --yes write a test pattern into the file's own blocks on DEV,
- *                                  bypassing the filesystem, then read it back from disk
- *   pinfile rawcheck PATH [DEV]    read-only: is the test pattern still there
+ *   pinfile rawtest PATH DEV N --yes
+ *                                  write a test pattern into the first N 4 KiB blocks of the
+ *                                  file (N = all for every block) on DEV, bypassing the
+ *                                  filesystem, then read them back from disk
+ *   pinfile rawcheck PATH [DEV]    read-only: which blocks carry the test pattern on disk
+ *   pinfile fsread  PATH           read-only: drop the file's cached pages and read it through
+ *                                  the filesystem; blocks written raw no longer read as zeros
+ *                                  (the filesystem decrypts our plaintext into noise), which
+ *                                  proves the raw positions are this file's own blocks
  *
  * rawtest is the only command that writes to a raw block device. Before writing it
  * checks (checked_layout): the file is pinned; it is a regular file whose size is a
  * whole number of 4 KiB blocks; its extents start at 0, are contiguous, cover exactly
  * the file and carry no flag other than MERGED/LAST; DEV is the only device under the
  * filesystem's device-mapper device and has the same size (a 1:1 mapping, offset 0);
- * every extent lies inside DEV. Every single write is checked again against the
- * extent list (inside_one_extent) right before it is issued.
+ * every extent lies inside DEV; no extent overlaps a region of DEV that another
+ * device-mapper device maps directly (Xiaomi's `cust` is a linear map inside userdata).
+ * Every single write is checked again against the extent list (inside_one_extent)
+ * right before it is issued.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dm-ioctl.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <stdint.h>
@@ -237,6 +246,90 @@ static int sysfs_u64(const char *path, uint64_t *out)
 	return ok ? 0 : -1;
 }
 
+/*
+ * Every device-mapper device other than the filesystem's own that sits on DEV (sysfs
+ * holders) must map DEV only through `linear` targets, and none of those regions may
+ * overlap the layout L. DM_TABLE_STATUS with DM_STATUS_TABLE_FLAG returns the table;
+ * for status, dm_target_spec.next counts from the first spec.
+ */
+static int check_other_holders(const char *devname, dev_t devrdev, dev_t fsdev)
+{
+	char hp[PATH_MAX];
+	snprintf(hp, sizeof hp, "/sys/class/block/%s/holders", devname);
+	DIR *d = opendir(hp);
+	if (!d)
+		return fail("cannot list DEV's holders");
+	int ctl = open("/dev/device-mapper", O_RDWR | O_CLOEXEC);
+	if (ctl < 0) {
+		closedir(d);
+		return die("open /dev/device-mapper");
+	}
+	int others = 0, rc = 0;
+	for (struct dirent *h; !rc && (h = readdir(d));) {
+		if (h->d_name[0] == '.')
+			continue;
+		char dp[PATH_MAX];
+		unsigned hmaj, hmin;
+		snprintf(dp, sizeof dp, "/sys/class/block/%s/dev", h->d_name);
+		FILE *f = fopen(dp, "r");
+		if (!f || fscanf(f, "%u:%u", &hmaj, &hmin) != 2) {
+			if (f)
+				fclose(f);
+			rc = fail("cannot read a holder's device number");
+			break;
+		}
+		fclose(f);
+		if (makedev(hmaj, hmin) == fsdev)
+			continue;
+		others++;
+		static char buf[65536] __attribute__((aligned(8)));
+		struct dm_ioctl *io = (struct dm_ioctl *)buf;
+		memset(buf, 0, sizeof buf);
+		io->version[0] = DM_VERSION_MAJOR;
+		io->data_size = sizeof buf;
+		io->data_start = sizeof(struct dm_ioctl);
+		io->dev = makedev(hmaj, hmin);
+		io->flags = DM_STATUS_TABLE_FLAG;
+		if (ioctl(ctl, DM_TABLE_STATUS, io) < 0) {
+			rc = die("DM_TABLE_STATUS");
+			break;
+		}
+		if (io->flags & DM_BUFFER_FULL_FLAG) {
+			rc = fail("a holder's table does not fit the buffer");
+			break;
+		}
+		const char *first = buf + io->data_start;
+		uint32_t at = 0;
+		for (uint32_t t = 0; !rc && t < io->target_count; t++) {
+			const struct dm_target_spec *sp = (const struct dm_target_spec *)(first + at);
+			const char *params = (const char *)(sp + 1);
+			unsigned pmaj, pmin;
+			unsigned long long off;
+			if (strncmp(sp->target_type, "linear", DM_MAX_TYPE_NAME) != 0 ||
+			    sscanf(params, "%u:%u %llu", &pmaj, &pmin, &off) != 3) {
+				fprintf(stderr, "pinfile: holder %s target %u: %.16s %s\n", h->d_name, t,
+				    sp->target_type, params);
+				rc = fail("a holder of DEV maps it with something other than linear");
+				break;
+			}
+			if (makedev(pmaj, pmin) == devrdev) {
+				uint64_t start = (uint64_t)off * 512, len = sp->length * 512;
+				printf("holder %s maps %s bytes [%#llx, %#llx)\n", h->d_name, devname,
+				    (unsigned long long)start, (unsigned long long)(start + len));
+				for (int i = 0; i < nL; i++)
+					if (L[i].physical < start + len && start < L[i].physical + L[i].length)
+						rc = fail("the file overlaps a region another device maps directly");
+			}
+			at = sp->next;
+		}
+	}
+	closedir(d);
+	close(ctl);
+	if (!rc)
+		printf("other holders of %s: %d, no overlap\n", devname, others);
+	return rc;
+}
+
 /* All checks that must hold before anything is written; fills L/nL. */
 static int checked_layout(const char *path, const char *dev, int devfd)
 {
@@ -257,7 +350,10 @@ static int checked_layout(const char *path, const char *dev, int devfd)
 		return fail("no extent list (or too many extents)");
 	uint64_t next = 0;
 	for (int i = 0; i < nL; i++) {
-		uint32_t bad = L[i].flags & ~(uint32_t)(FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_LAST);
+		/* DATA_ENCRYPTED only says the filesystem encrypts the contents (FBE); the
+		 * block positions are what matter here. */
+		uint32_t bad = L[i].flags & ~(uint32_t)(FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_LAST |
+		    FIEMAP_EXTENT_DATA_ENCRYPTED);
 		if (bad)
 			return fail("extent with an unexpected flag (unwritten/encoded/inline/...)");
 		if (L[i].logical != next || L[i].logical % BLK || L[i].physical % BLK ||
@@ -311,6 +407,8 @@ static int checked_layout(const char *path, const char *dev, int devfd)
 	for (int i = 0; i < nL; i++)
 		if (L[i].physical + L[i].length > bytes)
 			return fail("an extent lies beyond the end of DEV");
+	if (check_other_holders(want, dst.st_rdev, st.st_dev))
+		return 1;
 	printf("checked: pinned, %lld bytes, %d extents, all inside %s (%s)\n",
 	    (long long)st.st_size, nL, dev, real);
 	return 0;
@@ -361,8 +459,15 @@ static int verify(int rfd, uint64_t *good, uint64_t *badc)
 	return 0;
 }
 
-static int cmd_rawtest(const char *path, const char *dev)
+static int cmd_rawtest(const char *path, const char *dev, const char *count)
 {
+	uint64_t limit = UINT64_MAX;
+	if (strcmp(count, "all") != 0) {
+		char *end;
+		limit = strtoull(count, &end, 10);
+		if (*end || limit == 0)
+			return fail("N must be a positive number of blocks or 'all'");
+	}
 	int wfd = open(dev, O_RDWR | O_DIRECT | O_SYNC | O_CLOEXEC);
 	if (wfd < 0)
 		return die("open DEV for writing");
@@ -372,8 +477,8 @@ static int cmd_rawtest(const char *path, const char *dev)
 	if (posix_memalign((void **)&b, BLK, BLK))
 		return die("posix_memalign");
 	uint64_t written = 0;
-	for (int i = 0; i < nL; i++)
-		for (uint64_t off = 0; off < L[i].length; off += BLK) {
+	for (int i = 0; i < nL && written < limit; i++)
+		for (uint64_t off = 0; off < L[i].length && written < limit; off += BLK) {
 			uint64_t phys = L[i].physical + off;
 			if (!inside_one_extent(phys, BLK))
 				return fail("internal: write outside the extents");
@@ -391,9 +496,9 @@ static int cmd_rawtest(const char *path, const char *dev)
 	if (rfd < 0 || verify(rfd, &good, &badc) < 0)
 		return die("read back");
 	close(rfd);
-	printf("wrote %llu blocks; read back from disk: %llu match, %llu differ\n",
+	printf("wrote %llu blocks; read back from disk: %llu carry the pattern, %llu do not\n",
 	    (unsigned long long)written, (unsigned long long)good, (unsigned long long)badc);
-	return badc ? 1 : 0;
+	return good == written ? 0 : 1;
 }
 
 static int cmd_rawcheck(const char *path, const char *dev)
@@ -412,10 +517,46 @@ static int cmd_rawcheck(const char *path, const char *dev)
 	return badc ? 1 : 0;
 }
 
+/* Read-only through the filesystem: which 4 KiB blocks are no longer all zero. */
+static int cmd_fsread(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return die("open");
+	if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		return die("posix_fadvise");
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		return die("fstat");
+	char b[BLK];
+	uint64_t nonzero = 0, first = UINT64_MAX, last = 0;
+	for (uint64_t off = 0; off + BLK <= (uint64_t)st.st_size; off += BLK) {
+		if (pread(fd, b, BLK, (off_t)off) != BLK)
+			return die("pread");
+		for (unsigned k = 0; k < BLK; k++)
+			if (b[k]) {
+				nonzero++;
+				if (first == UINT64_MAX)
+					first = off / BLK;
+				last = off / BLK;
+				break;
+			}
+	}
+	close(fd);
+	printf("through the filesystem: %llu of %llu blocks are not zero",
+	    (unsigned long long)nonzero, (unsigned long long)(st.st_size / BLK));
+	if (nonzero)
+		printf(" (blocks %llu..%llu)", (unsigned long long)first, (unsigned long long)last);
+	printf("\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	if (argc == 5 && !strcmp(argv[1], "rawtest") && !strcmp(argv[4], "--yes"))
-		return cmd_rawtest(argv[2], argv[3]);
+	if (argc == 6 && !strcmp(argv[1], "rawtest") && !strcmp(argv[5], "--yes"))
+		return cmd_rawtest(argv[2], argv[3], argv[4]);
+	if (argc == 3 && !strcmp(argv[1], "fsread"))
+		return cmd_fsread(argv[2]);
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "rawcheck"))
 		return cmd_rawcheck(argv[2], argc == 4 ? argv[3] : DEFAULT_DEV);
 	if (argc >= 4 && !strcmp(argv[1], "create"))
@@ -428,6 +569,6 @@ int main(int argc, char **argv)
 		return cmd_compare(argv[2], argc == 4 ? argv[3] : DEFAULT_DEV);
 	fprintf(stderr,
 	    "usage: pinfile create PATH SIZE_MB | status PATH | extents PATH [--json] | compare PATH [DEV]\n"
-	    "       pinfile rawtest PATH DEV --yes | rawcheck PATH [DEV]\n");
+	    "       pinfile rawtest PATH DEV N|all --yes | rawcheck PATH [DEV] | fsread PATH\n");
 	return 2;
 }
