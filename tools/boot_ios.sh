@@ -3,7 +3,8 @@
 # Runs in Git Bash on Windows (adb/fastboot are Windows binaries); payload work in WSL.
 #
 #   tools/boot_ios.sh --file /data/local/tmp/iostest.img --run 19 [--cmdline "..."]
-#                     [--cpus 8] [--check pattern|hfsx|none] [--dry-run]
+#                     [--cpus 8] [--rd md0|ufsroot0] [--check pattern|hfsx|none] [--dry-run]
+#    (--rd ufsroot0: root on the pinned file itself, no RAM disk)
 #
 # 1. Phone in Android (adb): the file must be pinned with no GC move failures; its extent
 #    list is saved to device/extents/<name>-<time>.json and must equal the last saved one
@@ -18,19 +19,20 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PT=/d/Android/platform-tools
 ADB="$PT/adb.exe" FB="$PT/fastboot.exe"
-FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0
+FILE="" RUN="" CMDLINE="" CPUS=8 CHECK=none DRY=0 RD=md0
 while [ $# -gt 0 ]; do
 	case $1 in
 	--file) FILE=$2; shift 2 ;;
+	--rd) RD=$2; shift 2 ;;
 	--run) RUN=$2; shift 2 ;;
 	--cmdline) CMDLINE=$2; shift 2 ;;
 	--cpus) CPUS=$2; shift 2 ;;
 	--check) CHECK=$2; shift 2 ;;
 	--dry-run) DRY=1; shift ;;
-	*) sed -n '2,15p' "$0"; exit 2 ;;
+	*) sed -n '2,16p' "$0"; exit 2 ;;
 	esac
 done
-[ -n "$FILE" ] && [ -n "$RUN" ] || { sed -n '2,15p' "$0"; exit 2; }
+[ -n "$FILE" ] && [ -n "$RUN" ] || { sed -n '2,16p' "$0"; exit 2; }
 P=/data/local/tmp/pinfile
 su() { "$ADB" shell su -c "'$*'" | tr -d '\r'; }
 
@@ -59,7 +61,7 @@ esac
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
 wslnow=/mnt/$(echo "${now:1:1}" | tr A-Z a-z)${now:2}
-wsl -d Ubuntu-24.04 -u root -- bash -c "ADTFLAGS='--root-extents $wslnow' CPUS=$CPUS NAME=out \
+wsl -d Ubuntu-24.04 -u root -- bash -c "ADTFLAGS='--root-extents $wslnow' CPUS=$CPUS RD=$RD NAME=out \
 	bash <(tr -d '\r' < /mnt/d/DeepSeekHarness/claude/ios_pandora/wsl/make_phone_payload.sh) /opt/work/run$RUN '$CMDLINE'" 2>&1 |
 	grep -v NodeJS | tail -2
 bash "$ROOT/shim/loader/build.sh" | tail -1
