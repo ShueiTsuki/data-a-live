@@ -102,7 +102,7 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 ### Linux 的 a840 数据和这台手机原厂驱动的对照 [实测，详见调研笔记 `kgsl_vs_linux_a840.md`]
 从手机只读复制了安卓的 `msm_kgsl.ko`（带符号），解析出 `adreno_gpu_core_gen8_2_1` 和它指向的各张表，逐条和 Linux 的 a840 条目比对：
 - **一致**：固件名（sqe、aqe、gmu；zap 在 KGSL 里叫 `gen80200_zap.mbn`）、GMEM 18 MiB、highest bank bit 16、GMU chip id `0x08020100`、54 段保护寄存器、48 项上电恢复列表和 31 项按管线的扩展表、UCHE 和 GMEM 基地址等。`gen8_2_1` 和 `gen8_2_0` 两个结构只差版本号，表格共用。
-- **不一致，写驱动时以原厂为准**：非上下文寄存器里有几项不同，`RB_RBP_CNTL` 原厂 `0x60`、Linux `0x20`，`SP_CHICKEN_BITS` 和 `SP_CHICKEN_BITS_2` 也不同，两边还各有几项对方没有；GBIF 原厂多一项 `GMUCX_MRC_GBIF_QOS_CTRL=0x33`；时钟门控 `GMUAO_CGC_MODE_CNTL` 原厂 `0x02220000`；UBWC 的 `RB_CMP_NC_MODE_CNTL` 原厂 `0x28040`、Linux `0x28046`。
+- **不一致，写驱动时以原厂为准**：非上下文寄存器里有几项不同，`RB_RBP_CNTL` 原厂 `0x60`、Linux `0x20`，`SP_CHICKEN_BITS` 和 `SP_CHICKEN_BITS_2` 也不同，两边还各有几项对方没有；GBIF 原厂多一项 `GMUCX_MRC_GBIF_QOS_CTRL=0x33`；时钟门控 `GMUAO_CGC_MODE_CNTL` 原厂 `0x02220000`；UBWC 的 `RB_CMP_NC_MODE_CNTL` 原厂 `0x28040`、Linux `0x28046`。安卓设备树里 `qcom,min-access-length` 是 32（不是 64）[实测]，所以 UBWC 模式寄存器里和它有关的那一位保持默认。
 - **通信方式**：原厂驱动用"硬件调度"模式，命令由 GMU 接收；Linux 用老式 HFI，命令走 CP 命令环。固件里的版本字段 [实测]：手机这份 `gen80200_gmu.bin` 的 HFI 版本是 `0x20070001`（固件块类型 6，定义见 KGSL `kgsl_gmu_core.h`，`GMU_BLK_TYPE_HFI_VER`），和 linux-firmware 里的 `gen80200_gmu.bin` **完全相同**；GMU 核心版本手机是 `0x50030027`，linux-firmware 是 `0x50030017`，手机的稍新。Linux 主线正是用 linux-firmware 这份、按老式 HFI 跑 840 的，所以协议版本这一层兼容。后备方案：linux-firmware 的 `gen80200_*` 可公开再分发，AQE 和手机上的完全相同（SHA-256 一致），GMU、SQE 版本稍旧。
 
 ## 3. iOS 16 这一侧怎么接入 [读到，苹果二进制]
