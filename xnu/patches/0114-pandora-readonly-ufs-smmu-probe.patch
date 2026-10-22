@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f3efd20..2210d04 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -718,9 +718,99 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++#if defined(PANDORA)
++/*
++ * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
++ * for UFS, before any driver work: the apps SMMU (stream 0x60 = ufshc@1d84000) and
++ * the UFS host's standard registers. Loads only: no UFS command, no SMMU/GCC write.
++ * The UFS host is read last because its clocks may be off. The boot then stops so
++ * the screen can be photographed.
++ */
++#define PU_SMMU_PA      0x15000000u
++#define PU_SMMU_SIZE    0x100000u               /* apps-smmu reg in the live DT */
++#define PU_UFS_PA       0x01d84000u
++#define PU_UFS_SIZE     0x3000u                 /* ufs_mem */
++#define PU_UFS_SID      0x60u
++
++static inline uint32_t
++pu_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++pandora_ufs_probe(void)
++{
++	vm_offset_t smmu = ml_io_map(PU_SMMU_PA, PU_SMMU_SIZE);
++	uint32_t scr0 = pu_rd(smmu, 0x00), idr0 = pu_rd(smmu, 0x20), idr1 = pu_rd(smmu, 0x24);
++	uint32_t idr2 = pu_rd(smmu, 0x28), idr7 = pu_rd(smmu, 0x3c), gfsr = pu_rd(smmu, 0x48);
++	printf("PANDORA SMMU: sCR0=%08x IDR0=%08x IDR1=%08x\n", scr0, idr0, idr1);
++	printf("PANDORA SMMU: IDR2=%08x IDR7=%08x sGFSR=%08x\n", idr2, idr7, gfsr);
++
++	unsigned nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	uint32_t pgsize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t cb_base = (1u << (((idr1 >> 28) & 7) + 1)) * pgsize;
++	unsigned valid = 0, shown = 0, ufs = 0;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t smr = pu_rd(smmu, 0x800 + 4 * i);
++		if (!(smr & 0x80000000u)) {
++			continue;
++		}
++		valid++;
++		uint32_t s2cr = pu_rd(smmu, 0xc00 + 4 * i);
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		bool is_ufs = ((id ^ PU_UFS_SID) & ~mask) == 0;
++		if (!is_ufs && shown >= 6) {
++			continue;
++		}
++		shown++;
++		printf("PANDORA SMMU: SMR%u id=%04x mask=%04x S2CR=%08x%s\n",
++		    i, id, mask, s2cr, is_ufs ? " <- UFS" : "");
++		if (!is_ufs) {
++			continue;
++		}
++		ufs++;
++		unsigned type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		if (type == 0 && cb < ncb && cb_base + (cb + 1) * pgsize <= PU_SMMU_SIZE) {
++			vm_offset_t c = smmu + cb_base + cb * pgsize;
++			printf("PANDORA SMMU: CB%u CBAR=%08x CBA2R=%08x SCTLR=%08x TCR=%08x\n", cb,
++			    pu_rd(smmu, pgsize + 4 * cb), pu_rd(smmu, pgsize + 0x800 + 4 * cb),
++			    pu_rd(c, 0x00), pu_rd(c, 0x30));
++			printf("PANDORA SMMU: CB%u TTBR0=%08x%08x FSR=%08x\n", cb,
++			    pu_rd(c, 0x24), pu_rd(c, 0x20), pu_rd(c, 0x58));
++		}
++	}
++	printf("PANDORA SMMU: %u stream groups, %u valid, %u match UFS 0x60; %u context banks\n",
++	    nsmr, valid, ufs, ncb);
++
++	printf("PANDORA UFS: reading host registers (a hang here = UFS clocks off)\n");
++	vm_offset_t hc = ml_io_map(PU_UFS_PA, PU_UFS_SIZE);
++	printf("PANDORA UFS: CAP=%08x MCQCAP=%08x VER=%08x HCS=%08x HCE=%08x\n",
++	    pu_rd(hc, 0x00), pu_rd(hc, 0x04), pu_rd(hc, 0x08), pu_rd(hc, 0x30), pu_rd(hc, 0x34));
++	printf("PANDORA UFS: IS=%08x IE=%08x UTRLBA=%08x%08x DBR=%08x RSR=%08x\n",
++	    pu_rd(hc, 0x20), pu_rd(hc, 0x24), pu_rd(hc, 0x54), pu_rd(hc, 0x50),
++	    pu_rd(hc, 0x58), pu_rd(hc, 0x60));
++	printf("PANDORA UFS: MEM_CFG=%08x MCQ_CFG=%08x\n", pu_rd(hc, 0x300), pu_rd(hc, 0x380));
++	printf("PANDORA UFS: probe done, nothing written. Hold power to reboot.\n");
++	for (;;) {
++		delay(1000000);
++	}
++}
++
++/* Not ported to SM8850 yet: the SM8550 init writes SM8550 GCC offsets. Non-const so the
++ * code below stays reachable for the compiler. */
++static bool pandora_ufs_ported = false;
++#endif /* PANDORA */
++
+ static int
+ sweet_ufs_init(void)
+ {
++#if defined(PANDORA)
++	if (!pandora_ufs_ported) {
++		printf("PANDORA UFS: driver not ported to SM8850 yet\n");
++		return ENXIO;
++	}
++#endif
+ #if defined(FUXI)
+     uint32_t requested=0;
+     if (!PE_parse_boot_argn("fuxi_ufs_probe", &requested, sizeof(requested)) || requested!=1)
+@@ -876,6 +966,10 @@ sweet_ufs_init(void)
+ void fuxi_storage_probe(void);
+ void fuxi_storage_probe(void)
+ {
++#if defined(PANDORA)
++ uint32_t probe=0;
++ if (PE_parse_boot_argn("pandora_ufs_probe",&probe,sizeof(probe)) && probe==1) pandora_ufs_probe();
++#endif
+  uint32_t requested=0;
+  if (!PE_parse_boot_argn("fuxi_ufs_probe",&requested,sizeof(requested)) || requested!=1) return;
+  int error=sweet_ufs_init();
