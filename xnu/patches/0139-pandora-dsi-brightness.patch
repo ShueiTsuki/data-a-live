@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 11f9b01..de4fa33 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -326,6 +326,101 @@ sweet_bl_number(OSObject *o, uint64_t *out)
+ 	return true;
+ }
+ 
++/*
++ * Panel brightness over DSI (0139). The main panel (DT "xiaomi q200 42 02 0a cmd mode dsc
++ * dsi panel") is on DSI0 (0x09ac0000) and takes DCS 0x51 with two bytes, high byte first
++ * (qcom,mdss-dsi-bl-inverted-dbv), 7..0x3fff, 0x1554 = top of the normal range (above it
++ * is Xiaomi's high-brightness mode), HS mode. The command goes through the test-pattern
++ * FIFO, as dsi_ctrl_hw_cmn_kickoff_fifo_command / reset_cmd_fifo in the SM8850 msm_drm:
++ * TPG_CTRL 0x15c = 0x30006, words to 0x17c, COMMAND_MODE_DMA_CTRL 0x3c |= embedded mode,
++ * DMA_CMD_LENGTH 0x4c, SW_TRIGGER 0x90, done = INT_CTRL 0x110 bit 0. No memory DMA, so no
++ * display SMMU mapping. Boot-arg pandora_dsi_bl=0 keeps the pixel scaling instead.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#define SWEET_DSI0_PA           0x09ac0000u
++#define SWEET_PANEL_BL_MIN      7u
++#define SWEET_PANEL_BL_MAX      0x1554u
++static vm_offset_t sweet_dsi;
++static int sweet_dsi_bl = -1;           /* -1 unknown, 0 off/failed, 1 working */
++static unsigned sweet_dsi_logs;
++
++static inline uint32_t
++sweet_dsi_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(sweet_dsi + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++sweet_dsi_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sweet_dsi + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++sweet_dsi_brightness(uint32_t level)
++{
++	if (sweet_dsi_bl < 0) {
++		int on = 1;
++		PE_parse_boot_argn("pandora_dsi_bl", &on, sizeof(on));
++		sweet_dsi_bl = on ? 1 : 0;
++		if (on) {
++			sweet_dsi = ml_io_map(SWEET_DSI0_PA, 0x1000);
++			if (!sweet_dsi) {
++				sweet_dsi_bl = 0;
++			} else {
++				uint32_t ctrl = sweet_dsi_rd(0x4);
++				IOLog("SWEET DSI: DSI0 ctrl %#x dma_ctrl %#x int %#x\n", ctrl,
++				    sweet_dsi_rd(0x3c), sweet_dsi_rd(0x110));
++				/* DSI_EN (bit 0) and CMD_MODE_EN (bit 2) as ABL left them. */
++				if ((ctrl & 5u) != 5u) {
++					IOLog("SWEET DSI: DSI0 not enabled in command mode; brightness by pixels\n");
++					sweet_dsi_bl = 0;
++				}
++			}
++		}
++	}
++	if (sweet_dsi_bl != 1) {
++		return false;
++	}
++	level = level < SWEET_PANEL_BL_MIN ? SWEET_PANEL_BL_MIN :
++	    (level > SWEET_PANEL_BL_MAX ? SWEET_PANEL_BL_MAX : level);
++	/* clear CMD_MODE_DMA_DONE (write 1), keep the enables */
++	sweet_dsi_wr(0x110, (sweet_dsi_rd(0x110) & 0xeeffffffu) | 1u);
++	sweet_dsi_wr(0x15c, 0x30006u);
++	/* header: word count 3, 0, DCS long write 0x39, last + long; payload 51 hi lo, pad ff */
++	sweet_dsi_wr(0x17c, 0xc0390003u);
++	sweet_dsi_wr(0x17c, 0xff000000u | ((level & 0xffu) << 16) | (((level >> 8) & 0xffu) << 8) | 0x51u);
++	sweet_dsi_wr(0x3c, (sweet_dsi_rd(0x3c) & 0x2bffffffu) | 0x10000000u);
++	sweet_dsi_wr(0x390, sweet_dsi_rd(0x390) & ~2u);
++	sweet_dsi_wr(0x4c, 8);
++	sweet_dsi_wr(0x90, 1);
++	bool done = false;
++	for (int i = 0; i < 50000 && !done; i++) {
++		done = (sweet_dsi_rd(0x110) & 1u) != 0;
++		if (!done) {
++			IODelay(1);
++		}
++	}
++	sweet_dsi_wr(0x15c, 0);
++	sweet_dsi_wr(0x1ec, 1);
++	IODelay(1);
++	sweet_dsi_wr(0x1ec, 0);
++	if (done) {
++		sweet_dsi_wr(0x110, (sweet_dsi_rd(0x110) & 0xeeffffffu) | 1u);
++	}
++	if (sweet_dsi_logs++ < 20 || !done) {
++		IOLog("SWEET DSI: brightness %u (%#x) %s\n", level, level, done ? "sent" : "TIMEOUT");
++	}
++	if (!done) {
++		sweet_dsi_bl = 0;       /* fall back to pixel scaling for the rest of the boot */
++	}
++	return done;
++}
++
+ static void
+ sweet_bl_apply(const OSSymbol *key, OSObject *o, int depth)
+ {
+@@ -350,6 +445,13 @@ sweet_bl_apply(const OSSymbol *key, OSObject *o, int depth)
+ 	}
+ 	if (frac != ~0ULL) {
+ 		frac = frac > 65536 ? 65536 : frac;
++		/* Panel level: square law over the normal range (50 % -> about a quarter). */
++		uint32_t level = SWEET_PANEL_BL_MIN + (uint32_t)((uint64_t)(SWEET_PANEL_BL_MAX -
++		    SWEET_PANEL_BL_MIN) * frac * frac / (65536ULL * 65536ULL));
++		if (sweet_dsi_brightness(level)) {
++			sweet_fb_dim = 256;
++			return;
++		}
+ 		uint32_t r = 0;                 /* isqrt(frac << 16): 0..65536 */
+ 		for (uint64_t bit = 1ULL << 32, x = frac << 16; bit; bit >>= 2) {
+ 			if (x >= r + bit) {
