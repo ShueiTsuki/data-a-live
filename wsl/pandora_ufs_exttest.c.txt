@@ -1,0 +1,75 @@
+#if defined(PANDORA)
+/*
+ * tools/pinfile pattern(): the 4 KiB test block at file offset `logical` whose raw position
+ * is `physical` bytes into userdata. Must stay byte-identical to pinfile.c.
+ */
+static void
+pandora_pattern(uint8_t *b, uint64_t logical, uint64_t physical)
+{
+	memset(b, 0, UFS_BLOCK);
+	int n = snprintf((char *)b, 64, "IOSPANDORA RAWTEST v1 L=%016llx P=%016llx\n",
+	    (unsigned long long)logical, (unsigned long long)physical);
+	uint64_t x = logical * 6364136223846793005ull + 1442695040888963407ull;
+	for (unsigned k = (unsigned)n; k < UFS_BLOCK; k++) {
+		x = x * 6364136223846793005ull + 1442695040888963407ull;
+		b[k] = (uint8_t)(x >> 56);
+	}
+}
+
+/*
+ * pandora_ufs_probe=4: the pinned test file in userdata (ADT fuxi-root-extents from
+ * pinfile's extent JSON) through the real driver: init with ufsroot=userdata (read-only),
+ * read every file block through the extent map (fx_map) and compare it with the pattern
+ * pinfile wrote raw from Android. Stops for the photo.
+ */
+static void
+pandora_ufs_extent_test(void)
+{
+	static uint8_t want[UFS_BLOCK];
+	uint64_t good = 0, bad = 0, firstbad = UINT64_MAX;
+	int error = sweet_ufs_init();
+	printf("PANDORA UFS: driver init (userdata extent file): %d, %u extents, %llu blocks\n",
+	    error, fx_next, su.nblocks);
+	if (!error && !fx_root) {
+		error = ENXIO;
+	}
+	if (!error) {
+		const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+		lck_mtx_lock(&sweet_ufs_lock);
+		for (uint64_t blk = 0; blk < su.nblocks && !error;) {
+			uint64_t lba, run;
+			if (!fx_map(blk, &lba, &run)) {
+				error = EINVAL;
+				break;
+			}
+			uint64_t left = su.nblocks - blk;
+			uint32_t n = (uint32_t)MIN(MIN(run, left), (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+			error = ufs_read_blocks(lba, n);
+			if (!error && blk == 0) {
+				printf("PANDORA UFS: block 0 says: %.59s\n", (const char *)b);
+			}
+			for (uint32_t i = 0; !error && i < n; i++) {
+				pandora_pattern(want, (blk + i) * UFS_BLOCK, (lba + i - fx_part_first) * UFS_BLOCK);
+				if (memcmp(b + (size_t)i * UFS_BLOCK, want, UFS_BLOCK) == 0) {
+					good++;
+				} else if (bad++ == 0) {
+					firstbad = blk + i;
+				}
+			}
+			blk += n;
+		}
+		lck_mtx_unlock(&sweet_ufs_lock);
+		printf("PANDORA UFS: blocks matching pinfile's pattern: %llu, not matching: %llu (first bad %lld)\n",
+		    good, bad, firstbad == UINT64_MAX ? -1LL : (long long)firstbad);
+		if (!error && bad) {
+			error = EIO;
+		}
+	}
+	printf("PANDORA UFS: extent test %s (%d), %s. Hold power to reboot.\n",
+	    error ? "FAILED" : "done", error, su.writable ? "WRITABLE" : "read-only");
+	for (;;) {
+		delay(1000000);
+	}
+}
+#endif
+

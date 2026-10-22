@@ -8,8 +8,11 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            framebuffer at 0x9c000000 so tools/qemu-sweet.py can decode the screen.
   --qemu-gic  phone RAM and framebuffer, but QEMU's GIC/timer: lets tools/qemu_loader.py run
            the real phone image (shim/loader) past interrupt setup.
+  --root-extents JSON  a pinned file in userdata (tools/pinfile `extents --json`) as the
+           extent root: /chosen fuxi-root-extents + fuxi-root-blocks (patch 0088), the whole
+           file unless --root-bytes N says how much of it.
 """
-import hashlib, os, struct, sys
+import hashlib, json, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -85,7 +88,27 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, qemu_gic=False):
+def root_extent_props(path, root_bytes=None):
+    """/chosen props for a pinned-file root (as ios-fuxi mkadt-fuxi.py): u64 triples
+    {file block, partition block, blocks} in 4 KiB units, partition-relative. pinfile's
+    JSON gives bytes: [logical, physical, length, fiemap flags]."""
+    table = json.load(open(path))
+    root_bytes = table['size'] if root_bytes is None else root_bytes
+    if root_bytes <= 0 or root_bytes % 4096 or root_bytes > table['size']:
+        raise ValueError('root size must be 4 KiB aligned and inside the pinned file')
+    words, pos = [], 0
+    for logical, physical, length, _flags in table['extents']:
+        if logical != pos or physical % 4096 or length % 4096 or not length:
+            raise ValueError('extent table is not contiguous 4 KiB extents')
+        words += [logical // 4096, physical // 4096, length // 4096]
+        pos += length
+    if pos < root_bytes:
+        raise ValueError('extents do not cover the root')
+    return [('fuxi-root-extents', struct.pack(f'<{len(words)}Q', *words)),
+            ('fuxi-root-blocks', struct.pack('<Q', root_bytes // 4096))]
+
+
+def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
     """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     fb, fb_size, fb_w, fb_h, fb_stride = ((QEMU_FB, QEMU_FB_SIZE, QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE)
@@ -134,7 +157,7 @@ def build(seed=None, qemu=False, qemu_gic=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + list(root_props), [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -254,7 +277,15 @@ def build(seed=None, qemu=False, qemu_gic=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv)
+    def opt(name):
+        return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
+    props = ()
+    if opt('--root-extents'):
+        rb = opt('--root-bytes')
+        props = root_extent_props(opt('--root-extents'), int(rb, 0) if rb else None)
+        print(f'root extents: {len(props[0][1]) // 24}, {struct.unpack("<Q", props[1][1])[0]} blocks',
+              file=sys.stderr)
+    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
