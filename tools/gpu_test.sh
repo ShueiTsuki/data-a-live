@@ -20,7 +20,7 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
-WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0186-amfi.macho LEVEL=15 ARGS= METAL=1
+WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -29,6 +29,7 @@ while [ $# -gt 0 ]; do
 	--level) LEVEL=$2; shift 2 ;;
 	--args) ARGS=$2; shift 2 ;;
 	--no-metal) METAL=0; shift ;;
+	--clients) CLIENTS=$2; shift 2 ;;     # NativeAdrenoMetal.clients: processes the plugin gives a device
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -76,7 +77,7 @@ if [ $HAVE_METAL = 1 ]; then
 	# The bundle directory first (patch 0185), then its files; the plugin hands a device only to the
 	# processes named in NativeAdrenoMetal.clients (tools/metal/adapt_ios16.py).
 	E=/System/Library/Extensions
-	printf 'bluetoothd vktest mtltest\n' > "$T/NativeAdrenoMetal.clients"
+	printf '%s\n' "$CLIENTS" > "$T/NativeAdrenoMetal.clients"
 	printf -- '- 755 %s\nNativeAdrenoMetal 755 %s\nNativeAdrenoMetal.Info.plist 644 %s\nNativeAdrenoMetal.clients 644 %s\nmtltest 755 /usr/libexec/mtltest\n' \
 		"$E/NativeAdrenoMetal.bundle" "$E/NativeAdrenoMetal.bundle/NativeAdrenoMetal" \
 		"$E/NativeAdrenoMetal.bundle/Info.plist" "$E/NativeAdrenoMetal.clients" >> "$T/files.txt"
