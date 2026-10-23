@@ -100,6 +100,18 @@ SM8850（代号 Kaanapali）这颗芯片本身在主线里也有完整描述 [�
 - 早先用 lavapipe 的描述时，`inplace_copy` 会被翻译成"互锁 + 片元写图像"的方案（lavapipe 支持互锁），Turnip 编译它时崩溃。这说明**测试必须用目标驱动的真实能力描述**，用别的驱动的描述会得出错误结论。
 - 没验证到的：着色器在 840 上的执行结果是否正确（drm-shim 不执行任何命令）；函数常量全填 0 的那 6 个万能着色器，CoreAnimation 运行时实际会用别的常量组合。
 
+### 全系统计算内核普查 [实测，脚本 `tools/gpu_m2v_census/census_kernels.sh`]
+iOS 根盘上一共 138 个 metallib，入口函数里有 7620 个计算内核（另有 1762 个片元、1075 个顶点函数没做普查）。全部用 Turnip 在 840 上的真实能力描述交给 metal2vulkan 翻译，缺的函数常量按类型逐个填 0，通过的再交给 Turnip 编成 840 机器码：
+
+| | 数量 |
+| --- | --- |
+| 计算内核总数 | 7620 |
+| 翻译通过，并且 Turnip 编成 840 机器码 | **6142**（Turnip 编译 0 失败） |
+| 没测到：Espresso（Core ML 的神经网络库），每个内核常量太多，补跑太慢，中途停掉 | 1028 |
+| 测了没通过 | 450 |
+
+不算没测到的部分，通过率约 93%。没通过的里面，真正属于 metal2vulkan 功能缺口的都在和主屏画面无关的库里：MPSNeuralNetwork 的卷积内核 235 个（采样器的一种用法还没实现）、MTLReplayer.app（开发者用的 GPU 回放工具）56 个（内建函数签名不匹配）、NRFV3 相机降噪 13 个（imageblock 等）、CoreRE（AR）4 个、其他 2 个。其余失败都是测试输入问题：缺链接函数、可见函数表、stage input、存储纹理格式、tile 附件。QuartzCore 的 4 个就是 tile 函数。**和主屏、墙纸、小组件、图标相关的库里没有发现翻译缺口。**
+
 ### Linux 的 a840 数据和这台手机原厂驱动的对照 [实测，详见调研笔记 `kgsl_vs_linux_a840.md`]
 从手机只读复制了安卓的 `msm_kgsl.ko`（带符号），解析出 `adreno_gpu_core_gen8_2_1` 和它指向的各张表，逐条和 Linux 的 a840 条目比对：
 - **一致**：固件名（sqe、aqe、gmu；zap 在 KGSL 里叫 `gen80200_zap.mbn`）、GMEM 18 MiB、highest bank bit 16、GMU chip id `0x08020100`、54 段保护寄存器、48 项上电恢复列表和 31 项按管线的扩展表、UCHE 和 GMEM 基地址等。`gen8_2_1` 和 `gen8_2_0` 两个结构只差版本号，表格共用。

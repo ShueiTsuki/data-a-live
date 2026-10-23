@@ -10,7 +10,7 @@ W=/opt/work/m2vtest; T=/opt/work/m2v/target/release/metal2vulkan; MAIN=$W/qc_def
 P=${M2V_PROFILE:-/opt/work/m2v/crates/metal2vulkan-validation/profiles/lavapipe.json}
 L=$(cd "$(dirname "$0")" && pwd)/mtlb_list.py
 O=$1; rm -rf "$O"; mkdir -p "$O"
-export METAL2VULKAN_REPRO_DIR=$O/repro T MAIN P O L W
+export METAL2VULKAN_REPRO_DIR=/proc/no-repro T MAIN P O L W
 VD="--vertex-descriptor $W/vd8.json"
 CF1="--color-format 0:BGRA8Unorm"
 CF2="--color-format 0:BGRA8Unorm --color-format 1:BGRA8Unorm"

@@ -2,7 +2,7 @@
 # Third pass: path_blit with three attachments; fixed_* uber shaders with zero constants.
 M=/opt/work/m2vtest/qc_default.metallib; T=/opt/work/m2v/target/release/metal2vulkan
 P=/opt/work/m2v/crates/metal2vulkan-validation/profiles/lavapipe.json; O=/opt/work/m2vtest/out_retry2; rm -rf $O; mkdir -p $O
-export METAL2VULKAN_REPRO_DIR=$O/repro
+export METAL2VULKAN_REPRO_DIR=/proc/no-repro
 VD="--vertex-descriptor /opt/work/m2vtest/vd8.json"
 BLIT="--color-format 0:BGRA8Unorm --color-format 1:BGRA8Unorm --color-format 2:R32Float"
 for f in path_blit_frag_lpf path_blit_frag_eo_lpf path_blit_frag_lph path_blit_frag_eo_lph; do

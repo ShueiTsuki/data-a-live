@@ -5,7 +5,7 @@
 set -u
 T=/opt/work/m2v/target/release/metal2vulkan; P=$1; O=$2; shift 2
 L=$(cd "$(dirname "$0")" && pwd)/mtlb_list.py
-rm -rf "$O"; mkdir -p "$O"; export METAL2VULKAN_REPRO_DIR=$O/repro
+rm -rf "$O"; mkdir -p "$O"; export METAL2VULKAN_REPRO_DIR=/proc/no-repro
 for lib in "$@"; do
 	b=$(basename $lib .metallib)
 	python3 $L $lib 2>/dev/null | awk '$1=="kernel"{print $2}' | while read k; do

@@ -4,7 +4,7 @@ T=/opt/work/m2v/target/release/metal2vulkan; D=/opt/work/m2vtest/plib; MAIN=/opt
 P=/opt/work/m2v/crates/metal2vulkan-validation/profiles/$1.json; O=/opt/work/m2vtest/plib_out_$1; rm -rf $O; mkdir -p $O
 L=$(cd "$(dirname "$0")" && pwd)/mtlb_list.py
 VREC=$(for f in $D/*.metallib; do python3 $L $f | grep -q "vertex fixed_vert_lph_gen" && echo $f; done | head -1)
-export METAL2VULKAN_REPRO_DIR=$O/repro T D MAIN P O L VREC
+export METAL2VULKAN_REPRO_DIR=/proc/no-repro T D MAIN P O L VREC
 one() {
 	f=$1; read kind name < <(python3 $L $f)
 	VD="--vertex-descriptor /opt/work/m2vtest/vd8.json"

@@ -2,7 +2,7 @@
 # Translate every QuartzCore entry point with one device profile; one result line per function.
 M=/opt/work/m2vtest/qc_default.metallib; T=/opt/work/m2v/target/release/metal2vulkan
 P=/opt/work/m2v/crates/metal2vulkan-validation/profiles/$1.json; O=/opt/work/m2vtest/out_$1; rm -rf $O; mkdir -p $O
-export METAL2VULKAN_REPRO_DIR=$O/repro
+export METAL2VULKAN_REPRO_DIR=/proc/no-repro
 one() {
 	kind=$1 name=$2
 	case $kind in

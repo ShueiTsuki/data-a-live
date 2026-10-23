@@ -3,7 +3,7 @@
 # colour attachments, and compile tile kernels as tile pipelines.
 M=/opt/work/m2vtest/qc_default.metallib; T=/opt/work/m2v/target/release/metal2vulkan
 P=/opt/work/m2v/crates/metal2vulkan-validation/profiles/lavapipe.json; O=/opt/work/m2vtest/out_retry; rm -rf $O; mkdir -p $O
-export METAL2VULKAN_REPRO_DIR=$O/repro M T P O
+export METAL2VULKAN_REPRO_DIR=/proc/no-repro M T P O
 VD="--vertex-descriptor /opt/work/m2vtest/vd8.json"
 CF="--color-format 0:BGRA8Unorm --color-format 1:BGRA8Unorm --color-format 2:BGRA8Unorm --color-format 3:BGRA8Unorm"
 export VD CF
