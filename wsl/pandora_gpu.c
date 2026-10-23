@@ -41,6 +41,14 @@
  * HFI table/AHB fence/CM3_CFG/GENERAL_10 chip id/GENERAL_8 log, a840 GBIF (a6xx_catalog.c),
  * MRC_GBIF_QOS_CTRL, power config, then a6xx_gmu_start (reset release, FW_INIT_RESULT poll)
  * and a6xx_gmu_hfi_start (HFI_CTRL_INIT, HFI_CTRL_STATUS poll). No HFI message is sent yet.
+ * (gpu5 log: FW_INIT_RESULT 0x100, HFI ready, the GMU writes its log buffer.)
+ *
+ * Level 6 (patch 0167, "4c" first message): the HFI transport of a6xx_hfi.c (queue write with
+ * 0xfafafafa padding to 4 dwords, doorbell, MSGQ poll, response read with sequence match;
+ * plus cache maintenance, since the CPU maps the hfi buffer cacheable and the GMU does not)
+ * and the a8xx perf table HFI_H2F_MSG_TABLE (a8xx_hfi_send_perf_table): GPU levels of the
+ * phone's speed bin 0xfc and the GMU frequency table from its DT, votes built as
+ * a6xx_gmu_rpmh_arc_votes_init / a6xx_gmu_rpmh_dep_votes_init from cmd-db's level lists.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -852,6 +860,238 @@ gpu_level5(void)
 	return ok;
 }
 
+/* ---- level 6 (4c): HFI transport and the perf table --------------------------------- */
+
+#define GMU_GMU2HOST_INTR_CLR     0x1f991u
+#define GMU_GMU2HOST_INTR_INFO    0x1f992u
+#define GMU_HOST2GMU_INTR_SET     0x1f994u
+#define HFI_QUEUE_DWORDS          1024u
+#define HFI_F2H_MSG_ERROR         100u
+#define HFI_H2F_MSG_TABLE         15u
+#define HFI_TABLE_GPU_PERF        1u
+
+/* Phone DT qcom,gpu-pwrlevels-1 (speed-bin 0xfc; Android lists exactly these 18 frequencies),
+ * ascending, with qcom,level; and qcom,gmu@3d37000 qcom,gmu-freq-table. */
+static const struct { uint32_t hz, level; } gpu_opps[] = {
+	{ 160000000, 0x32 }, { 191000000, 0x33 }, { 222000000, 0x34 }, { 282000000, 0x36 },
+	{ 342000000, 0x38 }, { 382000000, 0x3c }, { 422000000, 0x40 }, { 461000000, 0x4c },
+	{ 500000000, 0x50 }, { 578000000, 0x80 }, { 646000000, 0x90 }, { 726000000, 0xc0 },
+	{ 826000000, 0xe0 }, { 902000000, 0x100 }, { 1000000000, 0x180 }, { 1050000000, 0x1a0 },
+	{ 1100000000, 0x1b0 }, { 1200000000, 0x1c0 },
+}, gmu_opps[] = {
+	{ 475000000, 0x38 }, { 575000000, 0x40 }, { 700000000, 0x80 }, { 750000000, 0x100 },
+};
+#define NGPU (1 + sizeof(gpu_opps) / sizeof(gpu_opps[0]))      /* with the "off" level */
+#define NGMU (1 + sizeof(gmu_opps) / sizeof(gmu_opps[0]))
+
+static uint32_t hfi_seq;
+
+/* cmd-db aux data of a .lvl resource: u16 levels. */
+static unsigned
+gpu_lvl(const char *res, uint16_t *out, unsigned max)
+{
+	uint32_t addr, aux, len;
+	if (!gpu_db || cmddb_find(res, &addr, &aux, &len)) {
+		return 0;
+	}
+	unsigned n = MIN(len / 2, max);
+	for (unsigned k = 0; k < n; k++) {
+		out[k] = db16(aux + 2 * k);
+	}
+	return n;
+}
+
+/* a6xx_gmu_rpmh_arc_votes_init for one level; false if the primary list has no such level. */
+static bool
+arc_vote(uint32_t level, const uint16_t *pri, unsigned np, const uint16_t *sec, unsigned ns, uint32_t *vote)
+{
+	unsigned p = 0, s = 0, j;
+	for (j = 0; j < np; j++) {
+		if (pri[j] >= level) {
+			p = j;
+			break;
+		}
+	}
+	if (j == np) {
+		return false;
+	}
+	for (j = 0; j < ns; j++) {
+		if (sec[j] >= level) {
+			s = j;
+			break;
+		} else if (sec[j]) {
+			s = j;
+		}
+	}
+	*vote = ((uint32_t)(pri[p] & 0xffff) << 16) | (s << 8) | p;
+	return true;
+}
+
+static uint32_t *
+hfi_q(unsigned q)
+{
+	return (uint32_t *)gmu_bufs[3].va + 6 + 12 * q;
+}
+
+static void
+hfi_clean(const void *va, size_t len)
+{
+	addr64_t pa = gmu_bufs[3].pa + ((vm_offset_t)va - gmu_bufs[3].va);
+	clean_dcache64(pa, (unsigned)len, TRUE);
+}
+
+static void
+hfi_inval(const void *va, size_t len)
+{
+	addr64_t pa = gmu_bufs[3].pa + ((vm_offset_t)va - gmu_bufs[3].va);
+	flush_dcache64(pa, (unsigned)len, TRUE);
+}
+
+/* a6xx_hfi_send_msg: msg[0] is filled with the header; true when the GMU acked without error. */
+static bool
+hfi_send(uint32_t id, uint32_t *msg, uint32_t dwords)
+{
+	uint32_t *cq = hfi_q(0), *rq = hfi_q(1);
+	uint32_t *cdata = (uint32_t *)(gmu_bufs[3].va + 0x1000), *rdata = (uint32_t *)(gmu_bufs[3].va + 0x2000);
+	uint32_t seq = (++hfi_seq) % 0xfff;
+	msg[0] = (seq << 20) | (dwords << 8) | id;
+
+	/* a6xx_hfi_queue_write */
+	hfi_inval(cq, 48);
+	uint32_t w = cq[11], r = cq[10];
+	uint32_t space = (r - w - 1) & (HFI_QUEUE_DWORDS - 1);
+	if (space < dwords) {
+		printf("PANDORA GPU: HFI command queue full (r %u w %u)\n", r, w);
+		return false;
+	}
+	for (uint32_t i = 0; i < dwords; i++) {
+		cdata[w] = msg[i];
+		w = (w + 1) % HFI_QUEUE_DWORDS;
+	}
+	for (; w % 4; w = (w + 1) % HFI_QUEUE_DWORDS) {
+		cdata[w] = 0xfafafafa;
+	}
+	hfi_clean(cdata, 0x1000);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	cq[11] = w;
+	hfi_clean(cq, 48);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1);
+
+	/* a6xx_hfi_wait_for_ack */
+	for (unsigned tries = 0; tries < 8; tries++) {
+		bool ok;
+		uint32_t info = gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, 1000000, &ok);
+		if (!ok) {
+			printf("PANDORA GPU: HFI id %u seq %u: no response (intr info %08x, cmd r %u w %u)\n", id, seq,
+			    info, (hfi_inval(cq, 48), cq[10]), cq[11]);
+			return false;
+		}
+		gmu_wr(GMU_GMU2HOST_INTR_CLR, 1);
+		for (;;) {
+			hfi_inval(rq, 48);
+			hfi_inval(rdata, 0x1000);
+			uint32_t ri = rq[10];
+			if (ri == rq[11]) {
+				rq[8] = 1;      /* rx_request */
+				hfi_clean(rq, 48);
+				break;
+			}
+			uint32_t resp[19] = {0}, hdr = rdata[ri], size = (hdr >> 8) & 0xff;
+			if (size > 19) {
+				printf("PANDORA GPU: HFI response size %u too large (hdr %08x)\n", size, hdr);
+				return false;
+			}
+			for (uint32_t i = 0; i < size; i++) {
+				resp[i] = rdata[ri];
+				ri = (ri + 1) % HFI_QUEUE_DWORDS;
+			}
+			ri = ((ri + 3) & ~3u) % HFI_QUEUE_DWORDS;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			rq[10] = ri;
+			hfi_clean(rq, 48);
+			if ((resp[0] & 0xff) == HFI_F2H_MSG_ERROR) {
+				printf("PANDORA GPU: HFI firmware error packet: code %u (%08x %08x)\n", resp[1], resp[2],
+				    resp[3]);
+				continue;
+			}
+			uint32_t rseq = (resp[1] >> 20) & 0xfff;
+			printf("PANDORA GPU: HFI response %08x for %08x error %u\n", resp[0], resp[1], resp[2]);
+			if (rseq != seq) {
+				continue;
+			}
+			return resp[2] == 0;
+		}
+	}
+	return false;
+}
+
+/* a8xx_hfi_send_perf_table. */
+static bool
+gpu_level6(void)
+{
+	static uint16_t gfx[32], gmxc[32], mx[32], cx[32];
+	unsigned ngfx = gpu_lvl("gfx.lvl", gfx, 32), ngmxc = gpu_lvl("gmxc.lvl", gmxc, 32);
+	unsigned nmx = gpu_lvl("mx.lvl", mx, 32), ncx = gpu_lvl("cx.lvl", cx, 32);
+	const uint16_t *sec = ngmxc ? gmxc : mx;
+	unsigned nsec = ngmxc ? ngmxc : nmx;
+	printf("PANDORA GPU: levels gfx %u gmxc %u mx %u cx %u\n", ngfx, ngmxc, nmx, ncx);
+	if (!ngfx || !nmx || !ncx || !nsec) {
+		return false;
+	}
+	static uint32_t msg[7 + 3 * NGPU + 2 * NGMU];
+	uint32_t *g = msg + 5, *c;
+	bzero(msg, sizeof(msg));
+	msg[1] = 0;                     /* version */
+	msg[2] = HFI_TABLE_GPU_PERF;
+	msg[3] = NGPU;                  /* entry 0: GX, stride 3 */
+	msg[4] = 3;
+	for (unsigned i = 0; i < NGPU; i++) {
+		uint32_t level = i ? gpu_opps[i - 1].level : 0, gxv, dep = 0xffffffffu;
+		if (!arc_vote(level, gfx, ngfx, sec, nsec, &gxv)) {
+			printf("PANDORA GPU: gfx level %#x not in cmd-db\n", level);
+			return false;
+		}
+		if (i) {
+			unsigned j;
+			for (j = 0; j < nmx && mx[j] < level; j++) {
+			}
+			if (j == nmx) {
+				printf("PANDORA GPU: mx level %#x not in cmd-db\n", level);
+				return false;
+			}
+			dep = (0x3fffu << 14) | (j << 8) | 0xff;
+		}
+		g[3 * i] = gxv;
+		g[3 * i + 1] = dep;
+		g[3 * i + 2] = i ? gpu_opps[i - 1].hz / 1000 : 0;
+	}
+	c = g + 3 * NGPU;               /* entry 1: CX, stride 2 */
+	c[0] = NGMU;
+	c[1] = 2;
+	for (unsigned i = 0; i < NGMU; i++) {
+		uint32_t level = i ? gmu_opps[i - 1].level : 0, cxv;
+		if (!arc_vote(level, cx, ncx, mx, nmx, &cxv)) {
+			printf("PANDORA GPU: cx level %#x not in cmd-db\n", level);
+			return false;
+		}
+		c[2 + 2 * i] = cxv;
+		c[3 + 2 * i] = i ? gmu_opps[i - 1].hz / 1000 : 0;
+	}
+	printf("PANDORA GPU: perf table %u dwords: gx[1] %08x %08x %u, gx[%u] %08x %08x %u, cx[1] %08x %u, cx[%u] %08x %u\n",
+	    (unsigned)(sizeof(msg) / 4), g[3], g[4], g[5], (unsigned)NGPU - 1, g[3 * (NGPU - 1)],
+	    g[3 * (NGPU - 1) + 1], g[3 * (NGPU - 1) + 2], c[4], c[5], (unsigned)NGMU - 1, c[2 + 2 * (NGMU - 1)],
+	    c[3 + 2 * (NGMU - 1)]);
+	gpu_step("HFI: perf table (MSG_TABLE)");
+	bool ok = hfi_send(HFI_H2F_MSG_TABLE, msg, (uint32_t)(sizeof(msg) / 4));
+	printf("PANDORA GPU: HFI perf table %s\n", ok ? "ACKED" : "NOT ACKED");
+	const uint32_t *log = (const uint32_t *)gmu_bufs[2].va;
+	flush_dcache64((addr64_t)gmu_bufs[2].pa, 64, TRUE);
+	printf("PANDORA GPU: GMU log %08x %08x %08x %08x %08x %08x %08x %08x; ao_host_irq %08x\n", log[0], log[1],
+	    log[2], log[3], log[4], log[5], log[6], log[7], gmu_rd(GMU_AO_HOST_INTR_STATUS));
+	return ok;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -860,7 +1100,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -885,6 +1125,10 @@ gpu_thread(void *arg, wait_result_t result)
 					if (ctx && level >= 5) {
 						bool up = gpu_level5();
 						printf("PANDORA GPU: level 5 (GMU cold start) %s\n", up ? "done" : "stopped");
+						if (up && level >= 6) {
+							bool t = gpu_level6();
+							printf("PANDORA GPU: level 6 (HFI perf table) %s\n", t ? "done" : "stopped");
+						}
 					}
 				}
 			}
