@@ -1,1 +1,2 @@
 ArmSmmu4K 4d0d6598b1a36aeec3de01091893fa6660e49388 (2026-10-20)
+NativeAdreno b686b9054f57d393c80195b82568a09f8ca106a2 (2026-10-23): NativeAdrenoABI.h only (the user-client wire ABI), unchanged

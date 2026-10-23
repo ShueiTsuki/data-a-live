@@ -106,6 +106,13 @@
  * Patch 0176: the pool is reserved in pandora_gpu_init, before launchd, as the myron driver
  * reserves it at start (1 GiB there on the same phone).
  *
+ * Level 14 (patch 0177): the interface NativeAdreno's user client (and so Turnip's Darwin
+ * backend) needs, in pandora_gpu_* functions: buffers from the pool (best-fit extents),
+ * mappings at client-chosen addresses inside per-client windows, CPU views by token, framed
+ * submissions of up to 16 IBs, fence waits, the always-on counter. The IOKit side is
+ * iokit/Kernel/arm/PandoraAdrenoGpu.cpp. Level 14 holds OOB GPU_SET for good and runs one
+ * kernel self-test through these functions. Level 13's test buffer moved to 0x1f000000.
+ *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
  * The gating order follows UniXNU's sheng GpuPowerBoard.h (BSD-2-Clause-Patent); no code
@@ -122,6 +129,7 @@
 #include <vm/vm_kern.h>
 #include <arm/caches_internal.h>
 #include <kern/kalloc.h>
+#include <kern/locks.h>
 #include "adreno/ArmSmmu4KStreams.h"
 #include "adreno/ArmSmmu4KMmio.h"
 
@@ -1731,7 +1739,10 @@ smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigne
 #define GPU_POOL_WANT     (1024ull << 20)
 #define GPU_POOL_MIN      (16ull << 20)
 static vm_offset_t gpu_pool_va;
-static uint64_t gpu_pool_pa, gpu_pool_bytes, gpu_pool_used;
+static uint64_t gpu_pool_pa, gpu_pool_bytes;
+#define GPU_POOL_EXTENTS  512u
+static uint64_t gpu_ext_off[GPU_POOL_EXTENTS], gpu_ext_len[GPU_POOL_EXTENTS];
+static unsigned gpu_next;
 
 static bool
 gpu_pool_reserve(void)
@@ -1744,6 +1755,9 @@ gpu_pool_reserve(void)
 		    gpu_pool_va ? "reserved" : "refused", ns / 1000000);
 		if (gpu_pool_va) {
 			gpu_pool_bytes = want;
+			gpu_ext_off[0] = 0;
+			gpu_ext_len[0] = want;
+			gpu_next = 1;
 			printf("PANDORA GPU: buffer pool at pa %#llx\n", gpu_pool_pa);
 			return true;
 		}
@@ -1751,17 +1765,91 @@ gpu_pool_reserve(void)
 	return false;
 }
 
-/* For this level only: take bytes from the front of the pool. */
+/* Best fit over a sorted list of free extents (pool offsets), merged on release, as
+ * NativeAdrenoMemory does; ALIGN is a power of two, applied to the physical address. Returns the
+ * pool offset or ~0. */
+static uint64_t
+gpu_pool_alloc(uint64_t bytes, uint64_t align)
+{
+	unsigned best = GPU_POOL_EXTENTS;
+	uint64_t best_at = 0;
+	for (unsigned i = 0; i < gpu_next; i++) {
+		uint64_t at = ((gpu_pool_pa + gpu_ext_off[i] + align - 1) & ~(align - 1)) - gpu_pool_pa;
+		if (at + bytes <= gpu_ext_off[i] + gpu_ext_len[i] &&
+		    (best == GPU_POOL_EXTENTS || gpu_ext_len[i] < gpu_ext_len[best])) {
+			best = i;
+			best_at = at;
+		}
+	}
+	if (best == GPU_POOL_EXTENTS) {
+		return ~0ull;
+	}
+	uint64_t off = gpu_ext_off[best], end = off + gpu_ext_len[best];
+	bool front = best_at > off, back = best_at + bytes < end;
+	if (front && back && gpu_next == GPU_POOL_EXTENTS) {
+		return ~0ull;
+	}
+	if (front) {
+		gpu_ext_len[best] = best_at - off;
+	}
+	if (back) {
+		unsigned at = front ? best + 1 : best;
+		if (front) {
+			memmove(&gpu_ext_off[at + 1], &gpu_ext_off[at], (gpu_next - at) * sizeof(uint64_t));
+			memmove(&gpu_ext_len[at + 1], &gpu_ext_len[at], (gpu_next - at) * sizeof(uint64_t));
+			gpu_next++;
+		}
+		gpu_ext_off[at] = best_at + bytes;
+		gpu_ext_len[at] = end - (best_at + bytes);
+	}
+	if (!front && !back) {
+		memmove(&gpu_ext_off[best], &gpu_ext_off[best + 1], (gpu_next - best - 1) * sizeof(uint64_t));
+		memmove(&gpu_ext_len[best], &gpu_ext_len[best + 1], (gpu_next - best - 1) * sizeof(uint64_t));
+		gpu_next--;
+	}
+	return best_at;
+}
+
+static void
+gpu_pool_free(uint64_t off, uint64_t bytes)
+{
+	unsigned i = 0;
+	while (i < gpu_next && gpu_ext_off[i] < off) {
+		i++;
+	}
+	bool prev = i > 0 && gpu_ext_off[i - 1] + gpu_ext_len[i - 1] == off;
+	bool next = i < gpu_next && off + bytes == gpu_ext_off[i];
+	if (prev && next) {
+		gpu_ext_len[i - 1] += bytes + gpu_ext_len[i];
+		memmove(&gpu_ext_off[i], &gpu_ext_off[i + 1], (gpu_next - i - 1) * sizeof(uint64_t));
+		memmove(&gpu_ext_len[i], &gpu_ext_len[i + 1], (gpu_next - i - 1) * sizeof(uint64_t));
+		gpu_next--;
+	} else if (prev) {
+		gpu_ext_len[i - 1] += bytes;
+	} else if (next) {
+		gpu_ext_off[i] = off;
+		gpu_ext_len[i] += bytes;
+	} else if (gpu_next < GPU_POOL_EXTENTS) {
+		memmove(&gpu_ext_off[i + 1], &gpu_ext_off[i], (gpu_next - i) * sizeof(uint64_t));
+		memmove(&gpu_ext_len[i + 1], &gpu_ext_len[i], (gpu_next - i) * sizeof(uint64_t));
+		gpu_ext_off[i] = off;
+		gpu_ext_len[i] = bytes;
+		gpu_next++;
+	} else {
+		printf("PANDORA GPU: pool extent list full: %#llx bytes at %#llx lost\n", bytes, off);
+	}
+}
+
+/* For level 13: a buffer from the pool, with its physical address. */
 static vm_offset_t
 gpu_pool_take(uint64_t bytes, uint64_t *pa)
 {
-	if (bytes > gpu_pool_bytes - gpu_pool_used) {
+	uint64_t off = gpu_pool_alloc(bytes, 0x1000);
+	if (off == ~0ull) {
 		return 0;
 	}
-	*pa = gpu_pool_pa + gpu_pool_used;
-	vm_offset_t va = gpu_pool_va + (vm_offset_t)gpu_pool_used;
-	gpu_pool_used += bytes;
-	return va;
+	*pa = gpu_pool_pa + off;
+	return gpu_pool_va + (vm_offset_t)off;
 }
 
 static uint32_t
@@ -1795,7 +1883,7 @@ ring_put_n(uint32_t op, const uint32_t *p, uint32_t n)
  * IFPC off, the IB, then the fence: scratch, CCU invalidates, BV timestamp, BR waits for it,
  * ring timestamp, BOTH, IFPC on. Returns the sequence number. */
 static uint32_t
-gpu_submit(uint64_t ib, uint32_t dwords, uint32_t thread, bool reset)
+gpu_submit(const uint64_t *ib, const uint32_t *dwords, unsigned n, uint32_t thread, bool reset)
 {
 	const uint64_t mem = gpu_bufs[2].iova + MEMPTRS_OFF, fence = mem + 4, bv = mem + 12;
 	const uint32_t seq = ++gpu_seqno;
@@ -1822,8 +1910,10 @@ gpu_submit(uint64_t ib, uint32_t dwords, uint32_t thread, bool reset)
 	ring_put_n(0x26, NULL, 0);                               /* CP_WAIT_FOR_IDLE */
 	ring_put_n(0x17, &thread, 1);
 	v = 0x101; ring_put_n(0x65, &v, 1);                      /* CP_SET_MARKER: IFPC off */
-	const uint32_t ibp[3] = { (uint32_t)ib, (uint32_t)(ib >> 32), dwords };
-	ring_put_n(0x3f, ibp, 3);                                /* CP_INDIRECT_BUFFER */
+	for (unsigned i = 0; i < n; i++) {
+		const uint32_t ibp[3] = { (uint32_t)ib[i], (uint32_t)(ib[i] >> 32), dwords[i] };
+		ring_put_n(0x3f, ibp, 3);                        /* CP_INDIRECT_BUFFER */
+	}
 	ring_put(pkt4(CP_SCRATCH_GLOBAL2, 1));
 	ring_put(seq);
 	v = 1; ring_put_n(0x17, &v, 1);
@@ -1864,7 +1954,7 @@ gpu_wait_fence(uint32_t seq, unsigned ms)
 	return ok;
 }
 
-#define GPU_TEST_IOVA     0x20000000ull     /* first user window address in NativeAdreno's layout */
+#define GPU_TEST_IOVA     0x1f000000ull     /* below the user windows of level 14 */
 
 static bool
 gpu_level13(void)
@@ -1907,7 +1997,9 @@ gpu_level13(void)
 		char what[64];
 		snprintf(what, sizeof(what), "CP: framed submission %u (IB on %s)", k + 1, k ? "BOTH" : "BR");
 		gpu_step(what);
-		uint32_t seq = gpu_submit(GPU_TEST_IOVA + 0x100 * k, 4, threads[k], k == 0);
+		const uint64_t ibva = GPU_TEST_IOVA + 0x100 * k;
+		const uint32_t ibdw = 4;
+		uint32_t seq = gpu_submit(&ibva, &ibdw, 1, threads[k], k == 0);
 		bool f = gpu_wait_fence(seq, 1000);
 		flush_dcache64((addr64_t)bo_pa + 0x8000, 64, TRUE);
 		uint32_t w = ((const volatile uint32_t *)(bo + 0x8000))[k];
@@ -1918,6 +2010,417 @@ gpu_level13(void)
 	return all;
 }
 
+/* ---- level 14: buffer objects and submissions for the user client ------------------------------ */
+
+/*
+ * What iokit/Kernel/arm/PandoraAdrenoGpu.cpp (NativeAdreno's user ABI) stands on: buffers from the
+ * pool with handles, GPU mappings at addresses the client picks inside its window, CPU views
+ * by token, framed submissions and fence waits. One lock for everything, as NativeAdreno's
+ * global lock; OOB GPU_SET is held from level 14 on, so the GPU never powers down under us.
+ * Windows as NativeAdrenoPublish lays them out: 1 GiB at 0x20000000, then three of 0xaaa9000.
+ */
+LCK_GRP_DECLARE(gpu_lck_grp, "pandora_gpu");
+LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
+
+#define GPU_MAX_BOS       4096u
+#define GPU_MAX_CLIENTS   4u
+#define GPU_MAX_IBS       16u
+struct gpu_bo {
+	bool used;
+	int client;
+	uint32_t gen, perm, leases;
+	uint64_t off, bytes, iova;      /* iova 0 = not mapped */
+	uint32_t meta_len;
+	char meta[64];
+};
+static struct gpu_bo gpu_bos[GPU_MAX_BOS];
+static struct {
+	bool used, reset;
+	uint64_t va_start, va_size;
+} gpu_clients[GPU_MAX_CLIENTS];
+static const uint64_t gpu_window[GPU_MAX_CLIENTS][2] = {
+	{ 0x20000000ull, 0x40000000ull }, { 0x60000000ull, 0xaaa9000ull },
+	{ 0x6aaa9000ull, 0xaaa9000ull }, { 0x75552000ull, 0xaaa9000ull },
+};
+static bool gpu_ready;
+static uint32_t gpu_bo_gen;
+
+/* Clear the leaves of [iova, iova + bytes) and TLBIALL; table pages stay. */
+static void
+smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes)
+{
+	uint64_t pool = c->tables.root_physical;
+	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
+	for (uint64_t off = 0; off < bytes; off += 0x1000) {
+		uint64_t va = iova + off, *t = (uint64_t *)c->tva;
+		for (unsigned level = start; level < 3 && t; level++) {
+			unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+			uint64_t e = t[(va >> shift) & ((1u << width) - 1)];
+			t = e ? (uint64_t *)(c->tva + ((e & 0xfffffffff000ull) - pool)) : NULL;
+		}
+		if (t) {
+			uint64_t *leaf = &t[(va >> 12) & 511];
+			*leaf = 0;
+			clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - c->tva)), 8, TRUE);
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ArmSmmu4KProgramResult r;
+	(void)ArmSmmu4KInvalidateAllOwnedContext(&smmu_io, c->bank, &c->ctx, 1000, &r);
+}
+
+static struct gpu_bo *
+gpu_bo_get(int client, uint64_t handle)
+{
+	uint32_t idx = (uint32_t)handle - 1, gen = (uint32_t)(handle >> 32);
+	if (idx >= GPU_MAX_BOS || !gpu_bos[idx].used || gpu_bos[idx].client != client || gpu_bos[idx].gen != gen) {
+		return NULL;
+	}
+	return &gpu_bos[idx];
+}
+
+static bool
+gpu_fence_done(uint32_t seq)
+{
+	const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
+	flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
+	return (int32_t)(mem[1] - seq) >= 0;
+}
+
+/* Without the lock: until fence seq or the timeout (0 = look once). 0, ETIMEDOUT, EINVAL. */
+int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
+int
+pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns)
+{
+	uint32_t seq = (uint32_t)fence;
+	if (fence >> 32 || (int32_t)(seq - gpu_seqno) > 0) {
+		return EINVAL;
+	}
+	uint64_t t0 = mach_absolute_time(), ns = 0;
+	while (!gpu_fence_done(seq)) {
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+		if (ns >= timeout_ns) {
+			return ETIMEDOUT;
+		}
+		delay(100);
+	}
+	return 0;
+}
+
+/* A client and its window; -1 while the GPU is not up or all windows are taken. */
+int pandora_gpu_open(void);
+int
+pandora_gpu_open(void)
+{
+	int c = -1;
+	lck_mtx_lock(&gpu_lock);
+	for (unsigned i = 0; gpu_ready && i < GPU_MAX_CLIENTS && c < 0; i++) {
+		if (!gpu_clients[i].used) {
+			gpu_clients[i].used = true;
+			gpu_clients[i].reset = true;
+			gpu_clients[i].va_start = gpu_window[i][0];
+			gpu_clients[i].va_size = gpu_window[i][1];
+			c = (int)i;
+		}
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return c;
+}
+
+void pandora_gpu_window(int client, uint64_t *start, uint64_t *size);
+void
+pandora_gpu_window(int client, uint64_t *start, uint64_t *size)
+{
+	*start = gpu_clients[client].va_start;
+	*size = gpu_clients[client].va_size;
+}
+
+/* After the client's work (at most 2 s, as NativeAdrenoPublish waits), every buffer it owns goes. */
+void pandora_gpu_close(int client);
+void
+pandora_gpu_close(int client)
+{
+	(void)pandora_gpu_wait(gpu_seqno, 2000000000ull);
+	lck_mtx_lock(&gpu_lock);
+	unsigned n = 0;
+	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
+		struct gpu_bo *b = &gpu_bos[i];
+		if (b->used && b->client == client) {
+			if (b->iova) {
+				smmu_unmap(&gpu_smmu, b->iova, b->bytes);
+			}
+			gpu_pool_free(b->off, b->bytes);
+			b->used = false;
+			n++;
+		}
+	}
+	gpu_clients[client].used = false;
+	lck_mtx_unlock(&gpu_lock);
+	printf("PANDORA GPU: client %d closed, %u buffers freed\n", client, n);
+}
+
+int pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *handle);
+int
+pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *handle)
+{
+	if (!bytes || (bytes & 0xfff) || bytes > (256ull << 20) || align_log2 < 12 || align_log2 > 24) {
+		return EINVAL;
+	}
+	int err = ENOMEM;
+	lck_mtx_lock(&gpu_lock);
+	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
+		struct gpu_bo *b = &gpu_bos[i];
+		if (b->used) {
+			continue;
+		}
+		uint64_t off = gpu_pool_alloc(bytes, 1ull << align_log2);
+		if (off != ~0ull) {
+			/* Zeroed through the kernel's cacheable view, then out of the CPU caches: the
+			 * client maps it write-combined and the GPU reads it non-cacheably. */
+			bzero((void *)(gpu_pool_va + off), (size_t)bytes);
+			flush_dcache64((addr64_t)(gpu_pool_pa + off), (unsigned)bytes, TRUE);
+			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
+			*handle = ((uint64_t)b->gen << 32) | (i + 1);
+			err = 0;
+		}
+		break;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/* PERM bit 0 read (required), bit 1 write; the address must lie inside the client's window. */
+int pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm);
+int
+pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
+{
+	int err = 0;
+	lck_mtx_lock(&gpu_lock);
+	struct gpu_bo *b = gpu_bo_get(client, handle);
+	uint64_t ws = gpu_clients[client].va_start, we = ws + gpu_clients[client].va_size;
+	if (!b || (iova & 0xfff) || !(perm & 1) || (perm & ~3u) || iova < ws || iova + b->bytes > we) {
+		err = EINVAL;
+	} else if (b->iova) {
+		err = EBUSY;
+	} else if (!smmu_map(&gpu_smmu, iova, gpu_pool_pa + b->off, b->bytes,
+	    ArmSmmu4KRead | ((perm & 2) ? ArmSmmu4KWrite : 0))) {
+		err = EEXIST;
+	} else {
+		b->iova = iova;
+		b->perm = perm;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/* Refused while CPU views remain; waits for every submission so far, then unmaps and frees. */
+int pandora_gpu_bo_free(int client, uint64_t handle);
+int
+pandora_gpu_bo_free(int client, uint64_t handle)
+{
+	if (pandora_gpu_wait(gpu_seqno, 2000000000ull)) {
+		return EBUSY;
+	}
+	int err = 0;
+	lck_mtx_lock(&gpu_lock);
+	struct gpu_bo *b = gpu_bo_get(client, handle);
+	if (!b) {
+		err = EINVAL;
+	} else if (b->leases) {
+		err = EBUSY;
+	} else {
+		if (b->iova) {
+			smmu_unmap(&gpu_smmu, b->iova, b->bytes);
+		}
+		gpu_pool_free(b->off, b->bytes);
+		b->used = false;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/* CPU views: DELTA +1 takes a lease and returns the token (entry + 1), -1 gives one back; the
+ * token's physical range for clientMemoryForType. */
+int pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token, uint64_t *bytes,
+    uint32_t *leases);
+int
+pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token, uint64_t *bytes,
+    uint32_t *leases)
+{
+	int err = 0;
+	lck_mtx_lock(&gpu_lock);
+	struct gpu_bo *b = gpu_bo_get(client, handle);
+	if (!b || (delta < 0 && !b->leases)) {
+		err = EINVAL;
+	} else {
+		b->leases += delta;
+		*token = (uint32_t)(b - gpu_bos) + 1;
+		*bytes = b->bytes;
+		*leases = b->leases;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+int pandora_gpu_token_phys(int client, uint32_t token, uint64_t *pa, uint64_t *bytes);
+int
+pandora_gpu_token_phys(int client, uint32_t token, uint64_t *pa, uint64_t *bytes)
+{
+	int err = EINVAL;
+	lck_mtx_lock(&gpu_lock);
+	if (token >= 1 && token <= GPU_MAX_BOS) {
+		struct gpu_bo *b = &gpu_bos[token - 1];
+		if (b->used && b->client == client && b->leases) {
+			*pa = gpu_pool_pa + b->off;
+			*bytes = b->bytes;
+			err = 0;
+		}
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+int pandora_gpu_bo_meta(int client, uint64_t handle, bool set, char *text, uint32_t *len);
+int
+pandora_gpu_bo_meta(int client, uint64_t handle, bool set, char *text, uint32_t *len)
+{
+	int err = 0;
+	lck_mtx_lock(&gpu_lock);
+	struct gpu_bo *b = gpu_bo_get(client, handle);
+	if (!b || (set && *len > sizeof(b->meta))) {
+		err = EINVAL;
+	} else if (set) {
+		memcpy(b->meta, text, *len);
+		b->meta_len = *len;
+	} else {
+		memcpy(text, b->meta, b->meta_len);
+		*len = b->meta_len;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/* Each IB inside one of the client's readable mapped buffers, at most 0xfffff dwords. The IBs
+ * run on BOTH when the first one starts with its own CP_THREAD_CONTROL (Turnip's tu_init_hw,
+ * 0x70970001), else on BR: the myron driver found the A840 hangs with all jobs on BR and with
+ * continuation jobs on BOTH. */
+int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
+int
+pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence)
+{
+	if (!n || n > GPU_MAX_IBS) {
+		return EINVAL;
+	}
+	uint64_t ib[GPU_MAX_IBS];
+	uint32_t dw[GPU_MAX_IBS], first = 0;
+	int err = 0;
+	lck_mtx_lock(&gpu_lock);
+	for (unsigned i = 0; i < n && !err; i++) {
+		err = EINVAL;
+		if ((iova[i] & 3) || !bytes[i] || (bytes[i] & 3) || bytes[i] / 4 > 0xfffff) {
+			break;
+		}
+		for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
+			struct gpu_bo *b = &gpu_bos[j];
+			if (b->used && b->client == client && b->iova && (b->perm & 1) && iova[i] >= b->iova &&
+			    iova[i] + bytes[i] <= b->iova + b->bytes) {
+				if (i == 0) {
+					uint64_t pa = gpu_pool_pa + b->off + (iova[i] - b->iova);
+					flush_dcache64((addr64_t)pa, 4, TRUE);
+					first = *(const volatile uint32_t *)(gpu_pool_va + (vm_offset_t)(pa - gpu_pool_pa));
+				}
+				ib[i] = iova[i];
+				dw[i] = (uint32_t)(bytes[i] / 4);
+				err = 0;
+				break;
+			}
+		}
+	}
+	/* Room in the ring for the frame (at most ~110 dwords) and the IB packets. */
+	const uint32_t size = (uint32_t)(gpu_bufs[0].bytes / 4), need = 128 + 4 * n;
+	for (unsigned t = 0; !err; t++) {
+		uint32_t rptr = gr(CP_RB_RPTR);
+		if (((rptr - ring_wptr - 1) & (size - 1)) >= need) {
+			break;
+		}
+		if (t == 10000) {
+			err = EBUSY;
+		}
+		delay(100);
+	}
+	if (!err) {
+		uint32_t thread = first == 0x70970001u ? 3 : 1;
+		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
+		gpu_clients[client].reset = false;
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/* CP_ALWAYS_ON_COUNTER (A8XX 0x8e7, as the myron chip table has it). */
+uint64_t pandora_gpu_timestamp(void);
+uint64_t
+pandora_gpu_timestamp(void)
+{
+	lck_mtx_lock(&gpu_lock);
+	uint32_t hi = gr(0x8e8), lo = gr(0x8e7), hi2 = gr(0x8e8);
+	if (hi2 != hi) {
+		lo = gr(0x8e7);
+	}
+	lck_mtx_unlock(&gpu_lock);
+	return ((uint64_t)hi2 << 32) | lo;
+}
+
+/* Level 14: hold OOB GPU_SET, open the user interface, and use it once from the kernel the way
+ * the user client will: a buffer, mapped at the window start, an IB in it, submit, wait, free. */
+static bool
+gpu_level14(void)
+{
+	bool ok;
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
+	(void)gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 100000, &ok);
+	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+	if (!ok) {
+		printf("PANDORA GPU: OOB GPU_SET NOT ACKED\n");
+		return false;
+	}
+	gpu_ready = true;
+	gpu_step("user interface: kernel self-test through it");
+	int c = pandora_gpu_open();
+	uint64_t h = 0, ws = 0, wsz = 0, fence = 0;
+	int err = c < 0 ? ENXIO : pandora_gpu_bo_alloc(c, 0x10000, 12, &h);
+	if (!err) {
+		pandora_gpu_window(c, &ws, &wsz);
+		err = pandora_gpu_bo_map(c, h, ws, 3);
+	}
+	printf("PANDORA GPU: self-test client %d window %#llx+%#llx buffer %#llx -> %d\n", c, ws, wsz, h, err);
+	bool good = false;
+	if (!err) {
+		vm_offset_t va = gpu_pool_va + (vm_offset_t)gpu_bos[(uint32_t)h - 1].off;
+		uint32_t *ib = (uint32_t *)va;
+		ib[0] = pkt7(0x3d, 3);
+		ib[1] = (uint32_t)(ws + 0x8000);
+		ib[2] = (uint32_t)((ws + 0x8000) >> 32);
+		ib[3] = 0x14141414;
+		clean_dcache64((addr64_t)(gpu_pool_pa + gpu_bos[(uint32_t)h - 1].off), 16, TRUE);
+		const uint64_t ibva = ws, ibbytes = 16;
+		err = pandora_gpu_submit(c, &ibva, &ibbytes, 1, &fence);
+		int w = err ? err : pandora_gpu_wait(fence, 1000000000ull);
+		flush_dcache64((addr64_t)(gpu_pool_pa + gpu_bos[(uint32_t)h - 1].off + 0x8000), 64, TRUE);
+		uint32_t v = *(const volatile uint32_t *)(va + 0x8000);
+		good = !err && !w && v == 0x14141414;
+		printf("PANDORA GPU: self-test submit -> %d fence %llu wait -> %d, word %08x; timestamp %llu\n",
+		    err, fence, w, v, pandora_gpu_timestamp());
+		(void)ring_idle(10);
+	}
+	if (c >= 0) {
+		int f = h ? pandora_gpu_bo_free(c, h) : 0;
+		printf("PANDORA GPU: self-test free -> %d\n", f);
+		pandora_gpu_close(c);
+	}
+	return good;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -1926,7 +2429,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer, 13 = pool and framed submit)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer, 13 = pool and framed submit, 14 = user interface)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -1979,6 +2482,11 @@ gpu_thread(void *arg, wait_result_t result)
 														bool s = gpu_level13();
 														printf("PANDORA GPU: level 13 (pool, framed submit) %s\n",
 														    s ? "done" : "stopped");
+														if (s && level >= 14) {
+															bool u = gpu_level14();
+															printf("PANDORA GPU: level 14 (user interface) %s\n",
+															    u ? "done" : "stopped");
+														}
 													}
 												}
 											}
