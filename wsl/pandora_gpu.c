@@ -112,6 +112,11 @@
  * submissions of up to 16 IBs, fence waits, the always-on counter. The IOKit side is
  * iokit/Kernel/arm/PandoraAdrenoGpu.cpp. Level 14 holds OOB GPU_SET for good and runs one
  * kernel self-test through these functions. Level 13's test buffer moved to 0x1f000000.
+ * (gpu14 / pgpu1 logs: 1 GiB pool before launchd; tools/pgputest PASS from user space, but every
+ * CPU view logged IOKit's "IOMemoryDescriptor physical with managed page".)
+ * Patch 0178: the pool comes from RAM the loader keeps from XNU when the ADT has
+ * pandora-gpu-pool (mkadt_pandora.py --gpu-pool, boot_ios.sh GPUPOOL=MiB), mapped write-combined;
+ * the kernel-memory pool stays as the fallback.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -130,6 +135,8 @@
 #include <arm/caches_internal.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <pexpert/device_tree.h>
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 #include "adreno/ArmSmmu4KStreams.h"
 #include "adreno/ArmSmmu4KMmio.h"
 
@@ -1740,13 +1747,62 @@ smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigne
 #define GPU_POOL_MIN      (16ull << 20)
 static vm_offset_t gpu_pool_va;
 static uint64_t gpu_pool_pa, gpu_pool_bytes;
+static bool gpu_pool_carved;    /* RAM the loader kept from XNU (ADT pandora-gpu-pool), mapped write-combined */
 #define GPU_POOL_EXTENTS  512u
 static uint64_t gpu_ext_off[GPU_POOL_EXTENTS], gpu_ext_len[GPU_POOL_EXTENTS];
 static unsigned gpu_next;
 
+/*
+ * Clean (and with INVAL also invalidate) the CPU caches over pool bytes [off, off + len). Nothing
+ * to do for the carved pool: its only kernel mapping is write-combined (no cache lines), and its
+ * pages are outside the physical aperture that the by-address cache operations go through.
+ */
+static void
+gpu_pool_sync(uint64_t off, uint64_t len, bool inval)
+{
+	if (gpu_pool_carved) {
+		__asm__ volatile ("dsb sy" ::: "memory");
+	} else if (inval) {
+		flush_dcache64((addr64_t)(gpu_pool_pa + off), (unsigned)len, TRUE);
+	} else {
+		clean_dcache64((addr64_t)(gpu_pool_pa + off), (unsigned)len, TRUE);
+	}
+}
+
+static void
+gpu_pool_ready(uint64_t bytes)
+{
+	gpu_pool_bytes = bytes;
+	gpu_ext_off[0] = 0;
+	gpu_ext_len[0] = bytes;
+	gpu_next = 1;
+	printf("PANDORA GPU: buffer pool at pa %#llx, %llu MiB%s\n", gpu_pool_pa, bytes >> 20,
+	    gpu_pool_carved ? " (carved by the loader, write-combined)" : "");
+}
+
+/*
+ * The pool. Preferably the RAM the loader carved off (mkadt_pandora.py --gpu-pool): pages XNU
+ * never manages, so the user client's physical-address views of them are plain (IOKit warns
+ * about such views of managed pages). Otherwise kernel memory, as before.
+ */
 static bool
 gpu_pool_reserve(void)
 {
+	DTEntry chosen;
+	const uint64_t *carve;
+	unsigned int size;
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "pandora-gpu-pool", (void const **)&carve, &size) == kSuccess &&
+	    size == 16 && carve[1]) {
+		gpu_pool_va = ml_io_map_wcomb((vm_offset_t)carve[0], (vm_size_t)carve[1]);
+		if (gpu_pool_va) {
+			gpu_pool_pa = carve[0];
+			gpu_pool_carved = true;
+			gpu_pool_ready(carve[1]);
+			return true;
+		}
+		printf("PANDORA GPU: carved pool %#llx+%#llx not mapped\n", carve[0], carve[1]);
+	}
 	for (uint64_t want = GPU_POOL_WANT; want >= GPU_POOL_MIN; want /= 2) {
 		uint64_t t0 = mach_absolute_time(), ns;
 		gpu_pool_va = gpu_contig(want, &gpu_pool_pa);
@@ -1754,11 +1810,7 @@ gpu_pool_reserve(void)
 		printf("PANDORA GPU: buffer pool %llu MiB: %s (%llu ms)\n", want >> 20,
 		    gpu_pool_va ? "reserved" : "refused", ns / 1000000);
 		if (gpu_pool_va) {
-			gpu_pool_bytes = want;
-			gpu_ext_off[0] = 0;
-			gpu_ext_len[0] = want;
-			gpu_next = 1;
-			printf("PANDORA GPU: buffer pool at pa %#llx\n", gpu_pool_pa);
+			gpu_pool_ready(want);
 			return true;
 		}
 	}
@@ -1993,7 +2045,7 @@ gpu_level13(void)
 		ib[1] = (uint32_t)target;
 		ib[2] = (uint32_t)(target >> 32);
 		ib[3] = 0x13130000u + k;
-		clean_dcache64((addr64_t)bo_pa + 0x100 * k, 16, TRUE);
+		gpu_pool_sync(bo_pa - gpu_pool_pa + 0x100 * k, 16, false);
 		char what[64];
 		snprintf(what, sizeof(what), "CP: framed submission %u (IB on %s)", k + 1, k ? "BOTH" : "BR");
 		gpu_step(what);
@@ -2001,7 +2053,7 @@ gpu_level13(void)
 		const uint32_t ibdw = 4;
 		uint32_t seq = gpu_submit(&ibva, &ibdw, 1, threads[k], k == 0);
 		bool f = gpu_wait_fence(seq, 1000);
-		flush_dcache64((addr64_t)bo_pa + 0x8000, 64, TRUE);
+		gpu_pool_sync(bo_pa - gpu_pool_pa + 0x8000, 64, true);
 		uint32_t w = ((const volatile uint32_t *)(bo + 0x8000))[k];
 		printf("PANDORA GPU: submission %u: buffer word %u = %08x (want %08x)\n", seq, k, w, 0x13130000u + k);
 		all = f && w == 0x13130000u + k;
@@ -2178,7 +2230,7 @@ pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *
 			/* Zeroed through the kernel's cacheable view, then out of the CPU caches: the
 			 * client maps it write-combined and the GPU reads it non-cacheably. */
 			bzero((void *)(gpu_pool_va + off), (size_t)bytes);
-			flush_dcache64((addr64_t)(gpu_pool_pa + off), (unsigned)bytes, TRUE);
+			gpu_pool_sync(off, bytes, true);
 			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
 			*handle = ((uint64_t)b->gen << 32) | (i + 1);
 			err = 0;
@@ -2326,7 +2378,7 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 			    iova[i] + bytes[i] <= b->iova + b->bytes) {
 				if (i == 0) {
 					uint64_t pa = gpu_pool_pa + b->off + (iova[i] - b->iova);
-					flush_dcache64((addr64_t)pa, 4, TRUE);
+					gpu_pool_sync(pa - gpu_pool_pa, 4, true);
 					first = *(const volatile uint32_t *)(gpu_pool_va + (vm_offset_t)(pa - gpu_pool_pa));
 				}
 				ib[i] = iova[i];
@@ -2402,11 +2454,11 @@ gpu_level14(void)
 		ib[1] = (uint32_t)(ws + 0x8000);
 		ib[2] = (uint32_t)((ws + 0x8000) >> 32);
 		ib[3] = 0x14141414;
-		clean_dcache64((addr64_t)(gpu_pool_pa + gpu_bos[(uint32_t)h - 1].off), 16, TRUE);
+		gpu_pool_sync(gpu_bos[(uint32_t)h - 1].off, 16, false);
 		const uint64_t ibva = ws, ibbytes = 16;
 		err = pandora_gpu_submit(c, &ibva, &ibbytes, 1, &fence);
 		int w = err ? err : pandora_gpu_wait(fence, 1000000000ull);
-		flush_dcache64((addr64_t)(gpu_pool_pa + gpu_bos[(uint32_t)h - 1].off + 0x8000), 64, TRUE);
+		gpu_pool_sync(gpu_bos[(uint32_t)h - 1].off + 0x8000, 64, true);
 		uint32_t v = *(const volatile uint32_t *)(va + 0x8000);
 		good = !err && !w && v == 0x14141414;
 		printf("PANDORA GPU: self-test submit -> %d fence %llu wait -> %d, word %08x; timestamp %llu\n",

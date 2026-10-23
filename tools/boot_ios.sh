@@ -83,6 +83,10 @@ if [ -n "$FW" ]; then
 	fwnow=$(pinned_extents "$FW")
 	ADTFLAGS="$ADTFLAGS --fw-extents $(wslpath_of "$fwnow")"
 fi
+# GPUPOOL=MIB (environment): RAM carved off for the GPU buffer pool (mkadt_pandora.py --gpu-pool).
+if [ -n "${GPUPOOL:-}" ]; then
+	ADTFLAGS="$ADTFLAGS --gpu-pool $GPUPOOL"
+fi
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
 # KERNEL=/opt/work/plk/kN-amfi.macho (tools/mkprelink.py) and TRUSTCACHE="IPSW trust cache..."

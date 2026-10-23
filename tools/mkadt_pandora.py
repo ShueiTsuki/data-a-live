@@ -15,6 +15,9 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            /chosen pandora-log-extents + pandora-log-blocks, same layout.
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
+  --gpu-pool MIB       carve MIB MiB below the panic log off the RAM given to XNU for the GPU
+           buffer pool (pandora_gpu.c): /chosen pandora-gpu-pool = <u64 base, u64 size>.
+           XNU never manages those pages, so mapping them by physical address is plain.
 """
 import hashlib, json, os, struct, sys, zlib
 
@@ -151,7 +154,7 @@ def empty_nvram_proxy():
             ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
 
 
-def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
+def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
     """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     fb, fb_size, fb_w, fb_h, fb_stride = ((QEMU_FB, QEMU_FB_SIZE, QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE)
@@ -159,6 +162,11 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=()):
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
+    # And the GPU buffer pool below it, likewise outside what the kernel allocates from.
+    if gpu_pool:
+        assert gpu_pool % 0x100000 == 0 and gpu_pool < mem_size // 2, 'gpu pool size'
+        mem_size -= gpu_pool
+        root_props = list(root_props) + [('pandora-gpu-pool', u64(phys_base + mem_size) + u64(gpu_pool))]
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu or qemu_gic else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -363,7 +371,10 @@ if __name__ == '__main__':
         print(f'fw extents: {len(fp[0][1]) // 24}, {struct.unpack("<Q", fp[1][1])[0]} blocks',
               file=sys.stderr)
         props = list(props) + fp
-    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props)
+    pool = int(opt('--gpu-pool'), 0) << 20 if opt('--gpu-pool') else 0
+    if pool:
+        print(f'gpu pool: {pool >> 20} MiB', file=sys.stderr)
+    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props, gpu_pool=pool)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
