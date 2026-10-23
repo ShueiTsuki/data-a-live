@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index 95388f5..0e67761 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -10,8 +10,7 @@
+  * 0x4147 makes an AGXDeviceUserClient (the class name Apple's sandbox profiles allow). Every
+  * method is struct-in/struct-out with exact sizes; any selector also accepts the tunnel
+  * {u32 'NTNL', u32 method, payload}, and method 0xffffffff is the probe Turnip sends.
+- * Not yet: the IOAcceleratorES discovery class for Metal, host import (16), queues (11, 12),
+- * status (8).
++ * Not yet: host import (16), queues (11, 12). Status (8) answers zero counts (patch 0186).
+  */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(SWEET)
+@@ -138,7 +137,7 @@ static const uint16_t pandora_gpu_sizes[17][2] = {
+ 	{ sizeof(NativeAdrenoAbiSubmit), sizeof(NativeAdrenoAbiSubmitReply) },
+ 	{ sizeof(NativeAdrenoAbiWaitFence), 0 },
+ 	{ 0, sizeof(NativeAdrenoAbiTimestamp) },
+-	{ 0xffff, 0xffff },
++	{ 0, sizeof(NativeAdrenoAbiStatus) },
+ 	{ sizeof(NativeAdrenoAbiMetadata), 0 },
+ 	{ sizeof(NativeAdrenoAbiMetadata), sizeof(NativeAdrenoAbiMetadata) },
+ 	{ 0xffff, 0xffff },
+@@ -215,6 +214,12 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
+ 		memcpy(&a, in, sizeof(a));
+ 		return pandora_gpu_ret(pandora_gpu_wait(a.fence, a.timeout_ns));
+ 	}
++	case NativeAdrenoMethodGetStatus: {
++		/* No GPU fault or suspend is counted yet: both stay 0, which Turnip reads as "context intact". */
++		NativeAdrenoAbiStatus r = { 0, 0 };
++		memcpy(out, &r, sizeof(r));
++		return kIOReturnSuccess;
++	}
+ 	case NativeAdrenoMethodGetTimestamp: {
+ 		NativeAdrenoAbiTimestamp r = { pandora_gpu_timestamp() };
+ 		memcpy(out, &r, sizeof(r));

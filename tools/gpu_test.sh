@@ -20,7 +20,7 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
-WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0185-amfi.macho LEVEL=15 ARGS= METAL=1
+WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0186-amfi.macho LEVEL=15 ARGS= METAL=1
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
