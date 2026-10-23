@@ -84,13 +84,13 @@ if [ $HAVE_METAL = 1 ]; then
 	PARTS+=("$(winp "$T/NativeAdrenoMetal")" "$(winp "$T/NativeAdrenoMetal.Info.plist")"
 		"$(winp "$T/NativeAdrenoMetal.clients")" "$(winp "$T/mtltest")")
 	case " $CLIENTS " in *" backboardd "*)
-		# With a Metal device the render server picks the 10-bit 'b3a8' deep framebuffer (bb2 log), which
-		# the display copy takes as BGRA; UniXNU's add-gpu-plugin-data.py turns that and the compression
-		# off in the render server's preferences for mobile and root. Only backboardd's own domain here:
-		# the installer writes whole files and .GlobalPreferences holds the language and the rest.
-		python -I -c "import plistlib, sys; open(sys.argv[1], 'wb').write(plistlib.dumps({'CAEnableDeepFramebuffer': False, 'CAEnableFramebufferCompression': False, 'CAEnableIOSurfaceCompression': False}, fmt=plistlib.FMT_BINARY))" "$(winp "$T/backboardd.plist")"
-		printf 'backboardd.plist 644 /private/var/mobile/Library/Preferences/backboardd.plist\nbackboardd.plist 644 /private/var/root/Library/Preferences/backboardd.plist\n' >> "$T/files.txt"
-		PARTS+=("$(winp "$T/backboardd.plist")") ;;
+		# With a Metal device the render server picks the two-plane 10-bit 'b3a8' deep framebuffer (bb2
+		# log); UniXNU's add-gpu-plugin-data.py turns that and the compressions off in its preferences.
+		# Its domain is com.apple.backboardd (bb4: a backboardd.plist is not read); the file keeps what
+		# the phone's held (tools/metal/backboardd_prefs.py). .GlobalPreferences is left alone.
+		python -I "$(winp "$ROOT/tools/metal/backboardd_prefs.py")" "$(winp "$T/com.apple.backboardd.plist")"
+		printf 'com.apple.backboardd.plist 600 /private/var/mobile/Library/Preferences/com.apple.backboardd.plist\n' >> "$T/files.txt"
+		PARTS+=("$(winp "$T/com.apple.backboardd.plist")") ;;
 	esac
 fi
 cat "$T/files.txt"
