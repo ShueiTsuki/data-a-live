@@ -2,7 +2,7 @@
 # One GPU test round on the phone, from Git Bash:
 #
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
-#                     [--clients "NAMES"] [--no-vktest]
+#                     [--clients "NAMES"] [--no-vktest] [--pool MIB]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -22,7 +22,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
-SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest"
+SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
 	--args) ARGS=$2; shift 2 ;;
 	--no-metal) METAL=0; shift ;;
 	--clients) CLIENTS=$2; shift 2 ;;     # NativeAdrenoMetal.clients: processes the plugin gives a device
+	--pool) POOL=$2; shift 2 ;;            # MiB carved for the GPU (0: none)
 	--no-vktest) SWAP=; shift ;;          # vktest not run (launchd restarts it all boot, mtltest with it)
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
@@ -118,7 +119,7 @@ fi
 
 echo "== 5. boot"
 TC="/opt/work/ipsw/Firmware/087-86698-044.dmg.trustcache /opt/work/ipsw/Firmware/087-86593-047.dmg.trustcache+/opt/work/ipsw/Firmware/087-86715-047.dmg.trustcache+/opt/work/gputest/$NAME.tc"
-GPUPOOL=1024 KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
+GPUPOOL=${POOL#0} KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
 	"pandora_gpu=$LEVEL $SWAP $ARGS" 2>&1 | grep -v NodeJS | tail -4
 
 echo "== 6. results"
