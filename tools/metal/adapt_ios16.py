@@ -43,6 +43,32 @@ edit('NativeAdrenoMetalPlugin.mm',
      """static void reportDisplayState(Gpu &gpu) {
     if (gReports >= 0) return;   // ios-pandora: the addresses below are iPadOS 17.7.11 QuartzCore's, not iOS 16's
     ++gReports;""")
+edit('NativeAdrenoMetalPlugin.mm',
+     """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    return device;""",
+     """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    else if (!strcmp(getprogname(), "backboardd")) {
+        // ios-pandora: the render server as a client (no publish mode here): what it reads for the deep
+        // framebuffer, and the bridge's telemetry (refused surfaces, last problems) every 30 s.
+        CFTypeRef deep = CFPreferencesCopyAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFPreferencesCurrentApplication);
+        NSLog(@"pandora-metal: backboardd has a device; CAEnableDeepFramebuffer %@", (__bridge id)deep);
+        if (deep) CFRelease(deep);
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, [](void *) -> void * {
+                static char table[6144];
+                for (unsigned round = 0; round < 10; ++round) {
+                    sleep(30);
+                    native_bridge_metal_telemetry(table, sizeof table);
+                    for (char *line = table, *end; *line; line = end) {
+                        end = strchr(line, '\\n');
+                        if (end) *end++ = 0; else end = line + strlen(line);
+                        NSLog(@"pandora-metal T%u %s", round, line);
+                    }
+                }
+                return nullptr;
+            }, nullptr) == 0) pthread_detach(thread);
+    }
+    return device;""")
 edit('NativeBridgeMetalFrontend.mm',
      """ if(!base || class_getInstanceSize(base)!=536){""",
      """ // ios-pandora: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
