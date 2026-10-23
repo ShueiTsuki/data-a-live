@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index d839ee6..5f5c8fb 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -112,6 +112,20 @@ scm_smc(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, ui
+ 	}
+ }
+ 
++/* For bsd/dev/pandora_gpu.c: an SCM call, results in a0 and a1. */
++void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
++    uint64_t *a1);
++
++void
++pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
++    uint64_t *a1)
++{
++	struct scm_res r;
++	scm_smc(fn, arginfo, x2, x3, 0, 0, &r);
++	*a0 = r.a0;
++	*a1 = r.a1;
++}
++
+ #define SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | ((cmd) & 0xff))
+ #define SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
+ #define SCM_RW            2u
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index d71ab24..3586518 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -17,6 +17,13 @@
+  * RETAIN_FF already set): clear SW_COLLAPSE in the CX GDSCR and poll PWR_ON in its
+  * gds_hw_ctrl; enable the SMMU vote clock and gpu_cc_ahb and poll CLK_OFF; then the level 1
+  * SMMU and GMU reads again under the same gating. The GMU clocks stay off (level 3).
++ * (gpu2 log: CX on, all 24 SMRs free, GMU held in reset and idle, GMU clock on XO.)
++ *
++ * Level 3 (patch 0164): what Linux and KGSL gen8 do between the GMU clocks and the GMU
++ * boot, without PLL0 (the GMU keeps its 19.2 MHz XO clock for now): the GPU votes on
++ * GPLL0 (GCC 0x52000 bits 15/16), then SCM GPU_INIT_REGS (SIP svc 0x28 cmd 1, one
++ * argument: ALWAYS_EN | TSENSE_EN = 0x9, bits from include/linux/firmware/qcom/qcom_scm.h),
++ * after asking whether the call exists; then GPUCC and the GMU state are read again.
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -33,8 +40,17 @@
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3,
++    uint64_t *a0, uint64_t *a1);  /* bsd/dev/pandora_adsp.c */
+ void pandora_gpu_init(void);
+ 
++#define SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | ((cmd) & 0xff))
++#define SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
++#define SCM_SVC_GPU       0x28u
++#define SCM_GPU_INIT_REGS 0x01u
++#define GPU_ALWAYS_EN_REQ (1u << 0)
++#define GPU_TSENSE_EN_REQ (1u << 3)
++
+ #define GCC_PA            0x00100000u
+ #define GCC_GPU_CFG_AHB   0x71004u     /* gcc_gpu_cfg_ahb_clk CBCR */
+ #define GCC_GEMNOC_GFX    0x71010u     /* gcc_gpu_gemnoc_gfx_clk CBCR */
+@@ -360,6 +376,33 @@ gpu_level2(void)
+ 	return a && s;
+ }
+ 
++/* Level 3: GPLL0 votes for the GPU, then SCM GPU_INIT_REGS. */
++static bool
++gpu_level3(void)
++{
++	vm_offset_t gcc52 = ml_io_map(GCC_PA + GCC_GPLL0_VOTE, 0x1000);
++	if (!gcc52) {
++		printf("PANDORA GPU: GCC not mapped\n");
++		return false;
++	}
++	gpu_step("GPLL0 votes for the GPU (GCC 0x52000 bits 15/16)");
++	uint32_t v = gpu_rd(gcc52, 0);
++	gpu_wr(gcc52, 0, v | (1u << 15) | (1u << 16));
++	delay(50);
++	printf("PANDORA GPU: gpll0_vote %08x -> %08x\n", v, gpu_rd(gcc52, 0));
++
++	uint64_t a0, a1;
++	uint64_t id = (2ULL << 24) | (SCM_SVC_GPU << 8) | SCM_GPU_INIT_REGS;
++	pandora_scm_call(SCM_FN(6, 1), SCM_ARGS(1), id, 0, &a0, &a1);
++	printf("PANDORA GPU: SCM is_call_avail(gpu, init_regs) -> a0 %#llx a1 %#llx\n", a0, a1);
++	gpu_step("SCM GPU_INIT_REGS (ALWAYS_EN | TSENSE_EN)");
++	pandora_scm_call(SCM_FN(SCM_SVC_GPU, SCM_GPU_INIT_REGS), SCM_ARGS(1),
++	    GPU_ALWAYS_EN_REQ | GPU_TSENSE_EN_REQ, 0, &a0, &a1);
++	printf("PANDORA GPU: SCM GPU_INIT_REGS(%#x) -> a0 %#llx a1 %#llx\n",
++	    GPU_ALWAYS_EN_REQ | GPU_TSENSE_EN_REQ, a0, a1);
++	return a0 == 0;
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -367,7 +410,8 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
+-	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock)\n", level);
++	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
++	    "3 = GPLL0 vote and GPU_INIT_REGS)\n", level);
+ 	gpu_cmddb();
+ 	if (gpu_read_cc(true)) {
+ 		gpu_read_smmu();
+@@ -380,6 +424,12 @@ gpu_thread(void *arg, wait_result_t result)
+ 				gpu_read_smmu();
+ 				gpu_read_gmu();
+ 			}
++			if (on && level >= 3) {
++				bool ok = gpu_level3();
++				printf("PANDORA GPU: level 3 %s\n", ok ? "done" : "SCM call failed");
++				(void)gpu_read_cc(false);
++				gpu_read_gmu();
++			}
+ 		}
+ 	}
+ 	printf("PANDORA GPU: done\n");
