@@ -6,7 +6,8 @@
 # fine for quick tests; build release kernels in CI.
 set -euo pipefail
 R=/opt/work/run$1; OUT=$2; shift 2
-LOG=/opt/work/run48/run48.full.log
+# CI log of an xnu.yml run (compile and link command lines); kept outside the runN dirs.
+LOG=/opt/work/cilog/xnu-ci-54.full.log
 B=$R/bt-local
 rm -rf $B && mkdir -p $B && cp -r $R/bt/build $R/bt/fakeroot $R/bt/sdk-kernel-platform $B/ && cp -r /opt/work/tree $B/xnu
 O=$OUT/objs; rm -rf $OUT && mkdir -p $O

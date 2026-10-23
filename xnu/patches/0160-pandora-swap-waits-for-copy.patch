@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ff49777..b797395 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -246,6 +246,7 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	bool          fCopying;     /* the vsync timer is copying the frame it took from fPending */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -814,12 +815,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fCopying = true;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		IOLockLock(fb->fLock);
++		fb->fCopying = false;
++		IOLockWakeup(fb->fLock, &fb->fCopying, false);
++		IOLockUnlock(fb->fLock);
+ 	}
+ 	sweet_fb_rearm(fb, sender);
+ }
+@@ -868,6 +874,16 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fuxi_perf_swap();
+ #endif
+ 	IOLockLock(fLock);
++#if defined(PANDORA)
++	if (fDirty || fCopying) {
++		uint64_t deadline;
++		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &deadline);
++		deadline += mach_absolute_time();
++		while ((fDirty || fCopying) && !fPowerOff && mach_absolute_time() < deadline) {
++			IOLockSleepDeadline(fLock, &fCopying, *(AbsoluteTime *)&deadline, THREAD_UNINT);
++		}
++	}
++#endif
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fStatSwaps++;
+ 	if (fDirty) {
