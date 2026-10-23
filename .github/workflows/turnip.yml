@@ -146,6 +146,14 @@ jobs:
           cp SHA256SUMS SHA256SUMS.metal
           gh release upload turnip-ci NativeAdrenoMetal NativeAdrenoMetal.Info.plist mtltest SHA256SUMS.metal --clobber
 
+      # The Metal build log on the pre-release too (artifacts need a sign-in; the release does not).
+      - name: Metal log to the pre-release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f out/metal.log ] && gh release upload turnip-ci out/metal.log --clobber || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
