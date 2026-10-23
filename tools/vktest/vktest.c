@@ -6,6 +6,7 @@
  *   2. buffer: vkCmdFillBuffer and vkCmdUpdateBuffer into host-visible memory, read back
  *   3. image: vkCmdClearColorImage on a 64x64 RGBA8 image, copied to a buffer, read back
  *   4. compute: fill.comp (64 x 64 invocations) compiled by Turnip on the phone, run, read back
+ *   5. draw: a triangle (tri.vert, tri.frag) into a 64x64 render target, copied back and checked
  * The driver is dlopen'd from /usr/lib/libvulkan_freedreno.dylib (no Vulkan loader on iOS) and
  * reached through vk_icdGetInstanceProcAddr. stdout and stderr go to /dev/console, so Mesa's own
  * messages land in the kernel log next to the "VKTEST:" lines.
@@ -19,6 +20,8 @@
 #include <unistd.h>
 #include <vulkan/vulkan_core.h>
 #include "fill_spv.h"           /* fill.comp as SPIR-V, made by glslangValidator in build_ios.sh */
+#include "tri_vert_spv.h"       /* tri.vert */
+#include "tri_frag_spv.h"       /* tri.frag */
 
 #define DRIVER "/usr/lib/libvulkan_freedreno.dylib"
 
@@ -360,6 +363,132 @@ main(void)
 			}
 			say("VKTEST: part 4: words %08x %08x ... %08x, %u of 4096 wrong (first at %u)%s", p[0], p[1], p[4095],
 			    bad, bad ? first : 0, bad ? " FAIL" : "");
+			failures += bad != 0;
+		}
+	}
+	/* ---- part 5: a triangle (tri.vert, tri.frag) into a 64x64 render target, copied back ---- */
+	{
+		DFN(vkCreateShaderModule);
+		DFN(vkCreatePipelineLayout);
+		DFN(vkCreateImageView);
+		DFN(vkCreateRenderPass);
+		DFN(vkCreateFramebuffer);
+		DFN(vkCreateGraphicsPipelines);
+		DFN(vkCmdBeginRenderPass);
+		DFN(vkCmdEndRenderPass);
+		DFN(vkCmdBindPipeline);
+		DFN(vkCmdDraw);
+		VkImageCreateInfo ti = ii;
+		ti.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		VkImage timg;
+		VkDeviceMemory tmem;
+		if (check("part 5: vkCreateImage", vkCreateImage(dev, &ti, NULL, &timg))) {
+			goto done;
+		}
+		vkGetImageMemoryRequirements(dev, timg, &mr);
+		mai.allocationSize = mr.size;
+		mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (check("part 5: vkAllocateMemory", vkAllocateMemory(dev, &mai, NULL, &tmem)) ||
+		    check("part 5: vkBindImageMemory", vkBindImageMemory(dev, timg, tmem, 0))) {
+			goto done;
+		}
+		VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, timg, VK_IMAGE_VIEW_TYPE_2D,
+			VK_FORMAT_R8G8B8A8_UNORM, { 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+		VkImageView view;
+		VkAttachmentDescription att = { 0, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR,
+			VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL };
+		VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+		VkSubpassDescription sp = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ref, NULL, NULL, 0, NULL };
+		VkSubpassDependency dep = { 0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, 0 };
+		VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &att, 1, &sp, 1, &dep };
+		VkRenderPass rp;
+		if (check("part 5: vkCreateImageView", vkCreateImageView(dev, &vi, NULL, &view)) ||
+		    check("part 5: vkCreateRenderPass", vkCreateRenderPass(dev, &rpi, NULL, &rp))) {
+			goto done;
+		}
+		VkFramebufferCreateInfo fbi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &view, 64, 64, 1 };
+		VkFramebuffer fb;
+		VkShaderModuleCreateInfo vsi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(tri_vert_spv), tri_vert_spv };
+		VkShaderModuleCreateInfo fsi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(tri_frag_spv), tri_frag_spv };
+		VkShaderModule vs, fs;
+		VkPipelineLayoutCreateInfo epli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL, 0, NULL };
+		VkPipelineLayout epl;
+		if (check("part 5: vkCreateFramebuffer", vkCreateFramebuffer(dev, &fbi, NULL, &fb)) ||
+		    check("part 5: vkCreateShaderModule (vertex)", vkCreateShaderModule(dev, &vsi, NULL, &vs)) ||
+		    check("part 5: vkCreateShaderModule (fragment)", vkCreateShaderModule(dev, &fsi, NULL, &fs)) ||
+		    check("part 5: vkCreatePipelineLayout", vkCreatePipelineLayout(dev, &epli, NULL, &epl))) {
+			goto done;
+		}
+		VkPipelineShaderStageCreateInfo stages[2] = {
+			{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
+			{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL },
+		};
+		VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+		VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+			VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE };
+		VkViewport vp = { 0, 0, 64, 64, 0, 1 };
+		VkRect2D sc = { { 0, 0 }, { 64, 64 } };
+		VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc };
+		VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0,
+			VK_FALSE, VK_FALSE, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f };
+		VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0,
+			VK_SAMPLE_COUNT_1_BIT };
+		VkPipelineColorBlendAttachmentState cba = { VK_FALSE };
+		cba.colorWriteMask = 0xf;
+		VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0,
+			VK_FALSE, VK_LOGIC_OP_COPY, 1, &cba };
+		VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, stages, &vin, &ia,
+			NULL, &vps, &rs, &ms, NULL, &cbs, NULL, epl, rp, 0, VK_NULL_HANDLE, -1 };
+		VkPipeline gp;
+		if (check("part 5: vkCreateGraphicsPipelines (Turnip compiles both shaders)",
+		    vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &gp))) {
+			goto done;
+		}
+		VkClearValue black = { .color = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } } };
+		VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, sc, 1, &black };
+		vkResetFences(dev, 1, &fence);
+		vkResetCommandBuffer(cb, 0);
+		vkBeginCommandBuffer(cb, &cbi);
+		vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gp);
+		vkCmdDraw(cb, 3, 1, 0, 0);
+		vkCmdEndRenderPass(cb);
+		vkCmdCopyImageToBuffer(cb, timg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+		vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, NULL, 0, NULL);
+		vkEndCommandBuffer(cb);
+		if (!check("part 5: vkQueueSubmit", vkQueueSubmit(queue, 1, &si, fence)) &&
+		    !check("part 5: vkWaitForFences", vkWaitForFences(dev, 1, &fence, VK_TRUE, 2000000000ull))) {
+			VkMappedMemoryRange range = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, mem, 0, VK_WHOLE_SIZE };
+			vkInvalidateMappedMemoryRanges(dev, 1, &range);
+			/* Covered: x + y < 63 (the diagonal from top-right to bottom-left); exact edge pixels
+			 * depend on the rasterizer's rules, so only pixels clearly inside or outside count. */
+			unsigned green = 0, black_px = 0, other = 0, bad = 0;
+			for (unsigned y = 0; y < 64; y++) {
+				for (unsigned x = 0; x < 64; x++) {
+					uint32_t v = p[y * 64 + x];
+					green += v == 0xff00ff00u;
+					black_px += v == 0xff000000u;
+					other += v != 0xff00ff00u && v != 0xff000000u;
+					if (x + y + 2 < 63) {
+						bad += v != 0xff00ff00u;
+					} else if (x + y > 63 + 2) {
+						bad += v != 0xff000000u;
+					}
+				}
+			}
+			say("VKTEST: part 5: pixel (8,8) %08x (56,56) %08x; green %u black %u other %u; %u clearly wrong%s",
+			    p[8 * 64 + 8], p[56 * 64 + 56], green, black_px, other, bad, bad ? " FAIL" : "");
+			for (unsigned y = 0; y < 64; y += 8) {
+				char row[65];
+				for (unsigned x = 0; x < 64; x++) {
+					uint32_t v = p[y * 64 + x];
+					row[x] = v == 0xff00ff00u ? '#' : v == 0xff000000u ? '.' : '?';
+				}
+				row[64] = 0;
+				say("VKTEST: part 5: row %2u %s", y, row);
+			}
 			failures += bad != 0;
 		}
 	}

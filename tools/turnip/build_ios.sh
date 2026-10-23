@@ -56,6 +56,8 @@ install_name_tool -id /usr/lib/libvulkan_freedreno.dylib "$LIB"
 "$STRIP" -x "$LIB"
 nm -gU "$LIB" | grep -q ' T _vk_icdGetInstanceProcAddr' || { echo "no vk_icdGetInstanceProcAddr"; exit 1; }
 glslangValidator -V --target-env vulkan1.1 --vn fill_spv -o "$B/fill_spv.h" "$ROOT/tools/vktest/fill.comp"
+glslangValidator -V --target-env vulkan1.1 --vn tri_vert_spv -o "$B/tri_vert_spv.h" "$ROOT/tools/vktest/tri.vert"
+glslangValidator -V --target-env vulkan1.1 --vn tri_frag_spv -o "$B/tri_frag_spv.h" "$ROOT/tools/vktest/tri.frag"
 "$CC" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -I "$MESA/include" -I "$B" \
 	"$ROOT/tools/vktest/vktest.c" -o "$OUT/vktest"
 codesign -s - -f "$LIB" "$OUT/vktest"
