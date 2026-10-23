@@ -38,6 +38,8 @@ jobs:
 
       - name: Sources
         run: |
+          mkdir -p out
+          exec > >(tee -a out/build.log) 2>&1
           fetch() {  # DIR URL SHA
             git init -q "$1"
             git -C "$1" fetch -q --depth 1 "$2" "$3"
@@ -55,7 +57,22 @@ jobs:
           ls nativeadreno/NativeAdrenoABI.h
 
       - name: Build
-        run: bash tools/turnip/build_ios.sh mesa nativeadreno out
+        run: |
+          mkdir -p out
+          set -o pipefail
+          bash tools/turnip/build_ios.sh mesa nativeadreno out 2>&1 | tee -a out/build.log
+
+      # Logs need a GitHub sign-in; the run's summary page does not, so errors and the tail go there.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### errors'; echo '```'
+            grep -E 'error:|FAILED:|fatal|ERROR:' out/build.log 2>/dev/null | head -60 || true
+            echo '```'; echo '### last lines'; echo '```'
+            tail -40 out/build.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -65,5 +82,6 @@ jobs:
             out/libvulkan_freedreno.dylib
             out/vktest
             out/SHA256SUMS
+            out/build.log
             out/build/tu/meson-logs/meson-log.txt
           if-no-files-found: warn
