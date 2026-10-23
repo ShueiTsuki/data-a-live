@@ -130,6 +130,9 @@
  * Patch 0183: gpu_step no longer waits 3.5 s for the log flush unless pandora_gpu_slow=1.
  * Patch 0187: imported buffers (BoImport, an IOSurface's pages): mapped page by page with one TLB
  * invalidate, cleaned and invalidated from the CPU caches before each submission of their client.
+ * (mtl2 log: Metal renders into an IOSurface, read back by the CPU, 10/10. bb1 log: backboardd as
+ * a Metal client keeps its device, but the frame dumped at 130 s is black.)
+ * Patch 0189: per-client counts and a watch log of them, the ring and SMMU faults (gpu_watch).
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -148,6 +151,7 @@
 #include <arm/caches_internal.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <sys/proc.h>
 #include <pexpert/device_tree.h>
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 extern void ml_io_unmap(vm_offset_t, vm_size_t);
@@ -574,6 +578,7 @@ struct smmu_ctx {
 	vm_offset_t tva;                /* table pool: kernel address, size in pages, next unused page */
 	unsigned tpages, tnext;
 	unsigned bank;
+	uint32_t cb;                    /* the context bank's page in the SMMU window (FSR at +0x58) */
 };
 static struct smmu_ctx gmu_smmu, gpu_smmu;
 
@@ -676,6 +681,7 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned 
 	uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
 	uint64_t numpage = 1ull << (((id1 >> 28) & 7) + 1);
 	uint64_t cb = numpage * page + bank * page;
+	c->cb = (uint32_t)cb;
 	if (cb + 0x1000 > SMMU_SIZE) {
 		printf("PANDORA GPU: context bank %u at %#llx outside the window\n", bank, cb);
 		return false;
@@ -2197,6 +2203,8 @@ gpu_bo_release(struct gpu_bo *b)
 static struct {
 	bool used, reset;
 	uint64_t va_start, va_size;
+	char name[24];                  /* the opening process (patch 0189: the watch log) */
+	uint32_t allocs, imports, maps, submits, frees, fence;
 } gpu_clients[GPU_MAX_CLIENTS];
 static const uint64_t gpu_window[GPU_MAX_CLIENTS][2] = {
 	{ 0x20000000ull, 0x40000000ull }, { 0x60000000ull, 0xaaa9000ull },
@@ -2288,6 +2296,9 @@ pandora_gpu_open(void)
 			gpu_clients[i].reset = true;
 			gpu_clients[i].va_start = gpu_window[i][0];
 			gpu_clients[i].va_size = gpu_window[i][1];
+			gpu_clients[i].allocs = gpu_clients[i].imports = gpu_clients[i].maps = 0;
+			gpu_clients[i].submits = gpu_clients[i].frees = gpu_clients[i].fence = 0;
+			proc_selfname(gpu_clients[i].name, sizeof(gpu_clients[i].name));
 			c = (int)i;
 		}
 	}
@@ -2345,6 +2356,7 @@ pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *
 			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
 			*handle = ((uint64_t)b->gen << 32) | (i + 1);
 			err = 0;
+			gpu_clients[client].allocs++;
 		}
 		break;
 	}
@@ -2371,6 +2383,7 @@ pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
 	} else {
 		b->iova = iova;
 		b->perm = perm;
+		gpu_clients[client].maps++;
 	}
 	lck_mtx_unlock(&gpu_lock);
 	return err;
@@ -2393,6 +2406,7 @@ pandora_gpu_bo_free(int client, uint64_t handle)
 		err = EBUSY;
 	} else {
 		gpu_bo_release(b);
+		gpu_clients[client].frees++;
 	}
 	lck_mtx_unlock(&gpu_lock);
 	return err;
@@ -2447,6 +2461,7 @@ pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, 
 				              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref };
 			*handle = ((uint64_t)b->gen << 32) | (i + 1);
 			err = 0;
+			gpu_clients[client].imports++;
 			break;
 		}
 	}
@@ -2558,6 +2573,8 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 		}
 		uint32_t thread = first == 0x70970001u ? 3 : 1;
 		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
+		gpu_clients[client].submits++;
+		gpu_clients[client].fence = (uint32_t)*fence;
 		gpu_clients[client].reset = false;
 	}
 	lck_mtx_unlock(&gpu_lock);
@@ -2848,6 +2865,53 @@ gpu_level14(bool rest)
 	return good;
 }
 
+/*
+ * Patch 0189, with pandora_gpu_metal=1: every 5 s for 5 minutes, what each client has done
+ * (allocations, imports, mappings, frees, submissions, its last fence), the ring timestamp, and
+ * any GPU SMMU context fault (FSR, FAR, FSYNR0 of bank 0; cleared once logged); a line only when
+ * something changed. Which process renders through the GPU, and whether the GPU faults on it.
+ */
+static void
+gpu_watch(void)
+{
+	char last[GPU_MAX_CLIENTS][96] = {};
+	uint32_t last_ring = ~0u;
+	for (unsigned t = 0; t < 60; t++) {
+		gpu_sleep(5000);
+		lck_mtx_lock(&gpu_lock);
+		for (unsigned i = 0; i < GPU_MAX_CLIENTS; i++) {
+			char now[96];
+			if (!gpu_clients[i].used) {
+				snprintf(now, sizeof(now), "-");
+			} else {
+				snprintf(now, sizeof(now), "%s alloc %u import %u map %u free %u submit %u fence %u",
+				    gpu_clients[i].name, gpu_clients[i].allocs, gpu_clients[i].imports, gpu_clients[i].maps,
+				    gpu_clients[i].frees, gpu_clients[i].submits, gpu_clients[i].fence);
+			}
+			if (strcmp(now, last[i]) != 0) {
+				printf("PANDORA GPU WATCH: %u s client %u: %s\n", (t + 1) * 5, i, now);
+				strlcpy(last[i], now, sizeof(last[i]));
+			}
+		}
+		const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
+		flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
+		uint32_t ring = mem[1], fsr = gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x58);
+		if (ring != last_ring || fsr) {
+			printf("PANDORA GPU WATCH: %u s ring timestamp %u (issued %u) rbbm %08x cp int %08x rptr %u wptr %u\n",
+			    (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(CP_INTERRUPT_STATUS_GLOBAL),
+			    gr(CP_RB_RPTR), ring_wptr);
+			last_ring = ring;
+		}
+		if (fsr) {
+			printf("PANDORA GPU WATCH: SMMU fault fsr %08x far %08x%08x fsynr0 %08x\n", fsr,
+			    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x64), gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x60),
+			    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x68));
+			gpu_wr(gpu_smmu_va, gpu_smmu.cb + 0x58, fsr);
+		}
+		lck_mtx_unlock(&gpu_lock);
+	}
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -2913,6 +2977,11 @@ gpu_thread(void *arg, wait_result_t result)
 															bool u = gpu_level14(level >= 15);
 															printf("PANDORA GPU: level 14 (user interface) %s\n",
 															    u ? "done" : "stopped");
+															int metal = 0;
+															(void)PE_parse_boot_argn("pandora_gpu_metal", &metal, sizeof(metal));
+															if (u && metal) {
+																gpu_watch();
+															}
 														}
 													}
 												}
