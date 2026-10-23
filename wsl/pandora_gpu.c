@@ -88,6 +88,11 @@
  * gpu_microcode_region (0x9959a000, 8 KiB) through pandora_adsp.c's loader (metadata in
  * ordinary contiguous memory, no SHM bridge of our own), then CP_SET_SECURE_MODE 0 in the
  * ring and a second CP_MEM_WRITE.
+ * (gpu11 log: init_image, mem_setup, auth_and_reset all 0; secure mode off; 0x5ec0ff00 written.)
+ *
+ * Level 12 (patch 0174): commands from a separate buffer as Mesa submits them: a page mapped at
+ * GPU address 0x400000 holding one CP_MEM_WRITE, called from the ring with CP_INDIRECT_BUFFER;
+ * then the BR and BV copies of CP_IB1_BASE / REM_SIZE / INIT_SIZE.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -1324,6 +1329,7 @@ static struct gmu_buf gpu_bufs[] = {
 	{ "ring", 0x00100000u, 0x8000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
 	{ "sqe", 0x00200000u, 0x20000u, ArmSmmu4KRead | ArmSmmu4KExecute, 0, 0 },
 	{ "scratch", 0x00300000u, 0x1000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
+	{ "ib", 0x00400000u, 0x1000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
 };
 #define GPU_NBUFS (sizeof(gpu_bufs) / sizeof(gpu_bufs[0]))
 
@@ -1598,6 +1604,52 @@ gpu_level11(void)
 	return secure_off && wrote;
 }
 
+/* ---- level 12: an indirect buffer ------------------------------------------------------------ */
+
+#define CP_IB1_BASE_PIPE          0x900u
+#define CP_IB1_REM_SIZE_PIPE      0x902u
+#define CP_IB1_INIT_SIZE_PIPE     0x903u
+
+static bool
+gpu_level12(void)
+{
+	bool ok;
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
+	(void)gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 100000, &ok);
+	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+	if (!ok) {
+		printf("PANDORA GPU: OOB GPU_SET NOT ACKED\n");
+		return false;
+	}
+	gpu_step("CP: CP_INDIRECT_BUFFER with a CP_MEM_WRITE inside");
+	uint32_t *ib = (uint32_t *)gpu_bufs[3].va;
+	ib[0] = pkt7(0x3d, 3);                  /* CP_MEM_WRITE */
+	ib[1] = (uint32_t)gpu_bufs[2].iova + 8;
+	ib[2] = 0;
+	ib[3] = 0x1b000012;
+	clean_dcache64((addr64_t)gpu_bufs[3].pa, 64, TRUE);
+	ring_put(pkt7(0x3f, 3));                /* CP_INDIRECT_BUFFER */
+	ring_put((uint32_t)gpu_bufs[3].iova);
+	ring_put(0);
+	ring_put(4);                            /* size in dwords */
+	ring_put(pkt7(0x12, 0));                /* CP_WAIT_MEM_WRITES */
+	ring_kick();
+	bool idle = ring_idle(1000);
+	flush_dcache64((addr64_t)gpu_bufs[2].pa, 64, TRUE);
+	uint32_t v = ((const uint32_t *)gpu_bufs[2].va)[2];
+	printf("PANDORA GPU: CP_INDIRECT_BUFFER %s: scratch[2] = %08x\n", idle ? "consumed" : "NOT consumed", v);
+	/* What the CP kept of the IB, per pipe (BR 1, BV 2) through the host aperture. */
+	for (uint32_t pipe = 1; pipe <= 2; pipe++) {
+		gw(CP_APERTURE_CNTL_HOST, pipe << 12);
+		printf("PANDORA GPU: %s IB1 base %08x%08x rem %08x init %08x\n", pipe == 1 ? "BR" : "BV",
+		    gr(CP_IB1_BASE_PIPE + 1), gr(CP_IB1_BASE_PIPE), gr(CP_IB1_REM_SIZE_PIPE),
+		    gr(CP_IB1_INIT_SIZE_PIPE));
+	}
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 31);
+	return idle && v == 0x1b000012;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -1606,7 +1658,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -1651,6 +1703,11 @@ gpu_thread(void *arg, wait_result_t result)
 												bool z = gpu_level11();
 												printf("PANDORA GPU: level 11 (zap, non-secure) %s\n",
 												    z ? "done" : "stopped");
+												if (z && level >= 12) {
+													bool i = gpu_level12();
+													printf("PANDORA GPU: level 12 (indirect buffer) %s\n",
+													    i ? "done" : "stopped");
+												}
 											}
 										}
 									}
