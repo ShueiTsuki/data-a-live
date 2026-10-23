@@ -120,6 +120,14 @@ def main():
             missing.append((path.split(CONFIG)[1], len(cands)))
             continue
         filelist.append(cands[0])
+    # Sources new since the CI run (a patch added the file) are not in its link.filelist:
+    # link their local objects too.
+    listed = {os.path.splitext(os.path.basename(f))[0].split('__')[-1].split('.')[0] for f in filelist}
+    for src in local_only:
+        stem = os.path.splitext(os.path.basename(src))[0]
+        if stem not in listed and len(have.get((None, stem), [])) == 1:
+            filelist.append(have[(None, stem)][0])
+            print(f'  new source linked: {src}')
     print(f'link.filelist: {len(filelist)} objects found, {len(missing)} not: {missing[:8]}')
     if ci:
         n_ci = sum(1 for f in filelist if f.startswith(ci))
