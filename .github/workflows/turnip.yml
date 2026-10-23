@@ -1,0 +1,63 @@
+name: turnip
+
+# Turnip (Mesa freedreno Vulkan) with UniXNU's Darwin kernel backend, cross-built for iOS 16
+# arm64, plus tools/vktest (tools/turnip/build_ios.sh). Mesa, UniXNU's patches and NativeAdreno's
+# ABI header are fetched at pinned commits; nothing from them is committed here.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: turnip-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UNIXNU_SHA: 1a01c2afa197d975d04da892325c56b6b14aaecb
+  NATIVEADRENO_SHA: b686b9054f57d393c80195b82568a09f8ca106a2
+  MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install glslang bison flex ninja
+          python3 -m venv venv
+          echo "$PWD/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Sources
+        run: |
+          fetch() {  # DIR URL SHA
+            git init -q "$1"
+            git -C "$1" fetch -q --depth 1 "$2" "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch unixnu https://github.com/UniXNU/UniXNU.git "$UNIXNU_SHA"
+          fetch nativeadreno https://github.com/UniXNU/NativeAdreno.git "$NATIVEADRENO_SHA"
+          fetch mesa https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa "$MESA_SHA" ||
+            fetch mesa https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SHA"
+          venv/bin/pip install -q -r unixnu/scripts/requirements-adreno-compiler.txt
+          for p in $(python3 -c 'import json; print(" ".join(json.load(open("unixnu/scripts/data/adreno-compiler-inputs.json"))["patches"]))'); do
+            echo "== $p"
+            git -C mesa apply --whitespace=nowarn "$PWD/unixnu/$p"
+          done
+          ls nativeadreno/NativeAdrenoABI.h
+
+      - name: Build
+        run: bash tools/turnip/build_ios.sh mesa nativeadreno out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnip-ios
+          path: |
+            out/libvulkan_freedreno.dylib
+            out/vktest
+            out/SHA256SUMS
+            out/build/tu/meson-logs/meson-log.txt
+          if-no-files-found: warn

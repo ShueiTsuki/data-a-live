@@ -30,14 +30,20 @@ def cdhash(path):
             sb = b[off:off + n]
             m, _, count = struct.unpack_from('>3I', sb, 0)
             assert m == CSMAGIC_EMBEDDED_SIGNATURE, f'{path}: no embedded signature'
+            # The CodeDirectory (slot 0) and alternates (0x1000..): codesign may write a SHA-1
+            # one in slot 0 and a SHA-256 one as an alternate; the kernel takes the best hash.
+            best = None
             for i in range(count):
                 typ, boff = struct.unpack_from('>2I', sb, 12 + 8 * i)
-                if typ == 0:
+                if typ == 0 or 0x1000 <= typ < 0x1005:
                     cm, clen = struct.unpack_from('>2I', sb, boff)
                     assert cm == CSMAGIC_CODEDIRECTORY
                     cd = sb[boff:boff + clen]
                     ht = cd[37]
-                    return HASHES[ht](cd).digest()[:20], ht
+                    if best is None or ht > best[1]:
+                        best = (HASHES[ht](cd).digest()[:20], ht)
+            if best:
+                return best
         at += size
     raise SystemExit(f'{path}: not signed')
 
