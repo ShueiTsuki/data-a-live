@@ -40,7 +40,8 @@ int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, 
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 uint64_t pandora_gpu_timestamp(void);
 uint32_t pandora_gpu_chip_id(void);
-int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle);
+int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, bool readonly,
+    uint64_t *handle);
 void pandora_gpu_release_ref(void *ref);
 }
 
@@ -289,6 +290,19 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 			return kIOReturnNoMemory;
 		}
 		IOReturn ret = md->prepare();
+		bool readonly = false;
+		if (ret == KERN_PROTECTION_FAILURE) {
+			/* A read-only mapping (bb9: a surface backboardd only reads): pinned for the
+			 * device to read, and mapped read-only for the GPU. */
+			md->release();
+			md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)a.address,
+			    (mach_vm_size_t)a.bytes, kIODirectionOut, task_);
+			if (md == nullptr) {
+				return kIOReturnNoMemory;
+			}
+			ret = md->prepare();
+			readonly = true;
+		}
 		if (ret != kIOReturnSuccess) {
 			md->release();
 			return ret;
@@ -301,7 +315,7 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 			pages[i] = md->getPhysicalSegment((IOByteCount)i << 12, &len, kIOMemoryMapperNone);
 			whole = pages[i] && !(pages[i] & 0xfff) && len >= 0x1000;
 		}
-		int err = whole ? pandora_gpu_bo_import(client_, pages, n, md, &r.handle) : EINVAL;
+		int err = whole ? pandora_gpu_bo_import(client_, pages, n, md, readonly, &r.handle) : EINVAL;
 		if (pages != nullptr) {
 			IOFreeData(pages, n * sizeof(uint64_t));
 		}

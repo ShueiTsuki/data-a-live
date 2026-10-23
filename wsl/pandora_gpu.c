@@ -2175,6 +2175,7 @@ struct gpu_bo {
 	uint64_t off, bytes, iova;      /* iova 0 = not mapped */
 	uint64_t *pages;                /* an imported buffer's 4K pages (BoImport, patch 0187), else NULL */
 	void *ref;                      /* its pinning descriptor, given back by pandora_gpu_release_ref */
+	bool readonly;                  /* imported pages the caller may only read: the GPU maps them read-only */
 	uint32_t meta_len;
 	char meta[64];
 };
@@ -2378,7 +2379,7 @@ pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
 	} else if (b->iova) {
 		err = EBUSY;
 	} else if (!smmu_map_pages(&gpu_smmu, iova, gpu_pool_pa + b->off, b->pages, b->bytes,
-	    ArmSmmu4KRead | ((perm & 2) ? ArmSmmu4KWrite : 0))) {
+	    ArmSmmu4KRead | ((perm & 2) && !b->readonly ? ArmSmmu4KWrite : 0))) {
 		err = EEXIST;
 	} else {
 		b->iova = iova;
@@ -2439,10 +2440,14 @@ pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token, ui
  * BoImport: a buffer over the caller's own pinned pages (an IOSurface's), PAGES[N] physical, REF
  * the descriptor that pins them. It keeps the caller's CPU mapping and cache mode; the GPU maps
  * it non-cacheable, and every submission of the client cleans and invalidates those pages first.
+ * READONLY: the caller's mapping is read-only (bb9: a surface backboardd only reads); the GPU
+ * mapping then has no write permission whatever BoMap asks.
  */
-int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle);
+int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, bool readonly,
+    uint64_t *handle);
 int
-pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle)
+pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, bool readonly,
+    uint64_t *handle)
 {
 	if (!n || n > (256u << 20) >> 12) {
 		return EINVAL;
@@ -2458,7 +2463,8 @@ pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, 
 		struct gpu_bo *b = &gpu_bos[i];
 		if (!b->used) {
 			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen,
-				              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref };
+				              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref,
+				              .readonly = readonly };
 			*handle = ((uint64_t)b->gen << 32) | (i + 1);
 			err = 0;
 			gpu_clients[client].imports++;
