@@ -4,7 +4,8 @@
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
-#      out-root/turnip/NAME and checks its SHA256SUMS
+#      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
+#      pre-release, and checks its SHA256SUMS
 #   2. trust cache for vktest and libvulkan_freedreno.dylib (tools/pgputest/mktc.py)
 #   3. the GPU firmware pack (tools/mkfwpack.py): gen80200_{gmu,sqe,zap} from out-root/fwpack_src,
 #      vktest, the Turnip library and files.txt installing them (bsd/dev/pandora_files.c)
@@ -37,7 +38,16 @@ PACK=$ROOT/out-root/fwpack-$NAME.img
 
 echo "== 1. Turnip artifact"
 rm -rf "$T" && mkdir -p "$T"
-python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
+if [ "$ZIP" = release ]; then
+	# The rolling turnip-ci pre-release (turnip.yml): public, no sign-in needed.
+	R=https://github.com/ShueiTsuki/ios-pandora/releases/download/turnip-ci
+	for f in libvulkan_freedreno.dylib vktest SHA256SUMS BUILD.txt; do
+		curl -sSfL --retry 3 -o "$T/$f" "$R/$f"
+	done
+	cat "$T/BUILD.txt"
+else
+	python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
+fi
 (cd "$T" && sha256sum -c SHA256SUMS)
 
 echo "== 2. trust cache"
