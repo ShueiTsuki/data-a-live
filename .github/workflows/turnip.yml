@@ -25,6 +25,8 @@ jobs:
   build:
     runs-on: macos-14
     timeout-minutes: 90
+    permissions:
+      contents: write         # the rolling turnip-ci pre-release
     steps:
       - uses: actions/checkout@v4
 
@@ -85,3 +87,16 @@ jobs:
             out/build.log
             out/build/tu/meson-logs/meson-log.txt
           if-no-files-found: warn
+
+      # Artifacts need a sign-in to download; the rolling pre-release turnip-ci does not, so the
+      # test machine fetches the build from there (the owner agreed to publish these outputs).
+      - name: Pre-release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "commit $GITHUB_SHA run $GITHUB_RUN_NUMBER" > out/BUILD.txt
+          gh release view turnip-ci >/dev/null 2>&1 || gh release create turnip-ci --prerelease \
+            --target "$GITHUB_SHA" --title "Turnip CI build (test only)" \
+            --notes "Rolling test build from .github/workflows/turnip.yml: Turnip (Mesa, MIT) with UniXNU's Darwin kernel backend for iOS 16 arm64, and tools/vktest, for on-device GPU tests. Not a release. BUILD.txt names the commit."
+          gh release upload turnip-ci out/libvulkan_freedreno.dylib out/vktest out/SHA256SUMS out/BUILD.txt --clobber
