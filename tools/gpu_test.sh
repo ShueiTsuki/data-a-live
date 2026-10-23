@@ -1,7 +1,7 @@
 #!/bin/bash
 # One GPU test round on the phone, from Git Bash:
 #
-#   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L]
+#   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME and checks its SHA256SUMS
@@ -19,13 +19,14 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
-WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0183-amfi.macho LEVEL=15
+WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0184-amfi.macho LEVEL=15 ARGS=
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
 	--secs) SECS=$2; shift 2 ;;
 	--kernel) KERNEL=$2; shift 2 ;;
 	--level) LEVEL=$2; shift 2 ;;
+	--args) ARGS=$2; shift 2 ;;
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -70,9 +71,9 @@ fi
 echo "== 5. boot"
 TC="/opt/work/ipsw/Firmware/087-86698-044.dmg.trustcache /opt/work/ipsw/Firmware/087-86593-047.dmg.trustcache+/opt/work/ipsw/Firmware/087-86715-047.dmg.trustcache+/opt/work/gputest/$NAME.tc"
 GPUPOOL=1024 KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
-	"pandora_gpu=$LEVEL sweetexecswap=bluetoothd:/usr/libexec/vktest" 2>&1 | grep -v NodeJS | tail -4
+	"pandora_gpu=$LEVEL sweetexecswap=bluetoothd:/usr/libexec/vktest $ARGS" 2>&1 | grep -v NodeJS | tail -4
 
 echo "== 6. results"
 L=$ROOT/device/logs/$NAME.txt
-grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|AMFI: .*(vktest|libvulkan)|dyld|panic\(" "$L" | cut -c1-240 | head -120
+grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA GPU UC: (AGX|client|open)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|AMFI: .*(vktest|libvulkan)|dyld|NativeAdrenoMetal|panic\(" "$L" | cut -c1-240 | head -120
 echo "VKTEST PASS $(grep -c 'VKTEST: PASS' "$L"), FAIL lines $(grep -c 'VKTEST: .*FAIL' "$L"), restarts $(grep -c 'restart type' "$L")"

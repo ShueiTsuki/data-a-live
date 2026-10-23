@@ -1,0 +1,117 @@
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index 26117c1..95388f5 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -21,6 +21,8 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <sys/errno.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ #include "NativeAdrenoABIv1.h"
+ 
+ extern "C" {
+@@ -345,9 +347,9 @@ PandoraAdrenoGpu::start(IOService *provider)
+ 	return true;
+ }
+ 
+-IOReturn
+-PandoraAdrenoGpu::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+-    __unused OSDictionary *properties, IOUserClient **handler)
++/* The open both services share: type 0x4147 makes an AGXDeviceUserClient attached to OWNER. */
++static IOReturn
++pandora_gpu_new_client(IOService *owner, task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
+ {
+ 	if (type != PANDORA_GPU_OPEN_TYPE) {
+ 		return kIOReturnUnsupported;
+@@ -371,14 +373,71 @@ PandoraAdrenoGpu::newUserClient(task_t owningTask, void *securityID, UInt32 type
+ 	}
+ 	uc->client_ = c;
+ 	uc->views_ = (IOMemoryDescriptor **)views;
+-	if (!uc->attach(this) || !uc->start(this)) {
+-		uc->detach(this);
++	if (!uc->attach(owner) || !uc->start(owner)) {
++		uc->detach(owner);
+ 		uc->clientClose();
+ 		uc->release();
+ 		return kIOReturnError;
+ 	}
+-	IOLog("PANDORA GPU UC: client %d opened\n", c);
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("PANDORA GPU UC: client %d opened by %s through %s\n", c, name, owner->getMetaClass()->getClassName());
+ 	*handler = uc;
+ 	return kIOReturnSuccess;
+ }
++
++IOReturn
++PandoraAdrenoGpu::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    __unused OSDictionary *properties, IOUserClient **handler)
++{
++	return pandora_gpu_new_client(this, owningTask, securityID, type, handler);
++}
++
++/*
++ * Metal's discovery (patch 0184): Metal.framework looks up IOServiceMatching("IOAcceleratorES")
++ * and loads /System/Library/Extensions/<MetalPluginName>.bundle, class MetalPluginClassName; Turnip's
++ * Darwin backend, without TU_DARWIN_SERVICE, also opens IOAcceleratorES (type 0x4147, NTNL tunnel).
++ * IOAcceleratorES here is the empty in-kernel class of the fuxi lane (FuxiAdrenoUserClient.cpp,
++ * compiled into this kernel; Apple's IOGPUFamily is not loaded), declared again to derive from it.
++ * The class is named AGXAccelerator as UniXNU's is, the name Apple's sandbox profiles accept. It is
++ * published only with boot-arg pandora_gpu_metal=1: once it exists, every process that starts
++ * Metal (backboardd first) finds it and goes looking for the plugin.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++class AGXAccelerator : public IOAcceleratorES {
++	OSDeclareDefaultStructors(AGXAccelerator);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AGXAccelerator, IOAcceleratorES);
++
++bool
++AGXAccelerator::start(IOService *provider)
++{
++	int metal = 0;
++	(void)PE_parse_boot_argn("pandora_gpu_metal", &metal, sizeof(metal));
++	if (!metal || !IOService::start(provider)) {
++		return false;
++	}
++	setName("NativeAdrenoGpu");
++	setProperty("MetalPluginName", "NativeAdrenoMetal");
++	setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
++	registerService();
++	IOLog("PANDORA GPU UC: AGXAccelerator (IOAcceleratorES) registered, plugin NativeAdrenoMetal\n");
++	return true;
++}
++
++IOReturn
++AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    __unused OSDictionary *properties, IOUserClient **handler)
++{
++	return pandora_gpu_new_client(this, owningTask, securityID, type, handler);
++}
+ #endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 7ed4460..e3a3154 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -70,6 +70,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = PandoraAdrenoGpu;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AGXAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AGXAccelerator;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"

@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 #include <vulkan/vulkan_core.h>
 #include "fill_spv.h"           /* fill.comp as SPIR-V, made by glslangValidator in build_ios.sh */
 #include "tri_vert_spv.h"       /* tri.vert */
@@ -82,10 +83,19 @@ main(void)
 		dup2(con, 2);
 	}
 	sleep(5);
-	setenv("TU_DARWIN_SERVICE", "PandoraAdrenoGpu", 1);
-	setenv("TU_DARWIN_OPEN_TYPE", "0x4147", 1);
+	/* With pandora_gpu_metal=1 the kernel publishes AGXAccelerator (IOAcceleratorES), and Turnip is
+	 * left to its defaults (IOAcceleratorES, 0x4147, the NTNL tunnel), as inside the Metal plugin;
+	 * otherwise the direct service PandoraAdrenoGpu. */
+	char args[1024] = "";
+	size_t alen = sizeof(args) - 1;
+	(void)sysctlbyname("kern.bootargs", args, &alen, NULL, 0);
+	int metal = strstr(args, "pandora_gpu_metal=1") != NULL;
+	if (!metal) {
+		setenv("TU_DARWIN_SERVICE", "PandoraAdrenoGpu", 1);
+		setenv("TU_DARWIN_OPEN_TYPE", "0x4147", 1);
+	}
 	setenv("TU_DEBUG", "sysmem,nocb", 1);     /* no GMEM binning, no concurrent binning yet */
-	say("VKTEST: start");
+	say("VKTEST: start (service %s)", metal ? "IOAcceleratorES, Turnip's default" : "PandoraAdrenoGpu");
 
 	/* ---- part 1: instance and device ---- */
 	void *drv = dlopen(DRIVER, RTLD_NOW | RTLD_LOCAL);
