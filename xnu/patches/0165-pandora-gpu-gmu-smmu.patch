@@ -1,0 +1,1166 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 14980db..69ab520 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,11 @@ bsd/dev/pandora_selftest.c		standard
+ bsd/dev/pandora_adsp.c			standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
++bsd/dev/adreno/ArmSmmu4K.c		standard
++bsd/dev/adreno/ArmSmmu4KContext.c		standard
++bsd/dev/adreno/ArmSmmu4KProgram.c		standard
++bsd/dev/adreno/ArmSmmu4KStreams.c		standard
++bsd/dev/adreno/ArmSmmu4KMmio.c		standard
+ bsd/dev/fuxi_adreno.c			standard
+ bsd/dev/fuxi_perf.c			standard
+ bsd/dev/fuxi_keys.c			standard
+diff --git a/bsd/dev/adreno/ArmSmmu4K.c b/bsd/dev/adreno/ArmSmmu4K.c
+new file mode 100644
+index 0000000..be5f302
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4K.c
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: MIT */
++#include "ArmSmmu4K.h"
++#define PAGE_BYTES UINT64_C(4096)
++#define ADDRESS_MASK UINT64_C(0x0000fffffffff000)
++
++static ArmSmmu4KStatus build_region(const ArmSmmu4KConfig *config,
++    const ArmSmmu4KRange *ranges, size_t range_count, uint64_t *tables,
++    size_t capacity, ArmSmmu4KResult *result, unsigned upper)
++{
++    if (!result) return ArmSmmu4KArgument;
++    result->root_physical = result->mair = 0;
++    result->table_pages = result->leaf_pages = result->start_level = 0;
++    result->upper_region = 0;
++    if (!config || !ranges || !range_count || !tables || !capacity ||
++        capacity > SIZE_MAX / PAGE_BYTES || range_count > SIZE_MAX / sizeof(*ranges) ||
++        config->input_bits < 32 || config->input_bits > 48 ||
++        !(config->output_bits == 32 || config->output_bits == 36 || config->output_bits == 40 ||
++          config->output_bits == 42 || config->output_bits == 44 || config->output_bits == 48) ||
++        !config->leaf_budget || config->leaf_budget > (SIZE_MAX - 1) / 3 ||
++        ((uintptr_t)tables & 7)) return ArmSmmu4KArgument;
++    if (range_count > config->leaf_budget) return ArmSmmu4KBudget;
++    uint64_t input_limit = UINT64_C(1) << config->input_bits;
++    uint64_t output_limit = UINT64_C(1) << config->output_bits;
++    uint64_t pool_bytes = (uint64_t)capacity * PAGE_BYTES;
++    uint64_t pool = config->table_physical;
++    if ((pool & 4095) || pool >= output_limit || pool_bytes > output_limit - pool)
++        return ArmSmmu4KBadRange;
++    size_t leaves = 0;
++    uint64_t previous_end = 0;
++    for (size_t i = 0; i < range_count; ++i) {
++        const ArmSmmu4KRange *r = &ranges[i];
++        if (!r->bytes || ((r->iova | r->physical | r->bytes) & 4095) ||
++            (!(r->permissions & ArmSmmu4KRead) || (r->permissions & ~15u)) || r->writeback > 1 || (r->shareability != 2 && r->shareability != 3) ||
++            r->physical >= output_limit || r->bytes > output_limit - r->physical)
++            return ArmSmmu4KBadRange;
++        if (upper ? (r->iova < UINT64_MAX-input_limit+1 || r->bytes-1 > UINT64_MAX-r->iova) :
++                    (r->iova >= input_limit || r->bytes > input_limit-r->iova))
++            return ArmSmmu4KBadRange;
++        if (i && r->iova <= previous_end) return ArmSmmu4KOverlap;
++        previous_end = r->iova + (r->bytes-1);
++        if (r->physical < pool + pool_bytes && pool < r->physical + r->bytes)
++            return ArmSmmu4KOverlap;
++        for (size_t j = 0; j < i; ++j) {
++            if ((r->writeback != ranges[j].writeback || r->shareability != ranges[j].shareability || ((r->permissions ^ ranges[j].permissions) & ArmSmmu4KPrivileged)) && r->physical < ranges[j].physical + ranges[j].bytes &&
++                ranges[j].physical < r->physical + r->bytes) return ArmSmmu4KOverlap;
++        }
++        uint64_t pages = r->bytes / PAGE_BYTES;
++        if (pages > config->leaf_budget - leaves) return ArmSmmu4KBudget;
++        leaves += (size_t)pages;
++    }
++    /* Each range has at least one leaf, so the validated leaf budget also
++     * bounds the range/alias loops. Sorted IOVAs make prefix counting exact. */
++    unsigned levels = (config->input_bits - 12 + 8) / 9;
++    unsigned start = 4 - levels;
++    size_t required = 1;
++    uint64_t last[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
++    for (size_t i = 0; i < range_count; ++i) {
++        for (uint64_t offset = 0; offset < ranges[i].bytes; offset += PAGE_BYTES) {
++            uint64_t va = ranges[i].iova + offset;
++            for (unsigned level = start; level < 3; ++level) {
++                uint64_t prefix = va >> (39 - 9 * level);
++                if (prefix != last[level]) { ++required; last[level] = prefix; }
++            }
++        }
++    }
++    if (required > capacity) return ArmSmmu4KCapacity;
++    for (size_t i = 0; i < required * 512; ++i) tables[i] = 0;
++    size_t next = 1;
++    for (size_t i = 0; i < range_count; ++i) {
++        const ArmSmmu4KRange *r = &ranges[i];
++        uint64_t attributes = (1u << 11) | (1u << 10) | 3;
++        if (!(r->permissions & ArmSmmu4KExecute)) attributes |= UINT64_C(3) << 53;
++        if (!(r->permissions & ArmSmmu4KPrivileged)) attributes |= 1u << 6;
++        if (!(r->permissions & ArmSmmu4KWrite)) attributes |= 1u << 7;
++        attributes |= (uint64_t)r->shareability << 8;
++        if (r->writeback) attributes |= 1u << 2;
++        for (uint64_t offset = 0; offset < r->bytes; offset += PAGE_BYTES) {
++            uint64_t va = r->iova + offset;
++            size_t table = 0;
++            for (unsigned level = start; level < 3; ++level) {
++                unsigned shift = 39-9*level;
++                unsigned width = level==start ? config->input_bits-shift : 9;
++                size_t slot = table * 512 + ((va >> shift) & ((1u<<width)-1));
++                if (!tables[slot]) tables[slot] = (pool + PAGE_BYTES * next++) | 3;
++                table = (size_t)(((tables[slot] & ADDRESS_MASK) - pool) / PAGE_BYTES);
++            }
++            tables[table * 512 + ((va >> 12) & 511)] = (r->physical + offset) | attributes;
++        }
++    }
++    result->root_physical = pool;
++    result->mair = 0xff44;
++    result->table_pages = required;
++    result->leaf_pages = leaves;
++    result->start_level = start;
++    result->upper_region = upper;
++    return ArmSmmu4KSuccess;
++}
++
++ArmSmmu4KStatus ArmSmmu4KBuild(const ArmSmmu4KConfig *config,
++    const ArmSmmu4KRange *ranges, size_t range_count, uint64_t *tables,
++    size_t capacity, ArmSmmu4KResult *result)
++{
++    return build_region(config,ranges,range_count,tables,capacity,result,0);
++}
++
++ArmSmmu4KStatus ArmSmmu4KBuildUpper(const ArmSmmu4KConfig *config,
++    const ArmSmmu4KRange *ranges, size_t range_count, uint64_t *tables,
++    size_t capacity, ArmSmmu4KResult *result)
++{
++    return build_region(config,ranges,range_count,tables,capacity,result,1);
++}
+diff --git a/bsd/dev/adreno/ArmSmmu4K.h b/bsd/dev/adreno/ArmSmmu4K.h
+new file mode 100644
+index 0000000..1b09a29
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4K.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef ARM_SMMU_4K_H
++#define ARM_SMMU_4K_H
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum {
++    ArmSmmu4KSuccess = 0, ArmSmmu4KArgument, ArmSmmu4KBadRange,
++    ArmSmmu4KOverlap, ArmSmmu4KCapacity, ArmSmmu4KBudget,
++    ArmSmmu4KUnsupported, ArmSmmu4KStateMismatch,
++    ArmSmmu4KIoError, ArmSmmu4KTimeout, ArmSmmu4KBusy, ArmSmmu4KFault
++} ArmSmmu4KStatus;
++typedef struct {
++    unsigned input_bits;           /* 32..48, low-address TTBR0 profile. */
++    unsigned output_bits;          /* 32,36,40,42,44,48. */
++    uint64_t table_physical;        /* Caller-owned contiguous pool, aligned 4K. */
++    size_t leaf_budget;            /* Explicit upper bound on mapping work. */
++} ArmSmmu4KConfig;
++enum {ArmSmmu4KRead=1,ArmSmmu4KWrite=2,ArmSmmu4KExecute=4,ArmSmmu4KPrivileged=8};
++typedef struct {
++    uint64_t iova, physical, bytes;
++    unsigned permissions;          /* Read required; optional Write/Execute/Privileged. */
++    unsigned writeback;            /* 0=normal NC, 1=normal WB/WA. */
++    unsigned shareability;         /* 2=outer, 3=inner; explicit, no default. */
++} ArmSmmu4KRange;
++typedef struct {
++    uint64_t root_physical;
++    uint64_t mair;                 /* NC at index 0, WB/WA at index 1. */
++    size_t table_pages, leaf_pages;
++    unsigned start_level;
++    unsigned upper_region;        /* 0=Build TTBR0, 1=BuildUpper TTBR1. */
++} ArmSmmu4KResult;
++
++/* Build inactive ARM LPAE stage-1 tables with ONLY 4K level-3 leaves.
++ * Sorted disjoint low IOVA ranges; no sign extension or input conversion.
++ * No resource may map the table pool. Conflicting cache/shareability/privilege
++ * aliases refuse. Default 1/3 retains unprivileged PXN/UXN behavior. Execute
++ * and Privileged explicitly describe DEVICE-stage1 accesses (e.g. firmware),
++ * never CPU permissions or authorization to execute unauthenticated images.
++ * All validation/capacity checks precede table writes. Failure zeros result
++ * and leaves tables untouched. Success writes only result.table_pages pages.
++ * Caller guarantees real accessible, disjoint storage, immutable inputs,
++ * native-endian uint64_t table storage aligned to at least 8 bytes, actual
++ * physical ownership and matching CPU attributes/cache maintenance.
++ * NO MMIO, allocation, barriers, TLB operations or activation. This does NOT
++ * prove hardware support, coherent walks or a live isolated GPU context. */
++ArmSmmu4KStatus ArmSmmu4KBuild(const ArmSmmu4KConfig *config,
++    const ArmSmmu4KRange *ranges, size_t range_count, uint64_t *tables,
++    size_t table_capacity_pages, ArmSmmu4KResult *result);
++/* Same native 4K format for TTBR1's upper, sign-extended address region.
++ * IOVAs must already be in [2^64-2^input_bits,2^64); truncated low addresses
++ * refuse. Uses the architectural partial-root index width. No lower-region
++ * remapping, page-size conversion, MMIO or translation activation occurs. */
++ArmSmmu4KStatus ArmSmmu4KBuildUpper(const ArmSmmu4KConfig *config,
++    const ArmSmmu4KRange *ranges, size_t range_count, uint64_t *tables,
++    size_t table_capacity_pages, ArmSmmu4KResult *result);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/adreno/ArmSmmu4KContext.c b/bsd/dev/adreno/ArmSmmu4KContext.c
+new file mode 100644
+index 0000000..2cc334e
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KContext.c
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: MIT */
++#include "ArmSmmu4KContext.h"
++static int width_code(unsigned bits)
++{
++    switch(bits) {case 32:return 0;case 36:return 1;case 40:return 2;
++        case 42:return 3;case 44:return 4;case 48:return 5;default:return -1;}
++}
++static unsigned width_bits(unsigned code)
++{
++    switch(code) {case 0:return 32;case 1:return 36;case 2:return 40;
++        case 3:return 42;case 4:return 44;case 5:return 48;default:return 0;}
++}
++static int region_valid(const ArmSmmu4KConfig *c,const ArmSmmu4KResult *r,unsigned upper)
++{
++    if(!c || !r)return !c && !r;
++    if(c->input_bits<32 || c->input_bits>48 || width_code(c->output_bits)<0 ||
++        (c->table_physical&4095) || r->root_physical!=c->table_physical ||
++        r->mair!=0xff44 || r->upper_region!=upper || !r->table_pages ||
++        r->leaf_pages>c->leaf_budget || r->table_pages>UINT64_MAX/4096 ||
++        r->start_level!=4-(c->input_bits-12+8)/9)return 0;
++    uint64_t limit=UINT64_C(1)<<c->output_bits;
++    return r->root_physical<limit && (uint64_t)r->table_pages*4096<=limit-r->root_physical;
++}
++ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
++    ArmSmmu4KContextImage *out)
++{
++    if(!out)return ArmSmmu4KArgument;
++    out->cbar=out->cba2r=out->tcr=out->tcr2=out->mair0=out->mair1=out->sctlr=0;
++    out->reserved_zero=0;
++    out->ttbr0=out->ttbr1=0;
++    if(!c || (!c->lower && !c->upper) || c->asid>65535 || c->coherent_walk>1 ||
++        c->stall_on_fault>1 || c->continue_after_fault>1 ||
++        !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1))return ArmSmmu4KArgument;
++    unsigned va=width_bits((c->id2>>8)&15),pa=width_bits((c->id2>>4)&15);
++    if(!(c->id0&(UINT32_C(1)<<30)) || !(c->id2&(1u<<12)) || !va || !pa)return ArmSmmu4KUnsupported;
++    const ArmSmmu4KConfig *basis=c->lower?c->lower:c->upper;
++    if(basis->output_bits>pa || (c->lower && c->lower->input_bits>va) ||
++        (c->upper && (c->upper->input_bits>va || c->upper->output_bits!=basis->output_bits)))return ArmSmmu4KUnsupported;
++    if(c->lower && c->upper) {
++        const ArmSmmu4KResult *a=c->lower_tables,*b=c->upper_tables;
++        if(a->root_physical<b->root_physical+(uint64_t)b->table_pages*4096 &&
++           b->root_physical<a->root_physical+(uint64_t)a->table_pages*4096)return ArmSmmu4KOverlap;
++    }
++    ArmSmmu4KContextImage v;
++    v.cbar=0x1f300; /* Stage1 translation, stage2 bypass; weakest bypass attrs. */
++    v.cba2r=1;      /* AArch64. No stage2 VMID or guest translation. */
++    v.tcr=UINT32_C(2)<<30; /* TG1=4K, TG0=4K. */
++    unsigned walk=c->coherent_walk?0x3500:0x2000;
++    if(c->lower)v.tcr|=walk|(64-c->lower->input_bits);
++    else v.tcr|=1u<<7; /* EPD0 */
++    if(c->upper)v.tcr|=(walk|(64-c->upper->input_bits))<<16;
++    else v.tcr|=1u<<23; /* EPD1 */
++    v.tcr2=(7u<<15)|(1u<<4)|(unsigned)width_code(basis->output_bits);
++    v.ttbr0=(uint64_t)c->asid<<48;v.ttbr1=v.ttbr0;
++    if(c->lower)v.ttbr0|=c->lower_tables->root_physical;
++    if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
++    v.mair0=0xff44;v.mair1=0;
++    v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
++    v.reserved_zero=0;
++    *out=v;
++    return ArmSmmu4KSuccess;
++}
++ArmSmmu4KStatus ArmSmmu4KValidateContextReadback(const ArmSmmu4KContextConfig *c,
++    const ArmSmmu4KContextImage *observed)
++{
++    if(!observed)return ArmSmmu4KArgument;
++    ArmSmmu4KContextImage expected;
++    ArmSmmu4KStatus status=ArmSmmu4KEncodeContext(c,&expected);
++    if(status!=ArmSmmu4KSuccess)return status;
++    /* TCR2.TBI0/TBI1 (bits 5/6, top-byte ignore) are written 0 but may read 1: the sheng Adreno MMU-500 reads
++     * 0x38071 for 0x38011 (int-008). Linux neither sets nor reads them back. With a 48-bit upstream bus the top
++     * byte of a device address is zero, so ignoring it changes no translation. Only 0 -> 1 is accepted here. */
++    const uint32_t tbi_set=observed->tcr2&~expected.tcr2&UINT32_C(0x60);
++    /* SCTLR.ASIDPNE (bit 12) is written 1 but may read 0: the same SMMU reads 0x167 for 0x1167 (int-009). Linux
++     * writes it and never reads it back. A shared ASID namespace is safe because every bank's ASID is the
++     * caller's exclusive lease. Only 1 -> 0 is accepted. */
++    const uint32_t asidpne_clear=expected.sctlr&~observed->sctlr&UINT32_C(0x1000);
++    if(expected.cbar!=observed->cbar || expected.cba2r!=observed->cba2r ||
++        expected.tcr!=observed->tcr || ((expected.tcr2^observed->tcr2)&~tbi_set) ||
++        expected.mair0!=observed->mair0 || expected.mair1!=observed->mair1 ||
++        ((expected.sctlr^observed->sctlr)&~asidpne_clear) || observed->reserved_zero || expected.ttbr0!=observed->ttbr0 ||
++        expected.ttbr1!=observed->ttbr1)return ArmSmmu4KStateMismatch;
++    return ArmSmmu4KSuccess;
++}
+diff --git a/bsd/dev/adreno/ArmSmmu4KContext.h b/bsd/dev/adreno/ArmSmmu4KContext.h
+new file mode 100644
+index 0000000..3c2faa4
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KContext.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef ARM_SMMU_4K_CONTEXT_H
++#define ARM_SMMU_4K_CONTEXT_H
++#include "ArmSmmu4K.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct {
++    /* A config/result pair from Build, BuildUpper or LivePrepare; NULL pair disables it.
++     * A live arena may have zero mapped leaves while retaining its table topology.
++     * Both enabled regions need distinct physical pools and equal OAS/MAIR.
++     * The trusted caller retains actual pool ownership and immutable results. */
++    const ArmSmmu4KConfig *lower, *upper;
++    const ArmSmmu4KResult *lower_tables, *upper_tables;
++    uint32_t id0, id2;       /* Raw SMMUv2 identification register values. */
++    unsigned asid;          /* 0..65535, ownership managed by the caller. */
++    unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
++    unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
++} ArmSmmu4KContextConfig;
++typedef struct {
++    uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;
++    uint64_t ttbr0, ttbr1;
++} ArmSmmu4KContextImage;
++
++/* Encode AArch64 stage1, stage2-bypass native4K SMMUv2 context registers.
++ * Capability/width/result/refusal checks precede publishing an image. Failure
++ * zeros it. Both TG0/TG1 select 4K even for a disabled region. No MMIO, power,
++ * stream/context assignment, cache barriers, TLB operations or activation.
++ * ID inputs are not proof that the caller read actual hardware. Inputs,
++ * their pointed-to configs/results, and output must be disjoint and immutable
++ * throughout the call; this is a trusted kernel integration boundary. */
++ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *,
++    ArmSmmu4KContextImage *);
++/* Compare all supplied readback fields with the freshly encoded expected
++ * image. Caller must read real hardware and independently walk its actual
++ * TTBR tables, verify ownership/coherency and handle faults/TLB lifetime.
++ * Matching caller-supplied values alone never qualify an active GPU mapping. */
++ArmSmmu4KStatus ArmSmmu4KValidateContextReadback(const ArmSmmu4KContextConfig *,
++    const ArmSmmu4KContextImage *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/adreno/ArmSmmu4KMmio.c b/bsd/dev/adreno/ArmSmmu4KMmio.c
+new file mode 100644
+index 0000000..df974ba
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KMmio.c
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: MIT */
++#include "ArmSmmu4KMmio.h"
++#if !defined(__aarch64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error Direct SMMUv2 MMIO binding requires little-endian AArch64
++#endif
++static int fits(const ArmSmmu4KMmio *m,size_t at,size_t bytes)
++{return m && m->mapping && m->bytes && m->bytes-1<=UINTPTR_MAX-(uintptr_t)m->mapping && !((uintptr_t)m->mapping&7) && !(at&(bytes-1)) && at<=m->bytes && bytes<=m->bytes-at;}
++static int read32(void *cookie,size_t at,uint32_t *out)
++{ArmSmmu4KMmio *m=cookie;if(!out || !fits(m,at,4))return 1;*out=*(volatile uint32_t *)(m->mapping+at);return 0;}
++static int read64(void *cookie,size_t at,uint64_t *out)
++{ArmSmmu4KMmio *m=cookie;if(!out || !fits(m,at,8))return 1;*out=*(volatile uint64_t *)(m->mapping+at);return 0;}
++static int write32(void *cookie,size_t at,uint32_t value)
++{ArmSmmu4KMmio *m=cookie;if(!fits(m,at,4))return 1;*(volatile uint32_t *)(m->mapping+at)=value;return 0;}
++static int write64(void *cookie,size_t at,uint64_t value)
++{ArmSmmu4KMmio *m=cookie;if(!fits(m,at,8))return 1;*(volatile uint64_t *)(m->mapping+at)=value;return 0;}
++static int barrier(void *cookie)
++{(void)cookie;__asm__ volatile("dsb sy":::"memory");return 0;}
++ArmSmmu4KStatus ArmSmmu4KBindMmio(ArmSmmu4KMmio *mapping,ArmSmmu4KIo *out)
++{
++    if(!out)return ArmSmmu4KArgument;
++    *out=(ArmSmmu4KIo){0};
++    if(!mapping || !mapping->mapping || ((uintptr_t)mapping->mapping&7) || mapping->bytes<0x2c || mapping->bytes-1>UINTPTR_MAX-(uintptr_t)mapping->mapping)return ArmSmmu4KArgument;
++    out->cookie=mapping;out->register_bytes=mapping->bytes;out->read32=read32;out->read64=read64;
++    out->write32=write32;out->write64=write64;out->barrier=barrier;
++    return ArmSmmu4KSuccess;
++}
+diff --git a/bsd/dev/adreno/ArmSmmu4KMmio.h b/bsd/dev/adreno/ArmSmmu4KMmio.h
+new file mode 100644
+index 0000000..52a2d37
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KMmio.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef ARM_SMMU_4K_MMIO_H
++#define ARM_SMMU_4K_MMIO_H
++#include "ArmSmmu4KProgram.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct {volatile unsigned char *mapping;size_t bytes;} ArmSmmu4KMmio;
++/* AArch64 little-endian direct volatile MMIO adapter, with dsb sy barriers.
++ * Caller supplies an owned live Device mapping. This allocates/maps nothing,
++ * powers nothing and cannot recover a synchronous external bus abort. All
++ * inputs/output must be disjoint and retained for the I/O object's lifetime.
++ * Never bind arbitrary physical/virtual addresses or ordinary user buffers
++ * as a hardware mapping. Software tests are explicitly separate fixtures. */
++ArmSmmu4KStatus ArmSmmu4KBindMmio(ArmSmmu4KMmio *,ArmSmmu4KIo *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/adreno/ArmSmmu4KProgram.c b/bsd/dev/adreno/ArmSmmu4KProgram.c
+new file mode 100644
+index 0000000..2cb6695
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KProgram.c
+@@ -0,0 +1,195 @@
++/* SPDX-License-Identifier: MIT */
++#include "ArmSmmu4KProgram.h"
++#define FSR_FAULT UINT32_C(0xc00001fe)
++static int read_image(const ArmSmmu4KIo *io,size_t gr1,size_t cb,unsigned bank,
++    ArmSmmu4KContextImage *v)
++{
++    v->reserved_zero=0;
++    return io->read32(io->cookie,gr1+bank*4,&v->cbar) ||
++        io->read32(io->cookie,gr1+0x800+bank*4,&v->cba2r) ||
++        io->read32(io->cookie,cb+0x30,&v->tcr) ||
++        io->read32(io->cookie,cb+0x10,&v->tcr2) ||
++        io->read64(io->cookie,cb+0x20,&v->ttbr0) ||
++        io->read64(io->cookie,cb+0x28,&v->ttbr1) ||
++        io->read32(io->cookie,cb+0x38,&v->mair0) ||
++        io->read32(io->cookie,cb+0x3c,&v->mair1) ||
++        io->read32(io->cookie,cb,&v->sctlr);
++}
++static int write32(const ArmSmmu4KIo *io,size_t at,uint32_t value,ArmSmmu4KProgramResult *r)
++{
++    ++r->writes;return io->write32(io->cookie,at,value);
++}
++static int write64(const ArmSmmu4KIo *io,size_t at,uint64_t value,ArmSmmu4KProgramResult *r)
++{
++    ++r->writes;return io->write64(io->cookie,at,value);
++}
++/* TLBIASID (+0x610, value = ASID) or, with all set, TLBIALL (+0x618, value ignored), then TLBSYNC/TLBSTATUS. */
++static ArmSmmu4KStatus sync_tlb(const ArmSmmu4KIo *io,size_t cb,unsigned asid,unsigned all,
++    unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    r->tlb_synchronized=0;
++    if(io->barrier(io->cookie) || write32(io,cb+(all?0x618:0x610),all?0:asid,r) ||
++        write32(io,cb+0x7f0,UINT32_MAX,r) || io->barrier(io->cookie))return ArmSmmu4KIoError;
++    for(unsigned i=0;i<budget;++i) {
++        uint32_t status;++r->poll_reads;
++        if(io->read32(io->cookie,cb+0x7f4,&status))return ArmSmmu4KIoError;
++        if(!(status&1)) {
++            /* Order the completed device observation before callers recycle
++             * normal-memory tables or publish subsequent context work. */
++            if(io->barrier(io->cookie))return ArmSmmu4KIoError;
++            r->tlb_synchronized=1;return ArmSmmu4KSuccess;
++        }
++    }
++    return ArmSmmu4KTimeout;
++}
++static ArmSmmu4KStatus sync_asid(const ArmSmmu4KIo *io,size_t cb,unsigned asid,
++    unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    return sync_tlb(io,cb,asid,0,budget,r);
++}
++static ArmSmmu4KStatus disable_sync(const ArmSmmu4KIo *io,size_t cb,unsigned asid,
++    unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    r->must_retain_tables=1;r->disabled_verified=0;
++    uint32_t value;
++    if(write32(io,cb,0,r) || io->barrier(io->cookie) || io->read32(io->cookie,cb,&value))return ArmSmmu4KIoError;
++    if(value)return ArmSmmu4KStateMismatch;
++    r->disabled_verified=1;r->enabled=0;
++    ArmSmmu4KStatus status=sync_asid(io,cb,asid,budget,r);
++    if(status==ArmSmmu4KSuccess)r->must_retain_tables=0;
++    return status;
++}
++static ArmSmmu4KStatus prepare(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned budget,ArmSmmu4KProgramResult *r,
++    ArmSmmu4KContextConfig *actual,ArmSmmu4KContextImage *image,size_t *gr1)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KProgramResult){0};
++    r->must_retain_tables=1;
++    if(!io || !config || !io->read32 || !io->read64 || !io->write32 || !io->write64 ||
++        !io->barrier || io->register_bytes<0x2c || !budget || budget>1048576 || bank>255)return ArmSmmu4KArgument;
++    r->phase=1;
++    if(io->read32(io->cookie,0x20,&r->id0) || io->read32(io->cookie,0x24,&r->id1) ||
++        io->read32(io->cookie,0x28,&r->id2))return ArmSmmu4KIoError;
++    unsigned shift=(r->id1>>31)?16:12;
++    size_t pages=(size_t)1<<(((r->id1>>28)&7)+1);
++    size_t stride=(size_t)1<<shift;
++    unsigned banks=r->id1&255,s2=(r->id1>>16)&255;
++    if(!banks || banks>pages || s2>banks || bank<s2 || bank>=banks ||
++        io->register_bytes<2*pages*stride)return ArmSmmu4KUnsupported;
++    *gr1=stride;r->context_offset=(pages+bank)*stride;
++    if(r->context_offset>io->register_bytes || io->register_bytes-r->context_offset<0x7f8 ||
++        *gr1+0x804+bank*4>io->register_bytes)return ArmSmmu4KBadRange;
++    *actual=*config;actual->id0=r->id0;actual->id2=r->id2;
++    return ArmSmmu4KEncodeContext(actual,image);
++}
++ArmSmmu4KStatus ArmSmmu4KProgramDisabledContext(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    ArmSmmu4KContextConfig actual;ArmSmmu4KContextImage image;size_t gr1;
++    ArmSmmu4KStatus status=prepare(io,bank,config,budget,r,&actual,&image,&gr1);
++    if(status!=ArmSmmu4KSuccess)return status;
++    size_t cb=(size_t)r->context_offset;uint32_t sctlr;
++    if(io->read32(io->cookie,cb,&sctlr))return ArmSmmu4KIoError;
++    if(sctlr&1){r->enabled=1;return ArmSmmu4KBusy;}
++    r->must_retain_tables=1;r->phase=2;
++    /* A disabled owned bank only. TCR2/TCR precede all TTBR accesses. */
++    if(write32(io,cb,0,r) || io->barrier(io->cookie) ||
++        write32(io,gr1+0x800+bank*4,image.cba2r,r) || write32(io,gr1+bank*4,image.cbar,r) ||
++        write32(io,cb+0x10,image.tcr2,r) || write32(io,cb+0x30,image.tcr,r) ||
++        write64(io,cb+0x20,image.ttbr0,r) || write64(io,cb+0x28,image.ttbr1,r) ||
++        write32(io,cb+0x38,image.mair0,r) || write32(io,cb+0x3c,image.mair1,r) ||
++        write32(io,cb+0x58,UINT32_MAX,r)) {status=ArmSmmu4KIoError;goto failed;}
++    status=sync_asid(io,cb,actual.asid,budget,r);if(status!=ArmSmmu4KSuccess)goto failed;
++    r->phase=3;
++    if(read_image(io,gr1,cb,bank,&r->readback)) {status=ArmSmmu4KIoError;goto failed;}
++    r->readback_valid=1;
++    /* Verify configuration while M is still zero; never enable a bad granule. */
++    sctlr=r->readback.sctlr;r->readback.sctlr=image.sctlr;
++    status=ArmSmmu4KValidateContextReadback(&actual,&r->readback);r->readback.sctlr=sctlr;
++    if(status!=ArmSmmu4KSuccess || sctlr) {status=ArmSmmu4KStateMismatch;goto failed;}
++    r->readback_valid=0;
++    if(io->barrier(io->cookie) || write32(io,cb,image.sctlr,r) || io->barrier(io->cookie)) {status=ArmSmmu4KIoError;goto failed;}
++    r->phase=4;
++    if(read_image(io,gr1,cb,bank,&r->readback)) {status=ArmSmmu4KIoError;goto failed;}
++    r->readback_valid=1;r->enabled=r->readback.sctlr&1;
++    if(io->read32(io->cookie,cb+0x58,&r->fault_status)) {status=ArmSmmu4KIoError;goto failed;}
++    status=ArmSmmu4KValidateContextReadback(&actual,&r->readback);if(status!=ArmSmmu4KSuccess)goto failed;
++    if(r->fault_status&FSR_FAULT) {status=ArmSmmu4KFault;goto failed;}
++    r->phase=5;r->enabled=1;return ArmSmmu4KSuccess;
++failed:
++    /* Even a reported failed write may have reached hardware. On uncertainty
++     * retain all tables/leases; never claim safe recycling after timeout. */
++    r->readback_valid=0;(void)disable_sync(io,cb,actual.asid,budget,r);
++    r->phase=6;return status;
++}
++ArmSmmu4KStatus ArmSmmu4KDisableOwnedContext(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    ArmSmmu4KContextConfig actual;ArmSmmu4KContextImage image;size_t gr1;
++    ArmSmmu4KStatus status=prepare(io,bank,config,budget,r,&actual,&image,&gr1);
++    if(status!=ArmSmmu4KSuccess)return status;
++    size_t cb=(size_t)r->context_offset;r->must_retain_tables=1;
++    if(read_image(io,gr1,cb,bank,&r->readback))return ArmSmmu4KIoError;
++    r->readback_valid=1;uint32_t sctlr=r->readback.sctlr;
++    /* An enabled bank must match the owned image (ValidateContextReadback, with its documented read-only bits); a
++     * disabled one is compared with SCTLR substituted. */
++    if(sctlr)status=ArmSmmu4KValidateContextReadback(&actual,&r->readback);
++    else {r->readback.sctlr=image.sctlr;status=ArmSmmu4KValidateContextReadback(&actual,&r->readback);r->readback.sctlr=sctlr;}
++    if(status!=ArmSmmu4KSuccess)return status; /* Another context: do not touch. */
++    r->readback_valid=0;status=disable_sync(io,cb,actual.asid,budget,r);r->phase=status==ArmSmmu4KSuccess?7:6;
++    return status;
++}
++
++ArmSmmu4KStatus ArmSmmu4KObserveOwnedContext(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,ArmSmmu4KProgramResult *r)
++{
++    ArmSmmu4KContextConfig actual;ArmSmmu4KContextImage image;size_t gr1;
++    ArmSmmu4KStatus status=prepare(io,bank,config,1,r,&actual,&image,&gr1);
++    if(status!=ArmSmmu4KSuccess)return status;
++    if(read_image(io,gr1,(size_t)r->context_offset,bank,&r->readback))return ArmSmmu4KIoError;
++    r->readback_valid=1;r->enabled=r->readback.sctlr&1;
++    status=ArmSmmu4KValidateContextReadback(&actual,&r->readback);
++    if(status!=ArmSmmu4KSuccess)return status;
++    if(io->read32(io->cookie,(size_t)r->context_offset+0x58,&r->fault_status) || io->barrier(io->cookie))return ArmSmmu4KIoError;
++    if(r->fault_status&FSR_FAULT)return ArmSmmu4KFault;
++    r->phase=8;return ArmSmmu4KSuccess;
++}
++
++static ArmSmmu4KStatus synchronize(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned all,unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KProgramResult){0};r->must_retain_tables=1;
++    if(!budget || budget>1048576)return ArmSmmu4KArgument;
++    ArmSmmu4KStatus status=ArmSmmu4KObserveOwnedContext(io,bank,config,r);
++    if(status!=ArmSmmu4KSuccess)return status;
++    status=sync_tlb(io,(size_t)r->context_offset,config->asid,all,budget,r);
++    if(status!=ArmSmmu4KSuccess)return status;
++    ArmSmmu4KProgramResult after;
++    status=ArmSmmu4KObserveOwnedContext(io,bank,config,&after);
++    r->readback=after.readback;r->readback_valid=after.readback_valid;
++    r->fault_status=after.fault_status;r->enabled=after.enabled;
++    if(status!=ArmSmmu4KSuccess)return status;
++    if(r->id0!=after.id0 || r->id1!=after.id1 || r->id2!=after.id2 ||
++        r->context_offset!=after.context_offset)return ArmSmmu4KStateMismatch;
++    r->phase=9;return ArmSmmu4KSuccess;
++}
++ArmSmmu4KStatus ArmSmmu4KSyncContextTlb(const ArmSmmu4KIo *io,uint64_t context_offset,unsigned asid,unsigned all,
++    unsigned budget,ArmSmmu4KProgramResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KProgramResult){0};r->must_retain_tables=1;
++    if(!io || !io->write32 || !io->read32 || !io->barrier || !budget || budget>1048576 || !context_offset ||
++        context_offset>io->register_bytes || io->register_bytes-context_offset<0x7f8)return ArmSmmu4KArgument;
++    r->context_offset=context_offset;
++    ArmSmmu4KStatus status=sync_tlb(io,(size_t)context_offset,asid,all,budget,r);
++    if(status==ArmSmmu4KSuccess)r->phase=9;
++    return status;
++}
++ArmSmmu4KStatus ArmSmmu4KSynchronizeOwnedContext(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned budget,ArmSmmu4KProgramResult *r)
++{return synchronize(io,bank,config,0,budget,r);}
++ArmSmmu4KStatus ArmSmmu4KInvalidateAllOwnedContext(const ArmSmmu4KIo *io,unsigned bank,
++    const ArmSmmu4KContextConfig *config,unsigned budget,ArmSmmu4KProgramResult *r)
++{return synchronize(io,bank,config,1,budget,r);}
+diff --git a/bsd/dev/adreno/ArmSmmu4KProgram.h b/bsd/dev/adreno/ArmSmmu4KProgram.h
+new file mode 100644
+index 0000000..25ccf6d
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KProgram.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef ARM_SMMU_4K_PROGRAM_H
++#define ARM_SMMU_4K_PROGRAM_H
++#include "ArmSmmu4KContext.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Byte offsets are relative to one real, owned SMMUv2 MMIO mapping. All I/O
++ * callbacks return 0 on success. read/write64 must perform actual aligned
++ * 64-bit TTBR accesses; barrier orders table visibility and device writes.
++ * A barrier is NOT cache cleaning. No callback may silently fake success. */
++typedef struct {
++    void *cookie;
++    size_t register_bytes;
++    int (*read32)(void *,size_t,uint32_t *);
++    int (*read64)(void *,size_t,uint64_t *);
++    int (*write32)(void *,size_t,uint32_t);
++    int (*write64)(void *,size_t,uint64_t);
++    int (*barrier)(void *);
++} ArmSmmu4KIo;
++typedef struct {
++    uint64_t context_offset;
++    uint32_t id0,id1,id2,phase,writes,poll_reads,fault_status;
++    uint32_t readback_valid,enabled,disabled_verified,tlb_synchronized,must_retain_tables;
++    ArmSmmu4KContextImage readback;
++} ArmSmmu4KProgramResult;
++
++/* REAL register programming primitive, not a device-discovery/ownership layer.
++ * Caller MUST hold an exclusive bank/ASID/stream lease, keep the device powered
++ * and clocked, quiesce/fault its streams, install its fault interrupt handler,
++ * establish platform ACTLR/security requirements, and clean/publish real owned
++ * native4K tables before calling. Every argument/result must be disjoint.
++ * Reads actual ID0/ID1/ID2 through I/O and overrides config's supplied IDs.
++ * Refuses enabled banks before any write. Enables SCTLR only after register
++ * readback and bounded ASID invalidation/synchronization. No global reset,
++ * stream reassignment or other bank is touched. On failure attempts disable
++ * and sync; must_retain_tables stays set unless both are confirmed. Success
++ * also retains table ownership while the installed context is active.
++ * This does not walk tables or establish actual GPU execution/correctness. */
++ArmSmmu4KStatus ArmSmmu4KProgramDisabledContext(const ArmSmmu4KIo *,unsigned bank,
++    const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
++/* Read-only observation of actual IDs and all owned context registers. Requires
++ * exact enabled native4K image and no pending context fault. Does not walk the
++ * physical tables or establish ownership. Readback is a momentary observation;
++ * callers retain resources, quiescence/exclusive lease and fault handling. */
++ArmSmmu4KStatus ArmSmmu4KObserveOwnedContext(const ArmSmmu4KIo *,unsigned bank,
++    const ArmSmmu4KContextConfig *,ArmSmmu4KProgramResult *);
++/* Publish already cleaned descriptor changes with a real ASID invalidation
++ * and bounded context TLBSYNC. Observe the complete enabled native4K image and
++ * faults before and after. Caller exclusively owns this bank/ASID, serializes
++ * all page-table updates and keeps every master quiesced. A barrier is not a
++ * cache clean. No SCTLR/TTBR/stream writes or recovery/reset are performed.
++ * Any failure retains all mappings/resources; success is not a GPU fence. */
++ArmSmmu4KStatus ArmSmmu4KSynchronizeOwnedContext(const ArmSmmu4KIo *,unsigned bank,
++    const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
++/* TLBIASID (or, with all set, TLBIALL) and the bounded TLBSYNC of the context bank at context_offset alone: no image or fault
++ * observation. For a caller that observed this owned bank's image at that offset already and keeps it owned (the live updater
++ * between its whole-verification updates). */
++ArmSmmu4KStatus ArmSmmu4KSyncContextTlb(const ArmSmmu4KIo *,uint64_t context_offset,unsigned asid,unsigned all,
++    unsigned poll_budget,ArmSmmu4KProgramResult *);
++/* As ArmSmmu4KSynchronizeOwnedContext, but with TLBIALL for the bank instead of TLBIASID: every cached translation of the bank goes,
++ * whatever ASID it was tagged with. */
++ArmSmmu4KStatus ArmSmmu4KInvalidateAllOwnedContext(const ArmSmmu4KIo *,unsigned bank,
++    const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
++/* Disable only if actual stage/format/roots/ASID/attributes still match the
++ * expected owned context. Retain bank, mappings and tables on any uncertainty.
++ * Does not release the caller's lease or power/stream/interrupt resources. */
++ArmSmmu4KStatus ArmSmmu4KDisableOwnedContext(const ArmSmmu4KIo *,unsigned bank,
++    const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/adreno/ArmSmmu4KStreams.c b/bsd/dev/adreno/ArmSmmu4KStreams.c
+new file mode 100644
+index 0000000..4145ef2
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KStreams.c
+@@ -0,0 +1,157 @@
++/* SPDX-License-Identifier: MIT */
++#include "ArmSmmu4KStreams.h"
++#define FAULT (UINT32_C(2)<<16)
++static int rd(const ArmSmmu4KIo *io,size_t at,uint32_t *v,ArmSmmu4KStreamResult *r)
++{++r->reads;return io->read32(io->cookie,at,v);}
++static int wr(const ArmSmmu4KIo *io,size_t at,uint32_t v,ArmSmmu4KStreamResult *r)
++{++r->writes;return io->write32(io->cookie,at,v);}
++static unsigned exids(uint32_t id){return (id>>8)&1;}
++static uint32_t valid_smr(uint32_t id){return exids(id)?0:UINT32_C(1)<<31;}
++static uint32_t valid_s2cr(uint32_t id){return exids(id)?1u<<10:0;}
++static int valid(uint32_t id,uint32_t smr,uint32_t s2cr)
++{return exids(id)?!!(s2cr&(1u<<10)):!!(smr&(UINT32_C(1)<<31));}
++static ArmSmmu4KStatus global(const ArmSmmu4KIo *io,ArmSmmu4KStreamResult *r)
++{
++    if(!io || !io->read32 || !io->write32 || !io->barrier || io->register_bytes<0xc04)return ArmSmmu4KArgument;
++    if(rd(io,0x20,&r->id0,r) || rd(io,0,&r->scr0,r) || rd(io,0x48,&r->global_fault,r))return ArmSmmu4KIoError;
++    if(!(r->id0&(1u<<27)) || !(r->id0&255) || 0xc00u+4*(r->id0&255)>io->register_bytes)return ArmSmmu4KUnsupported;
++    /* Real global enable (CLIENTPD clear), global fault reporting (GFRE/GFIE) and unmatched-stream fault
++     * policy (USFCFG). Configuration-access fault reporting (GCFGFRE/GCFGFIE) is not required: Linux sets
++     * it only in its own global reset, and firmware that owns sCR0 may leave it clear (an Adreno SMMU read
++     * 0x002f0406). It reports bad register accesses, it does not change translation or bypass. */
++    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
++    return r->global_fault?ArmSmmu4KFault:ArmSmmu4KSuccess;
++}
++static ArmSmmu4KStatus scan(const ArmSmmu4KIo *io,const ArmSmmu4KStream *s,unsigned n,
++    unsigned bank,unsigned attached,ArmSmmu4KStreamResult *r)
++{
++    unsigned slots=r->id0&255;uint32_t sidmask=exids(r->id0)?0xffffu:(1u<<((r->id0>>9)&15))-1;
++    for(unsigned i=0;i<n;++i) {
++        if(s[i].slot>=slots || (s[i].sid&~sidmask))return ArmSmmu4KArgument;
++        for(unsigned j=0;j<i;++j)if(s[i].slot==s[j].slot || s[i].sid==s[j].sid)return ArmSmmu4KOverlap;
++    }
++    r->streams_verified=0;
++    for(unsigned slot=0;slot<slots;++slot) {
++        uint32_t smr,s2cr;
++        if(rd(io,0x800+4*slot,&smr,r) || rd(io,0xc00+4*slot,&s2cr,r))return ArmSmmu4KIoError;
++        unsigned own=n;
++        for(unsigned i=0;i<n;++i)if(s[i].slot==slot){own=i;break;}
++        if(own<n) {
++            unsigned live=valid(r->id0,smr,s2cr);
++            if(attached) {
++                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
++            } else if((s2cr&~valid_s2cr(r->id0))!=FAULT ||
++                (live && smr!=(valid_smr(r->id0)|s[own].sid)))return ArmSmmu4KBusy;
++            ++r->streams_verified;
++        } else if(valid(r->id0,smr,s2cr)) {
++            if(!(s2cr&(3u<<16)) && (s2cr&255)==bank)return ArmSmmu4KBusy;
++            uint32_t mask=(smr>>16)&(exids(r->id0)?0xffffu:0x7fffu),id=smr&0xffff;
++            for(unsigned i=0;i<n;++i)if(!((s[i].sid^id)&~mask&sidmask))return ArmSmmu4KOverlap;
++        }
++    }
++    return ArmSmmu4KSuccess;
++}
++ArmSmmu4KStatus ArmSmmu4KCheckFaultedStreams(const ArmSmmu4KIo *io,const ArmSmmu4KStream *s,
++    unsigned n,unsigned bank,ArmSmmu4KStreamResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
++    if(!s || !n || n>8 || bank>255)return ArmSmmu4KArgument;
++    ArmSmmu4KStatus status=global(io,r);if(status)return status;
++    return scan(io,s,n,bank,0,r);
++}
++static int quarantine(const ArmSmmu4KIo *io,const ArmSmmu4KStreamState *state,unsigned count,ArmSmmu4KStreamResult *r)
++{
++    r->streams_faulted=0;int failed=0;
++    for(unsigned i=0;i<count;++i) {
++        size_t at=0xc00+4*state->streams[i].slot;uint32_t value;
++        /* First stop translation. Only after confirmed FAULT may we restore
++         * the exact owned SID and make EXIDS matching valid again. This also
++         * handles an indeterminate/failed SMR publication without activating
++         * an old or corrupted SID from an initially invalid slot. */
++        size_t smr=0x800+4*state->streams[i].slot;
++        uint32_t match=valid_smr(state->id0)|state->streams[i].sid;
++        if(wr(io,at,FAULT,r) || io->barrier(io->cookie) || rd(io,at,&value,r) || value!=FAULT ||
++            wr(io,smr,match,r) || io->barrier(io->cookie) || rd(io,smr,&value,r) || value!=match ||
++            wr(io,at,FAULT|valid_s2cr(state->id0),r) || io->barrier(io->cookie) ||
++            rd(io,at,&value,r) || value!=(FAULT|valid_s2cr(state->id0)))failed=1;
++        else ++r->streams_faulted;
++    }
++    return failed;
++}
++static ArmSmmu4KStatus observe(const ArmSmmu4KIo *io,const ArmSmmu4KStreamState *s,
++    const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
++{
++    ArmSmmu4KStatus status=global(io,r);if(status)return status;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    status=ArmSmmu4KObserveOwnedContext(io,s->bank,c,&r->context);if(status)return status;
++    status=scan(io,s->streams,s->count,s->bank,1,r);if(status)return status;
++    return io->barrier(io->cookie)?ArmSmmu4KIoError:ArmSmmu4KSuccess;
++}
++ArmSmmu4KStatus ArmSmmu4KObserveStreams(const ArmSmmu4KIo *io,const ArmSmmu4KStreamState *s,
++    const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
++    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
++    return observe(io,s,c,r);
++}
++ArmSmmu4KStatus ArmSmmu4KObserveOwnedStreams(const ArmSmmu4KIo *io,const ArmSmmu4KStreamState *s,
++    const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
++    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
++    ArmSmmu4KStatus status=global(io,r);if(status)return status;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    status=ArmSmmu4KObserveOwnedContext(io,s->bank,c,&r->context);if(status)return status;
++    for(unsigned i=0;i<s->count;++i) {
++        uint32_t smr,s2cr;
++        if(rd(io,0x800+4*s->streams[i].slot,&smr,r) || rd(io,0xc00+4*s->streams[i].slot,&s2cr,r))return ArmSmmu4KIoError;
++        if(smr!=(valid_smr(r->id0)|s->streams[i].sid) || s2cr!=(s->bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
++        ++r->streams_verified;
++    }
++    return io->barrier(io->cookie)?ArmSmmu4KIoError:ArmSmmu4KSuccess;
++}
++ArmSmmu4KStatus ArmSmmu4KAttachStreams(const ArmSmmu4KIo *io,ArmSmmu4KStreamState *state,
++    const ArmSmmu4KStream *s,unsigned n,unsigned bank,const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
++    if(!state || !s || !n || n>8 || bank>255)return ArmSmmu4KArgument;
++    if(state->attempted || state->attached || state->poisoned)return ArmSmmu4KBusy;
++    r->phase=1;ArmSmmu4KStatus status=global(io,r);if(status)return status;
++    status=ArmSmmu4KObserveOwnedContext(io,bank,c,&r->context);if(status)return status;
++    status=scan(io,s,n,bank,0,r);if(status)return status;
++    state->attempted=1;state->id0=r->id0;state->scr0=r->scr0;state->count=n;state->bank=bank;
++    for(unsigned i=0;i<n;++i)state->streams[i]=s[i];
++    unsigned touched=0;r->phase=2;
++    for(unsigned i=0;i<n;++i) {
++        uint32_t value;size_t smr=0x800+4*s[i].slot,s2cr=0xc00+4*s[i].slot;
++        touched=i+1;
++        /* In EXIDS mode make this leased slot invalid until its new SID is
++         * installed. All masters are quiesced, and unmatched SIDs fault. */
++        if(wr(io,s2cr,bank,r) || io->barrier(io->cookie) || rd(io,s2cr,&value,r)) {status=ArmSmmu4KIoError;goto failed;}
++        if(value!=bank){status=ArmSmmu4KStateMismatch;goto failed;}
++        if(wr(io,smr,valid_smr(r->id0)|s[i].sid,r) || io->barrier(io->cookie) || rd(io,smr,&value,r)) {status=ArmSmmu4KIoError;goto failed;}
++        if(value!=(valid_smr(r->id0)|s[i].sid)){status=ArmSmmu4KStateMismatch;goto failed;}
++        if(exids(r->id0) && (wr(io,s2cr,bank|valid_s2cr(r->id0),r) || io->barrier(io->cookie))) {status=ArmSmmu4KIoError;goto failed;}
++    }
++    r->phase=3;status=observe(io,state,c,r);if(status)goto failed;
++    state->attached=1;r->phase=4;return ArmSmmu4KSuccess;
++failed:
++    state->poisoned=1;state->attached=0;r->phase=5;
++    (void)quarantine(io,state,touched,r);return status;
++}
++ArmSmmu4KStatus ArmSmmu4KFaultStreams(const ArmSmmu4KIo *io,ArmSmmu4KStreamState *s,ArmSmmu4KStreamResult *r)
++{
++    if(!r)return ArmSmmu4KArgument;
++    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
++    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
++    ArmSmmu4KStatus status=global(io,r);if(status)return status;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    status=scan(io,s->streams,s->count,s->bank,1,r);if(status)return status;
++    r->phase=6;
++    if(quarantine(io,s,s->count,r)){s->poisoned=1;s->attached=0;return ArmSmmu4KIoError;}
++    s->attached=0;r->phase=7;return ArmSmmu4KSuccess;
++}
+diff --git a/bsd/dev/adreno/ArmSmmu4KStreams.h b/bsd/dev/adreno/ArmSmmu4KStreams.h
+new file mode 100644
+index 0000000..56d3d2e
+--- /dev/null
++++ b/bsd/dev/adreno/ArmSmmu4KStreams.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef ARM_SMMU_4K_STREAMS_H
++#define ARM_SMMU_4K_STREAMS_H
++#include "ArmSmmu4KProgram.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct {unsigned slot;uint16_t sid;} ArmSmmu4KStream;
++typedef struct {
++    unsigned attempted,attached,poisoned,count,bank;
++    uint32_t id0,scr0;
++    ArmSmmu4KStream streams[8];
++} ArmSmmu4KStreamState;
++typedef struct {
++    unsigned phase,reads,writes,streams_verified,streams_faulted,must_retain_resources;
++    uint32_t id0,scr0,global_fault;
++    ArmSmmu4KProgramResult context;
++} ArmSmmu4KStreamResult;
++/* Read-only preflight of global fault policy, target faulting slots and all
++ * conflicting live routes, including unrelated SIDs using the selected bank.
++ * Intended before programming a disabled context under the same global lease. */
++ArmSmmu4KStatus ArmSmmu4KCheckFaultedStreams(const ArmSmmu4KIo *,const ArmSmmu4KStream *,
++    unsigned count,unsigned bank,ArmSmmu4KStreamResult *);
++/* Native SMMUv2 exact stream matching (SMS), both legacy and EXIDS layouts.
++ * Caller owns the listed slots, bank/ASID, mappings and a global configuration
++ * lock. All client masters MUST remain quiesced until successful attachment.
++ * Requires live powered MMIO and installed context/global fault handlers,
++ * active native4K context/tables with verified physical ownership/coherence,
++ * and global fault-on-unmatched (no bypass). Global setup/quirks and context
++ * creation belong to the platform; no global reset or mask probing occurs.
++ * All target S2CRs must already fault; valid target SMRs must be exact matches.
++ * Every other active SMR is checked for overlapping requested SIDs. No masked
++ * attachment, bypass, privilege override, implicit slot selection or context
++ * reassignment is supported. Reads actual ID0 and enabled context registers.
++ * Inputs/state/result must be disjoint; state is zero-initialized and remains
++ * exclusively owned. Configuration/tables remain immutable while attached.
++ * Writes S2CR before publishing SMR; EXIDS keeps EXIDVALID clear until the
++ * exact SMR has been read back. Success rereads actual context/stream state.
++ * Any failure after a mutation attempt faults only the leased touched slots,
++ * poisons state and forbids replay. Resources are retained on EVERY outcome.
++ * Successful software I/O fixtures are not proof of active hardware tables. */
++ArmSmmu4KStatus ArmSmmu4KAttachStreams(const ArmSmmu4KIo *,ArmSmmu4KStreamState *,
++    const ArmSmmu4KStream *,unsigned count,unsigned bank,const ArmSmmu4KContextConfig *,ArmSmmu4KStreamResult *);
++/* Read-only, checks all routes/conflicts/global fault policy and complete
++ * enabled native4K context image. No fault clear or recovery is synthesized. */
++ArmSmmu4KStatus ArmSmmu4KObserveStreams(const ArmSmmu4KIo *,const ArmSmmu4KStreamState *,
++    const ArmSmmu4KContextConfig *,ArmSmmu4KStreamResult *);
++/* Read-only, the global fault policy, the complete enabled native4K context
++ * image and the exact owned routes, without the scan of every other slot for
++ * conflicting routes: a fixed read count however many slots the SMMU has. A
++ * route another agent added later is only seen by ArmSmmu4KObserveStreams,
++ * which a caller observing this way must still run at a bounded interval. */
++ArmSmmu4KStatus ArmSmmu4KObserveOwnedStreams(const ArmSmmu4KIo *,const ArmSmmu4KStreamState *,
++    const ArmSmmu4KContextConfig *,ArmSmmu4KStreamResult *);
++/* Require exact owned active routes before changing them to FAULT. SMRs stay
++ * valid, so those SIDs remain blocked. Does not drain transactions/TLBs, stop
++ * devices, disable context, release ownership or authorize freeing tables.
++ * Failure poisons state; external real reset/recovery is required. */
++ArmSmmu4KStatus ArmSmmu4KFaultStreams(const ArmSmmu4KIo *,ArmSmmu4KStreamState *,ArmSmmu4KStreamResult *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/adreno/LICENSE.ArmSmmu4K b/bsd/dev/adreno/LICENSE.ArmSmmu4K
+new file mode 100644
+index 0000000..f5c4149
+--- /dev/null
++++ b/bsd/dev/adreno/LICENSE.ArmSmmu4K
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 ArmSmmu4K contributors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/bsd/dev/adreno/SOURCE.txt b/bsd/dev/adreno/SOURCE.txt
+new file mode 100644
+index 0000000..72be969
+--- /dev/null
++++ b/bsd/dev/adreno/SOURCE.txt
+@@ -0,0 +1 @@
++ArmSmmu4K 4d0d6598b1a36aeec3de01091893fa6660e49388 (2026-10-20)
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 3586518..b2e0881 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -24,6 +24,14 @@
+  * GPLL0 (GCC 0x52000 bits 15/16), then SCM GPU_INIT_REGS (SIP svc 0x28 cmd 1, one
+  * argument: ALWAYS_EN | TSENSE_EN = 0x9, bits from include/linux/firmware/qcom/qcom_scm.h),
+  * after asking whether the call exists; then GPUCC and the GMU state are read again.
++ * (gpu3 log: the call exists and returns 0.)
++ *
++ * Level 4 (patch 0165, "4a"): the GMU's own SMMU context on the GPU SMMU, the GMU still held
++ * in reset. Five physically contiguous buffers at Linux's fixed GMU addresses (a6xx_gmu_init:
++ * icache 0x4000 16 MiB-16 KiB, dummy 0x60000000, log and hfi after it, debug 0x60400000),
++ * native 4 KiB stage-1 tables built by UniXNU's ArmSmmu4K (MIT, bsd/dev/adreno/), ACTLR 0x32b
++ * from the phone's DT for the GMU stream, the context programmed, read back and enabled by
++ * ArmSmmu4K, then stream ID 5 routed to it through a free stream-match slot.
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -37,8 +45,14 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "adreno/ArmSmmu4KStreams.h"
++#include "adreno/ArmSmmu4KMmio.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3,
+     uint64_t *a0, uint64_t *a1);  /* bsd/dev/pandora_adsp.c */
+@@ -403,6 +417,166 @@ gpu_level3(void)
+ 	return a0 == 0;
+ }
+ 
++/* ---- level 4a: the GMU's SMMU context ------------------------------------------------- */
++
++#define SMMU_SIZE         0x40000u     /* DT kgsl-smmu reg length: 32 global + 32 context pages */
++#define GMU_SID           5u           /* DT gmu iommus = <&kgsl_smmu 0x5 0x0> */
++#define GMU_ACTLR         0x32bu       /* DT qcom,actlr for the GPU SMMU's streams */
++#define GMU_BANK          1u
++#define GMU_ASID          1u
++#define GMU_SLOT          2u
++#define GMU_TABLE_PAGES   64u
++
++struct gmu_buf {
++	const char *name;
++	uint64_t iova, bytes;
++	unsigned perm;
++	vm_offset_t va;
++	uint64_t pa;
++};
++
++/* Linux a6xx_gmu_init / a6xx_gmu_memory_alloc for a8xx, sorted by GMU address. */
++static struct gmu_buf gmu_bufs[] = {
++	{ "icache", 0x00004000u, 0xffc000u, ArmSmmu4KRead | ArmSmmu4KWrite | ArmSmmu4KExecute | ArmSmmu4KPrivileged, 0, 0 },
++	{ "dummy", 0x60000000u, 0x4000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++	{ "log", 0x60004000u, 0x4000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++	{ "hfi", 0x60008000u, 0x4000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++	{ "debug", 0x60400000u, 0x7000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++};
++#define GMU_NBUFS (sizeof(gmu_bufs) / sizeof(gmu_bufs[0]))
++
++static ArmSmmu4KMmio gmu_mmio;
++static ArmSmmu4KIo gmu_io;
++static ArmSmmu4KConfig gmu_tcfg;
++static ArmSmmu4KResult gmu_tables;
++static ArmSmmu4KContextConfig gmu_ctx;
++static ArmSmmu4KProgramResult gmu_prog;
++static ArmSmmu4KStreamState gmu_streams;
++static ArmSmmu4KStreamResult gmu_sres;
++
++/* Physically contiguous, zeroed, wired for good; returns the kernel address and fills *pa. */
++static vm_offset_t
++gpu_contig(uint64_t bytes, uint64_t *pa)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, (vm_size_t)bytes, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	*pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	/* The SMMU walks the tables and the GMU reads the buffers non-cacheably. */
++	clean_dcache64((addr64_t)*pa, (unsigned)bytes, TRUE);
++	return va;
++}
++
++static bool
++gpu_level4a(void)
++{
++	/* Memory. */
++	for (unsigned i = 0; i < GMU_NBUFS; i++) {
++		struct gmu_buf *b = &gmu_bufs[i];
++		b->va = gpu_contig(b->bytes, &b->pa);
++		if (!b->va) {
++			printf("PANDORA GPU: GMU %s: no %#llx contiguous bytes\n", b->name, b->bytes);
++			return false;
++		}
++		printf("PANDORA GPU: GMU %s: iova %#llx bytes %#llx pa %#llx\n", b->name, b->iova, b->bytes, b->pa);
++	}
++	uint64_t tpa;
++	vm_offset_t tva = gpu_contig(GMU_TABLE_PAGES * 0x1000ull, &tpa);
++	if (!tva) {
++		printf("PANDORA GPU: GMU tables: no memory\n");
++		return false;
++	}
++
++	/* SMMU window and what the context encoding needs from it. */
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		printf("PANDORA GPU: SMMU window not mapped\n");
++		return false;
++	}
++	gmu_mmio.mapping = (volatile unsigned char *)smmu;
++	gmu_mmio.bytes = SMMU_SIZE;
++	if (ArmSmmu4KBindMmio(&gmu_mmio, &gmu_io) != ArmSmmu4KSuccess) {
++		return false;
++	}
++	uint32_t id0 = gpu_rd(smmu, SMMU_ID0), id1 = gpu_rd(smmu, SMMU_ID1), id2 = gpu_rd(smmu, SMMU_ID2);
++	static const uint8_t oas_bits[16] = {32, 36, 40, 42, 44, 48};
++	unsigned oas = ((id2 >> 4) & 15) < 6 ? oas_bits[(id2 >> 4) & 15] : 0;
++	if (oas > 40) {
++		oas = 40;
++	}
++
++	/* Tables. */
++	ArmSmmu4KRange ranges[GMU_NBUFS];
++	uint64_t leaves = 0;
++	for (unsigned i = 0; i < GMU_NBUFS; i++) {
++		ranges[i] = (ArmSmmu4KRange){ gmu_bufs[i].iova, gmu_bufs[i].pa, gmu_bufs[i].bytes,
++			                      gmu_bufs[i].perm, 0, 2 };
++		leaves += gmu_bufs[i].bytes / 0x1000;
++		if ((gmu_bufs[i].pa >> oas) != 0) {
++			printf("PANDORA GPU: GMU %s above the %u-bit output size\n", gmu_bufs[i].name, oas);
++			return false;
++		}
++	}
++	gmu_tcfg = (ArmSmmu4KConfig){ 32, oas, tpa, (size_t)leaves };
++	ArmSmmu4KStatus st = ArmSmmu4KBuild(&gmu_tcfg, ranges, GMU_NBUFS, (uint64_t *)tva,
++	    GMU_TABLE_PAGES, &gmu_tables);
++	printf("PANDORA GPU: GMU tables: status %d root %#llx pages %zu leaves %zu start level %u mair %#llx "
++	    "(oas %u, id0 %08x id1 %08x id2 %08x)\n", st, gmu_tables.root_physical, gmu_tables.table_pages,
++	    gmu_tables.leaf_pages, gmu_tables.start_level, gmu_tables.mair, oas, id0, id1, id2);
++	if (st != ArmSmmu4KSuccess) {
++		return false;
++	}
++	clean_dcache64((addr64_t)tpa, (unsigned)(gmu_tables.table_pages * 0x1000), TRUE);
++
++	/* Context bank: must be disabled; ACTLR is the platform's part (the kit does not write it). */
++	uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	uint64_t numpage = 1ull << (((id1 >> 28) & 7) + 1);
++	uint64_t cb = numpage * page + GMU_BANK * page;
++	if (cb + 0x1000 > SMMU_SIZE) {
++		printf("PANDORA GPU: context bank %u at %#llx outside the window\n", GMU_BANK, cb);
++		return false;
++	}
++	uint32_t sctlr = gpu_rd(smmu, (uint32_t)cb);
++	printf("PANDORA GPU: SMMU bank %u at %#llx: sctlr %08x actlr %08x cbar %08x\n", GMU_BANK, cb, sctlr,
++	    gpu_rd(smmu, (uint32_t)cb + 4), gpu_rd(smmu, (uint32_t)(page + 4 * GMU_BANK)));
++	if (sctlr & 1) {
++		printf("PANDORA GPU: bank %u already enabled: stop\n", GMU_BANK);
++		return false;
++	}
++	gpu_step("SMMU: ACTLR, then program and enable the GMU context");
++	gpu_wr(smmu, (uint32_t)cb + 4, GMU_ACTLR);
++	gmu_ctx = (ArmSmmu4KContextConfig){ &gmu_tcfg, NULL, &gmu_tables, NULL, id0, id2, GMU_ASID, 0, 0, 0 };
++	st = ArmSmmu4KProgramDisabledContext(&gmu_io, GMU_BANK, &gmu_ctx, 1000, &gmu_prog);
++	printf("PANDORA GPU: SMMU context: status %d phase %u writes %u enabled %u fsr %08x actlr %08x sctlr %08x "
++	    "tcr %08x ttbr0 %#llx mair0 %08x\n", st, gmu_prog.phase, gmu_prog.writes, gmu_prog.enabled,
++	    gmu_prog.fault_status, gpu_rd(smmu, (uint32_t)cb + 4), gmu_prog.readback.sctlr, gmu_prog.readback.tcr,
++	    gmu_prog.readback.ttbr0, gmu_prog.readback.mair0);
++	if (st != ArmSmmu4KSuccess) {
++		return false;
++	}
++
++	/* Stream: the free slot's S2CR must fault before the kit attaches it. */
++	uint32_t smr = gpu_rd(smmu, SMMU_SMR(GMU_SLOT)), s2cr = gpu_rd(smmu, SMMU_S2CR(GMU_SLOT));
++	printf("PANDORA GPU: SMMU slot %u before: smr %08x s2cr %08x\n", GMU_SLOT, smr, s2cr);
++	if (smr & (1u << 31)) {
++		printf("PANDORA GPU: slot %u in use: stop\n", GMU_SLOT);
++		return false;
++	}
++	if (s2cr != (2u << 16)) {
++		gpu_wr(smmu, SMMU_S2CR(GMU_SLOT), 2u << 16);
++		printf("PANDORA GPU: slot %u S2CR set to fault: %08x\n", GMU_SLOT, gpu_rd(smmu, SMMU_S2CR(GMU_SLOT)));
++	}
++	gpu_step("SMMU: route stream 5 to the GMU context");
++	ArmSmmu4KStream route = { GMU_SLOT, (uint16_t)GMU_SID };
++	st = ArmSmmu4KAttachStreams(&gmu_io, &gmu_streams, &route, 1, GMU_BANK, &gmu_ctx, &gmu_sres);
++	printf("PANDORA GPU: SMMU stream: status %d phase %u writes %u verified %u global fault %08x; "
++	    "slot %u smr %08x s2cr %08x\n", st, gmu_sres.phase, gmu_sres.writes, gmu_sres.streams_verified,
++	    gmu_sres.global_fault, GMU_SLOT, gpu_rd(smmu, SMMU_SMR(GMU_SLOT)), gpu_rd(smmu, SMMU_S2CR(GMU_SLOT)));
++	return st == ArmSmmu4KSuccess;
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -411,7 +585,7 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
+ 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
+-	    "3 = GPLL0 vote and GPU_INIT_REGS)\n", level);
++	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context)\n", level);
+ 	gpu_cmddb();
+ 	if (gpu_read_cc(true)) {
+ 		gpu_read_smmu();
+@@ -429,6 +603,11 @@ gpu_thread(void *arg, wait_result_t result)
+ 				printf("PANDORA GPU: level 3 %s\n", ok ? "done" : "SCM call failed");
+ 				(void)gpu_read_cc(false);
+ 				gpu_read_gmu();
++				if (ok && level >= 4) {
++					bool ctx = gpu_level4a();
++					printf("PANDORA GPU: level 4a (GMU SMMU context) %s\n", ctx ? "done" : "stopped");
++					gpu_read_gmu();
++				}
+ 			}
+ 		}
+ 	}
