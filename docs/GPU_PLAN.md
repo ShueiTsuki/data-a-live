@@ -106,11 +106,9 @@ iOS 根盘上一共 138 个 metallib，入口函数里有 7620 个计算内核�
 | | 数量 |
 | --- | --- |
 | 计算内核总数 | 7620 |
-| 翻译通过，并且 Turnip 编成 840 机器码 | **6142**（Turnip 编译 0 失败） |
-| 没测到：Espresso（Core ML 的神经网络库），每个内核常量太多，补跑太慢，中途停掉 | 1028 |
-| 测了没通过 | 450 |
-
-不算没测到的部分，通过率约 93%。没通过的里面，真正属于 metal2vulkan 功能缺口的都在和主屏画面无关的库里：MPSNeuralNetwork 的卷积内核 235 个（采样器的一种用法还没实现）、MTLReplayer.app（开发者用的 GPU 回放工具）56 个（内建函数签名不匹配）、NRFV3 相机降噪 13 个（imageblock 等）、CoreRE（AR）4 个、其他 2 个。其余失败都是测试输入问题：缺链接函数、可见函数表、stage input、存储纹理格式、tile 附件。QuartzCore 的 4 个就是 tile 函数。**和主屏、墙纸、小组件、图标相关的库里没有发现翻译缺口。**
+| 翻译通过，并且 Turnip 编成 840 机器码 | **7170（94.1%）**，Turnip 编译 0 失败 |
+| 其中 Espresso（Core ML 的神经网络库，常量很多，改用 `census_lib_parallel.sh` 按内核并行测） | 1981 个全部通过 |
+| 没通过 | 450 |没通过的里面，真正属于 metal2vulkan 功能缺口的都在和主屏画面无关的库里：MPSNeuralNetwork 的卷积内核 235 个（采样器的一种用法还没实现）、MTLReplayer.app（开发者用的 GPU 回放工具）56 个（内建函数签名不匹配）、NRFV3 相机降噪 13 个（imageblock 等）、CoreRE（AR）4 个、其他 2 个。其余失败都是测试输入问题：缺链接函数、可见函数表、stage input、存储纹理格式、tile 附件。QuartzCore 的 4 个就是 tile 函数。**和主屏、墙纸、小组件、图标相关的库里没有发现翻译缺口。**
 
 ### Linux 的 a840 数据和这台手机原厂驱动的对照 [实测，详见调研笔记 `kgsl_vs_linux_a840.md`]
 从手机只读复制了安卓的 `msm_kgsl.ko`（带符号），解析出 `adreno_gpu_core_gen8_2_1` 和它指向的各张表，逐条和 Linux 的 a840 条目比对：
