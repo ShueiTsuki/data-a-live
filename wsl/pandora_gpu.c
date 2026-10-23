@@ -128,6 +128,8 @@
  * (gpu15 log: all read back as written except RB_CMP_NC_MODE_CNTL bits 1-2; tests pass.)
  * Patch 0182: the chip id given to user space carries the enabled slice count (0x44050a31).
  * Patch 0183: gpu_step no longer waits 3.5 s for the log flush unless pandora_gpu_slow=1.
+ * Patch 0187: imported buffers (BoImport, an IOSurface's pages): mapped page by page with one TLB
+ * invalidate, cleaned and invalidated from the CPU caches before each submission of their client.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -1715,7 +1717,21 @@ gpu_level12(void)
  * (normal non-cacheable, outer shareable, as NativeAdreno maps user buffers), table pages taken
  * from the rest of the context's pool, then TLBIALL for the bank. Refuses pages already mapped. */
 static bool
+smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *pages, uint64_t bytes,
+    unsigned perm);
+static void smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes);
+
+static bool
 smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigned perm)
+{
+	return smmu_map_pages(c, iova, pa, NULL, bytes, perm);
+}
+
+/* PAGES, when given, holds the physical address of each 4K page (an imported buffer, patch 0187);
+ * otherwise the range is PA onwards. A failure takes back the leaves this call wrote. */
+static bool
+smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *pages, uint64_t bytes,
+    unsigned perm)
 {
 	uint64_t pool = c->tables.root_physical, attr = (1u << 11) | (1u << 10) | 3 | (2u << 8);
 	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
@@ -1730,27 +1746,35 @@ smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigne
 		attr |= 1u << 7;
 	}
 	for (uint64_t off = 0; off < bytes; off += 0x1000) {
-		uint64_t va = iova + off;
+		uint64_t va = iova + off, page = pages ? pages[off >> 12] : pa + off;
 		uint64_t *t = (uint64_t *)c->tva;      /* root page */
-		for (unsigned level = start; level < 3; level++) {
+		bool ok = (page & 0xfff) == 0;
+		for (unsigned level = start; level < 3 && ok; level++) {
 			unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
 			uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
 			if (!*e) {
 				if (c->tnext >= c->tpages) {
 					printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
-					return false;
+					ok = false;
+					break;
 				}
 				*e = (pool + 0x1000ull * c->tnext++) | 3;
 				clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - c->tva)), 8, TRUE);
 			}
 			t = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
 		}
-		uint64_t *leaf = &t[(va >> 12) & 511];
-		if (*leaf) {
+		uint64_t *leaf = ok ? &t[(va >> 12) & 511] : NULL;
+		if (leaf && *leaf) {
 			printf("PANDORA GPU: iova %#llx already mapped (%#llx)\n", va, *leaf);
+			ok = false;
+		}
+		if (!ok) {
+			if (off) {
+				smmu_unmap(c, iova, off);
+			}
 			return false;
 		}
-		*leaf = (pa + off) | attr;
+		*leaf = page | attr;
 		clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - c->tva)), 8, TRUE);
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -2143,10 +2167,33 @@ struct gpu_bo {
 	int client;
 	uint32_t gen, perm, leases;
 	uint64_t off, bytes, iova;      /* iova 0 = not mapped */
+	uint64_t *pages;                /* an imported buffer's 4K pages (BoImport, patch 0187), else NULL */
+	void *ref;                      /* its pinning descriptor, given back by pandora_gpu_release_ref */
 	uint32_t meta_len;
 	char meta[64];
 };
 static struct gpu_bo gpu_bos[GPU_MAX_BOS];
+
+/* iokit/Kernel/arm/PandoraAdrenoGpu.cpp: unpin an imported buffer's pages. */
+extern void pandora_gpu_release_ref(void *ref);
+
+/* Under the lock: unmap and give back a buffer, from the pool or imported. */
+static void
+gpu_bo_release(struct gpu_bo *b)
+{
+	if (b->iova) {
+		smmu_unmap(&gpu_smmu, b->iova, b->bytes);
+	}
+	if (b->pages) {
+		kfree_data(b->pages, (vm_size_t)(b->bytes >> 12) * sizeof(uint64_t));
+		pandora_gpu_release_ref(b->ref);
+	} else {
+		gpu_pool_free(b->off, b->bytes);
+	}
+	b->pages = NULL;
+	b->ref = NULL;
+	b->used = false;
+}
 static struct {
 	bool used, reset;
 	uint64_t va_start, va_size;
@@ -2267,11 +2314,7 @@ pandora_gpu_close(int client)
 	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
 		struct gpu_bo *b = &gpu_bos[i];
 		if (b->used && b->client == client) {
-			if (b->iova) {
-				smmu_unmap(&gpu_smmu, b->iova, b->bytes);
-			}
-			gpu_pool_free(b->off, b->bytes);
-			b->used = false;
+			gpu_bo_release(b);
 			n++;
 		}
 	}
@@ -2322,7 +2365,7 @@ pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
 		err = EINVAL;
 	} else if (b->iova) {
 		err = EBUSY;
-	} else if (!smmu_map(&gpu_smmu, iova, gpu_pool_pa + b->off, b->bytes,
+	} else if (!smmu_map_pages(&gpu_smmu, iova, gpu_pool_pa + b->off, b->pages, b->bytes,
 	    ArmSmmu4KRead | ((perm & 2) ? ArmSmmu4KWrite : 0))) {
 		err = EEXIST;
 	} else {
@@ -2349,11 +2392,7 @@ pandora_gpu_bo_free(int client, uint64_t handle)
 	} else if (b->leases) {
 		err = EBUSY;
 	} else {
-		if (b->iova) {
-			smmu_unmap(&gpu_smmu, b->iova, b->bytes);
-		}
-		gpu_pool_free(b->off, b->bytes);
-		b->used = false;
+		gpu_bo_release(b);
 	}
 	lck_mtx_unlock(&gpu_lock);
 	return err;
@@ -2370,7 +2409,7 @@ pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token, ui
 	int err = 0;
 	lck_mtx_lock(&gpu_lock);
 	struct gpu_bo *b = gpu_bo_get(client, handle);
-	if (!b || (delta < 0 && !b->leases)) {
+	if (!b || b->pages || (delta < 0 && !b->leases)) {     /* an imported buffer has no CPU view token */
 		err = EINVAL;
 	} else {
 		b->leases += delta;
@@ -2379,6 +2418,42 @@ pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token, ui
 		*leases = b->leases;
 	}
 	lck_mtx_unlock(&gpu_lock);
+	return err;
+}
+
+/*
+ * BoImport: a buffer over the caller's own pinned pages (an IOSurface's), PAGES[N] physical, REF
+ * the descriptor that pins them. It keeps the caller's CPU mapping and cache mode; the GPU maps
+ * it non-cacheable, and every submission of the client cleans and invalidates those pages first.
+ */
+int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle);
+int
+pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle)
+{
+	if (!n || n > (256u << 20) >> 12) {
+		return EINVAL;
+	}
+	uint64_t *copy = kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
+	if (!copy) {
+		return ENOMEM;
+	}
+	memcpy(copy, pages, n * sizeof(uint64_t));
+	int err = ENOMEM;
+	lck_mtx_lock(&gpu_lock);
+	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
+		struct gpu_bo *b = &gpu_bos[i];
+		if (!b->used) {
+			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen,
+				              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref };
+			*handle = ((uint64_t)b->gen << 32) | (i + 1);
+			err = 0;
+			break;
+		}
+	}
+	lck_mtx_unlock(&gpu_lock);
+	if (err) {
+		kfree_data(copy, n * sizeof(uint64_t));
+	}
 	return err;
 }
 
@@ -2444,7 +2519,7 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 			struct gpu_bo *b = &gpu_bos[j];
 			if (b->used && b->client == client && b->iova && (b->perm & 1) && iova[i] >= b->iova &&
 			    iova[i] + bytes[i] <= b->iova + b->bytes) {
-				if (i == 0) {
+				if (i == 0 && !b->pages) {
 					uint64_t pa = gpu_pool_pa + b->off + (iova[i] - b->iova);
 					gpu_pool_sync(pa - gpu_pool_pa, 4, true);
 					vm_offset_t fv = gpu_pool_map(pa - gpu_pool_pa, 4);
@@ -2471,6 +2546,16 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 		delay(100);
 	}
 	if (!err) {
+		/* The client's imported buffers out of the CPU caches: their pages are the caller's
+		 * cacheable memory, the GPU reads and writes them non-cacheably. */
+		for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
+			struct gpu_bo *b = &gpu_bos[j];
+			if (b->used && b->client == client && b->pages && b->iova) {
+				for (uint64_t k = 0; k < b->bytes >> 12; k++) {
+					flush_dcache64((addr64_t)b->pages[k], 0x1000, TRUE);
+				}
+			}
+		}
 		uint32_t thread = first == 0x70970001u ? 3 : 1;
 		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
 		gpu_clients[client].reset = false;

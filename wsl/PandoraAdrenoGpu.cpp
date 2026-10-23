@@ -10,7 +10,8 @@
  * 0x4147 makes an AGXDeviceUserClient (the class name Apple's sandbox profiles allow). Every
  * method is struct-in/struct-out with exact sizes; any selector also accepts the tunnel
  * {u32 'NTNL', u32 method, payload}, and method 0xffffffff is the probe Turnip sends.
- * Not yet: host import (16), queues (11, 12). Status (8) answers zero counts (patch 0186).
+ * Not yet: queues (11, 12). Status (8) answers zero counts (patch 0186); host import (16) pins the
+ * caller's pages (patch 0187).
  */
 #include <pexpert/arm64/board_config.h>
 #if defined(SWEET)
@@ -39,6 +40,8 @@ int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, 
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 uint64_t pandora_gpu_timestamp(void);
 uint32_t pandora_gpu_chip_id(void);
+int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, uint64_t *handle);
+void pandora_gpu_release_ref(void *ref);
 }
 
 #define PANDORA_GPU_OPEN_TYPE   0x4147u
@@ -65,6 +68,7 @@ class AGXDeviceUserClient : public IOUserClient {
 
 public:
 	int client_ = -1;
+	task_t task_ = TASK_NULL;                   /* the opening task: BoImport pins its pages */
 	IOMemoryDescriptor **views_ = nullptr;      /* per CPU-view token, kept until its last lease */
 
 	void free(void) APPLE_KEXT_OVERRIDE;
@@ -145,7 +149,7 @@ static const uint16_t pandora_gpu_sizes[17][2] = {
 	{ sizeof(NativeAdrenoAbiBoCpuMap), sizeof(NativeAdrenoAbiBoCpuMapReply) },
 	{ sizeof(NativeAdrenoAbiBoCpuUnmap), 0 },
 	{ 0, sizeof(NativeAdrenoAbiDeviceInfo) },
-	{ 0xffff, 0xffff },
+	{ sizeof(NativeAdrenoAbiBoImport), sizeof(NativeAdrenoAbiBoAllocReply) },
 };
 
 IOReturn
@@ -159,7 +163,8 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 	}
 	switch (m) {
 	case NativeAdrenoMethodQuery: {
-		NativeAdrenoAbiParams p = { NativeAdrenoAbiVersion, 32, 36, 0, 1ull << NativeAdrenoAbiMaxBoBytesShift };
+		NativeAdrenoAbiParams p = { NativeAdrenoAbiVersion, 32, 36, NativeAdrenoParamsHostImport,
+			1ull << NativeAdrenoAbiMaxBoBytesShift };
 		memcpy(out, &p, sizeof(p));
 		return kIOReturnSuccess;
 	}
@@ -267,6 +272,44 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 			views_[token - 1]->release();
 			views_[token - 1] = nullptr;
 		}
+		return pandora_gpu_ret(err);
+	}
+	case NativeAdrenoMethodBoImport: {
+		/* The caller's own pages [address, address + bytes), wired by a descriptor that stays
+		 * prepared until the buffer is freed (pandora_gpu_release_ref). */
+		NativeAdrenoAbiBoImport a;
+		NativeAdrenoAbiBoAllocReply r = { 0 };
+		memcpy(&a, in, sizeof(a));
+		if (!a.bytes || ((a.address | a.bytes) & 0xfff) || a.bytes > (1ull << NativeAdrenoAbiMaxBoBytesShift)) {
+			return kIOReturnBadArgument;
+		}
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)a.address,
+		    (mach_vm_size_t)a.bytes, kIODirectionInOut, task_);
+		if (md == nullptr) {
+			return kIOReturnNoMemory;
+		}
+		IOReturn ret = md->prepare();
+		if (ret != kIOReturnSuccess) {
+			md->release();
+			return ret;
+		}
+		const uint32_t n = (uint32_t)(a.bytes >> 12);
+		uint64_t *pages = (uint64_t *)IOMallocData(n * sizeof(uint64_t));
+		bool whole = pages != nullptr;
+		for (uint32_t i = 0; whole && i < n; i++) {
+			IOByteCount len = 0;
+			pages[i] = md->getPhysicalSegment((IOByteCount)i << 12, &len, kIOMemoryMapperNone);
+			whole = pages[i] && !(pages[i] & 0xfff) && len >= 0x1000;
+		}
+		int err = whole ? pandora_gpu_bo_import(client_, pages, n, md, &r.handle) : EINVAL;
+		if (pages != nullptr) {
+			IOFreeData(pages, n * sizeof(uint64_t));
+		}
+		if (err) {
+			md->complete();
+			md->release();
+		}
+		memcpy(out, &r, sizeof(r));
 		return pandora_gpu_ret(err);
 	}
 	case NativeAdrenoMethodGetDeviceInfo: {
@@ -377,6 +420,7 @@ pandora_gpu_new_client(IOService *owner, task_t owningTask, void *securityID, UI
 		return kIOReturnNoMemory;
 	}
 	uc->client_ = c;
+	uc->task_ = owningTask;
 	uc->views_ = (IOMemoryDescriptor **)views;
 	if (!uc->attach(owner) || !uc->start(owner)) {
 		uc->detach(owner);
@@ -444,5 +488,15 @@ AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
     __unused OSDictionary *properties, IOUserClient **handler)
 {
 	return pandora_gpu_new_client(this, owningTask, securityID, type, handler);
+}
+/* For bsd/dev/pandora_gpu.c: unpin an imported buffer (its BoImport descriptor). */
+extern "C" void
+pandora_gpu_release_ref(void *ref)
+{
+	IOMemoryDescriptor *md = (IOMemoryDescriptor *)ref;
+	if (md != nullptr) {
+		md->complete();
+		md->release();
+	}
 }
 #endif /* SWEET */

@@ -6,10 +6,12 @@
  *   1. the device (name, family support)
  *   2. compute: mtltest.metal's fill kernel over 4096 threads into a shared buffer, read back
  *   3. render: a triangle into a 64x64 RGBA8 texture, blitted to a buffer and checked
+ *   4. IOSurface: the same triangle into a texture over an IOSurface (BoImport), read by the CPU
  * Lines go to /dev/console with the prefix "MTLTEST:" (the kernel log); stdout and stderr too.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -155,6 +157,75 @@ run(void)
 					say("MTLTEST: part 3: row %2u %s", y, row);
 				}
 				failures += bad != 0 || cb.status != MTLCommandBufferStatusCompleted;
+			}
+		}
+
+		/* ---- part 4: render into an IOSurface (the render server's way), read by the CPU ---- */
+		{
+			NSDictionary *props = @{
+				(id)kIOSurfaceWidth: @64, (id)kIOSurfaceHeight: @64, (id)kIOSurfaceBytesPerElement: @4,
+				(id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @((uint32_t)'RGBA'),
+			};
+			IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			    width:64 height:64 mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			td.storageMode = MTLStorageModeShared;
+			id<MTLTexture> tex = surface ? [dev newTextureWithDescriptor:td iosurface:surface plane:0] : nil;
+			MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+			rpd.vertexFunction = [lib newFunctionWithName:@"tri_vs"];
+			rpd.fragmentFunction = [lib newFunctionWithName:@"tri_fs"];
+			rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+			err = nil;
+			id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+			say("MTLTEST: part 4: IOSurface %p id %u", surface, surface ? IOSurfaceGetID(surface) : 0);
+			if (!check("part 4: texture over the IOSurface (BoImport)", tex, nil) &&
+			    !check("part 4: render pipeline", rps, err)) {
+				MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+				pass.colorAttachments[0].texture = tex;
+				pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+				pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+				pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+				id<MTLCommandBuffer> cb = [queue commandBuffer];
+				id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+				[enc setRenderPipelineState:rps];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+				const volatile uint32_t *s = (const volatile uint32_t *)IOSurfaceGetBaseAddress(surface);
+				const size_t row = IOSurfaceGetBytesPerRow(surface) / 4;
+				unsigned green = 0, black = 0, other = 0, bad = 0;
+				for (unsigned y = 0; y < 64; y++) {
+					for (unsigned x = 0; x < 64; x++) {
+						uint32_t v = s[y * row + x];
+						green += v == 0xff00ff00u;
+						black += v == 0xff000000u;
+						other += v != 0xff00ff00u && v != 0xff000000u;
+						if (x + y + 2 < 63) {
+							bad += v != 0xff00ff00u;
+						} else if (x + y > 63 + 2) {
+							bad += v != 0xff000000u;
+						}
+					}
+				}
+				say("MTLTEST: part 4: status %ld row %zu; green %u black %u other %u; %u clearly wrong%s",
+				    (long)cb.status, row * 4, green, black, other, bad, bad ? " FAIL" : "");
+				for (unsigned y = 0; y < 64; y += 16) {
+					char line[65];
+					for (unsigned x = 0; x < 64; x++) {
+						uint32_t v = s[y * row + x];
+						line[x] = v == 0xff00ff00u ? '#' : v == 0xff000000u ? '.' : '?';
+					}
+					line[64] = 0;
+					say("MTLTEST: part 4: row %2u %s", y, line);
+				}
+				IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+				failures += bad != 0 || cb.status != MTLCommandBufferStatusCompleted;
+			}
+			if (surface) {
+				CFRelease(surface);
 			}
 		}
 }

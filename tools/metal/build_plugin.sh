@@ -97,7 +97,7 @@ xcrun -sdk iphoneos metal -mios-version-min=16.0 -c "$ROOT/tools/metal/mtltest.m
 xcrun -sdk iphoneos metallib "$B/mtltest.air" -o "$B/mtltest.metallib"
 (cd "$B" && xxd -i mtltest.metallib > gen/mtltest_metallib.h)
 xcrun clang "${BASE[@]}" -fobjc-arc -Wall -I "$B/gen" "$ROOT/tools/metal/mtltest.m" \
-	-framework Foundation -framework Metal -o "$OUT/mtltest"
+	-framework Foundation -framework Metal -framework IOSurface -o "$OUT/mtltest"
 codesign -s - -f "$OUT/mtltest"
 
 otool -L "$BUNDLE/NativeAdrenoMetal" "$OUT/mtltest"
