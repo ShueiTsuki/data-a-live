@@ -76,6 +76,17 @@ edit('NativeBridgeMetalFrontend.mm',
  NSLog(@"pandora-metal refused: %@", why);   // ios-pandora: every refusal in the log (backboardd: specialize, bb7)
  return""")
 edit('NativeBridgeMetalFrontend.mm',
+     """  case 84:case 88:return 32;
+  default:return 0;""",
+     """  case 84:case 88:return 32;
+  // ios-pandora: 3-wide vectors, lanes packed as metal2vulkan's canon/fc.rs reads them (the first
+  // lanes*width bytes; Metal's storage is at least that). iOS 16 backboardd specializes a uchar3 (bb8).
+  case 5:case 31:case 35:return 12;
+  case 18:case 39:case 43:return 6;
+  case 47:case 51:case 55:return 3;
+  case 83:case 87:return 24;
+  default:return 0;""")
+edit('NativeBridgeMetalFrontend.mm',
      """ if(!base || class_getInstanceSize(base)!=536){""",
      """ // ios-pandora: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
  if(!base || (class_getInstanceSize(base)!=536 && class_getInstanceSize(base)!=528)){""")
