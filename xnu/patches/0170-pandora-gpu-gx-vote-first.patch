@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 1203d22..677d0c2 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -62,6 +62,10 @@
+  * with the lowest levels (perf index 1 = 160 MHz, bw index 1) where Linux starts at the top,
+  * then a8xx_gmu_gx_is_on (PWR_CLK_STATUS & 3 == 0); only then RBBM_STATUS (A8XX 0x012) is
+  * read from the GPU's own registers. a6xx_gmu_clear_oob (bit 31) at the end.
++ * (gpu8 log: no OOB ack within 10 ms, GMU2HOST_INTR_INFO 0.) Patch 0170: Linux's order
++ * instead: a6xx_gmu_resume, after a6xx_hfi_start, clears GMU2HOST_INTR, sets its mask to
++ * ~CM3_FAULT and sends the GX vote (a6xx_gmu_set_initial_freq); the OOB GPU_SET comes later,
++ * from a8xx hw_init. Here: interrupts, vote, then OOB with 100 ms (the GMU runs on XO).
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -877,6 +881,7 @@ gpu_level5(void)
+ 
+ #define GMU_GMU2HOST_INTR_CLR     0x1f991u
+ #define GMU_GMU2HOST_INTR_INFO    0x1f992u
++#define GMU_GMU2HOST_INTR_MASK    0x1f993u
+ #define GMU_HOST2GMU_INTR_SET     0x1f994u
+ #define HFI_QUEUE_DWORDS          1024u
+ #define HFI_F2H_MSG_ERROR         100u
+@@ -1220,22 +1225,30 @@ gpu_level8(void)
+ 		printf("PANDORA GPU: GPU window not mapped\n");
+ 		return false;
+ 	}
+-	gpu_step("GMU: OOB GPU_SET, GX vote (160 MHz, lowest bandwidth)");
+-	/* a6xx_gmu_set_oob(GMU_OOB_GPU_SET), non-legacy bits */
+-	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
+-	uint32_t info = gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 10000, &ok);
+-	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+-	printf("PANDORA GPU: OOB GPU_SET %s (intr info %08x)\n", ok ? "acked" : "NOT ACKED", info);
+-	if (!ok) {
+-		return false;
+-	}
+-	/* a6xx_hfi_set_freq */
++	gpu_step("GMU: interrupts, GX vote (160 MHz, lowest bandwidth), OOB GPU_SET");
++	/* a6xx_gmu_resume after a6xx_hfi_start: CM3 fault interrupt on, everything else masked */
++	gmu_wr(GMU_GMU2HOST_INTR_CLR, ~0u);
++	gmu_wr(GMU_GMU2HOST_INTR_MASK, ~(1u << 23));
++	/* a6xx_gmu_set_initial_freq -> a6xx_hfi_set_freq */
+ 	static uint32_t vote[4];
+ 	vote[1] = 1;            /* ack_type: blocking */
+ 	vote[2] = 1;            /* perf index: 160 MHz */
+ 	vote[3] = 1;            /* bw index: 2136718 KBps */
+ 	bool voted = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, 4);
+-	printf("PANDORA GPU: HFI GX vote %s\n", voted ? "ACKED" : "NOT ACKED");
++	printf("PANDORA GPU: HFI GX vote %s; pwr_clk_status %08x intr info %08x\n", voted ? "ACKED" : "NOT ACKED",
++	    gmu_rd(GMU_PWR_CLK_STATUS), gmu_rd(GMU_GMU2HOST_INTR_INFO));
++	if (!voted) {
++		return false;
++	}
++	/* a6xx_gmu_set_oob(GMU_OOB_GPU_SET), non-legacy bits, as a8xx hw_init starts */
++	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
++	uint32_t info = gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 100000, &ok);
++	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
++	printf("PANDORA GPU: OOB GPU_SET %s (intr info %08x, pwr_clk_status %08x)\n", ok ? "acked" : "NOT ACKED",
++	    info, gmu_rd(GMU_PWR_CLK_STATUS));
++	if (!ok) {
++		return false;
++	}
+ 	/* a8xx_gmu_gx_is_on */
+ 	uint32_t st = gpu_poll(gpu_gmu, GMU_REG(GMU_PWR_CLK_STATUS), 3, 0, 100000, &ok);
+ 	printf("PANDORA GPU: GX %s: pwr_clk_status %08x rpmh_power_state %08x ao_host_irq %08x\n",
