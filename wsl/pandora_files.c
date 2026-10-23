@@ -7,6 +7,7 @@
  * place of the HEIC ones (tools/mkwallpaper.py), which need the hardware HEVC decoder.
  * Boot-arg pandora_files=0 turns it off.
  * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
+ * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -26,6 +27,7 @@
 extern kern_return_t thread_terminate(thread_t);
 extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vnode_t rootvnode;
+extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
 void pandora_files_init(void);
 
 #define PF_MAX_FILE   (64u << 20)
@@ -167,6 +169,20 @@ pf_thread(void *arg, wait_result_t result)
 		int mode = 0;
 		for (const char *m = sp1 + 1; *m >= '0' && *m <= '7'; m++) {
 			mode = mode * 8 + (*m - '0');
+		}
+		/* "- MODE PATH": a directory (patch 0185: the Metal plugin is a bundle directory). */
+		if (!strcmp(name, "-") && path[0] == '/') {
+			int error = pandora_mkdir(path, mode ? mode : 0755);
+			if (!error) {
+				written++;
+				printf("PANDORA FILES: mkdir %s\n", path);
+			} else if (error == EEXIST) {
+				same++;
+			} else {
+				failed++;
+				printf("PANDORA FILES: mkdir %s: error %d\n", path, error);
+			}
+			continue;
 		}
 		struct pf_ent *e = pf_find(name);
 		if (!e || e->size > PF_MAX_FILE || path[0] != '/') {

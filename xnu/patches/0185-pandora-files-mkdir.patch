@@ -1,0 +1,64 @@
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+index eec0462..b6b8277 100644
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -7,6 +7,7 @@
+  * place of the HEIC ones (tools/mkwallpaper.py), which need the hardware HEVC decoder.
+  * Boot-arg pandora_files=0 turns it off.
+  * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
++ * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -26,6 +27,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vnode_t rootvnode;
++extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
+ void pandora_files_init(void);
+ 
+ #define PF_MAX_FILE   (64u << 20)
+@@ -168,6 +170,20 @@ pf_thread(void *arg, wait_result_t result)
+ 		for (const char *m = sp1 + 1; *m >= '0' && *m <= '7'; m++) {
+ 			mode = mode * 8 + (*m - '0');
+ 		}
++		/* "- MODE PATH": a directory (patch 0185: the Metal plugin is a bundle directory). */
++		if (!strcmp(name, "-") && path[0] == '/') {
++			int error = pandora_mkdir(path, mode ? mode : 0755);
++			if (!error) {
++				written++;
++				printf("PANDORA FILES: mkdir %s\n", path);
++			} else if (error == EEXIST) {
++				same++;
++			} else {
++				failed++;
++				printf("PANDORA FILES: mkdir %s: error %d\n", path, error);
++			}
++			continue;
++		}
+ 		struct pf_ent *e = pf_find(name);
+ 		if (!e || e->size > PF_MAX_FILE || path[0] != '/') {
+ 			printf("PANDORA FILES: %s: not in the pack or too big\n", name);
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..b9870bd 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14579,3 +14579,18 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(PANDORA)
++/* For bsd/dev/pandora_files.c: mkdir of a kernel-space path as the mkdir syscall makes it (patch 0185). */
++int pandora_mkdir(const char *path, int mode);
++
++int
++pandora_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif /* PANDORA */
