@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b797395..2d400eb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,22 @@ sweet_fb_scale(uint32_t p, uint32_t k)
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#if defined(PANDORA)
++extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
++
++/* Patch 0188: with a Metal client the GPU writes IOSurfaces non-cacheably (bsd/dev/pandora_gpu.c);
++ * the copy below then cleans and invalidates each source row first, or it can copy stale lines. */
++static bool
++sweetfb_gpu_frames(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = 0;
++		PE_parse_boot_argn("pandora_gpu_metal", &on, sizeof(on));
++	}
++	return on != 0;
++}
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -1133,6 +1149,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			copyStart = mach_absolute_time();
+ #endif
+ 			if (copied != 2) for (int32_t y = 0; y < h; y++) {
++#if defined(PANDORA)
++				if (sweetfb_gpu_frames()) {
++					flush_dcache((vm_offset_t)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (unsigned)w * 4, FALSE);
++				}
++#endif
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
