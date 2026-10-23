@@ -65,6 +65,7 @@ jobs:
           ls nativeadreno/NativeAdrenoABI.h
 
       - name: Build
+        timeout-minutes: 20   # 2 min when healthy; run 12 hung here for over 30
         run: |
           mkdir -p out
           set -o pipefail
@@ -112,6 +113,7 @@ jobs:
       - name: Metal plugin
         id: metal
         continue-on-error: true
+        timeout-minutes: 30
         run: |
           set -o pipefail
           exec > >(tee -a out/metal.log) 2>&1
