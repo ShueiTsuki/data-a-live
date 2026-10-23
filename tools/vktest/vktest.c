@@ -5,6 +5,7 @@
  *   1. instance and device: the physical device Turnip reports (name, chip from the device info)
  *   2. buffer: vkCmdFillBuffer and vkCmdUpdateBuffer into host-visible memory, read back
  *   3. image: vkCmdClearColorImage on a 64x64 RGBA8 image, copied to a buffer, read back
+ *   4. compute: fill.comp (64 x 64 invocations) compiled by Turnip on the phone, run, read back
  * The driver is dlopen'd from /usr/lib/libvulkan_freedreno.dylib (no Vulkan loader on iOS) and
  * reached through vk_icdGetInstanceProcAddr. stdout and stderr go to /dev/console, so Mesa's own
  * messages land in the kernel log next to the "VKTEST:" lines.
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan_core.h>
+#include "fill_spv.h"           /* fill.comp as SPIR-V, made by glslangValidator in build_ios.sh */
 
 #define DRIVER "/usr/lib/libvulkan_freedreno.dylib"
 
@@ -287,6 +289,79 @@ main(void)
 		say("VKTEST: part 3: pixels %08x %08x ... %08x, %u of 4096 wrong%s", p[0], p[1], p[4095], bad,
 		    bad ? " FAIL" : "");
 		failures += bad != 0;
+	}
+	/* ---- part 4: a compute shader (fill.comp), compiled by Turnip on the phone ---- */
+	{
+		DFN(vkCreateShaderModule);
+		DFN(vkCreateDescriptorSetLayout);
+		DFN(vkCreatePipelineLayout);
+		DFN(vkCreateComputePipelines);
+		DFN(vkCreateDescriptorPool);
+		DFN(vkAllocateDescriptorSets);
+		DFN(vkUpdateDescriptorSets);
+		DFN(vkCmdBindPipeline);
+		DFN(vkCmdBindDescriptorSets);
+		DFN(vkCmdDispatch);
+		VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(fill_spv), fill_spv };
+		VkShaderModule sm;
+		VkDescriptorSetLayoutBinding bind = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+		VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &bind };
+		VkDescriptorSetLayout dsl;
+		VkPipelineLayout pl;
+		VkPipeline pipe;
+		VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+		VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &dps };
+		VkDescriptorPool dp;
+		VkDescriptorSet ds;
+		if (check("part 4: vkCreateShaderModule", vkCreateShaderModule(dev, &smi, NULL, &sm)) ||
+		    check("part 4: vkCreateDescriptorSetLayout", vkCreateDescriptorSetLayout(dev, &dli, NULL, &dsl))) {
+			goto done;
+		}
+		VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 0, NULL };
+		if (check("part 4: vkCreatePipelineLayout", vkCreatePipelineLayout(dev, &pli, NULL, &pl))) {
+			goto done;
+		}
+		VkComputePipelineCreateInfo cpci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+			{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+			pl, VK_NULL_HANDLE, -1 };
+		if (check("part 4: vkCreateComputePipelines (Turnip compiles the shader)",
+		    vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe)) ||
+		    check("part 4: vkCreateDescriptorPool", vkCreateDescriptorPool(dev, &dpi, NULL, &dp))) {
+			goto done;
+		}
+		VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &dsl };
+		if (check("part 4: vkAllocateDescriptorSets", vkAllocateDescriptorSets(dev, &dai, &ds))) {
+			goto done;
+		}
+		VkDescriptorBufferInfo dbi = { buf, 0, 4096 * 4 };
+		VkWriteDescriptorSet wds = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds, 0, 0, 1,
+			VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &dbi, NULL };
+		vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+		VkMemoryBarrier shToHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+		vkResetFences(dev, 1, &fence);
+		vkResetCommandBuffer(cb, 0);
+		vkBeginCommandBuffer(cb, &cbi);
+		vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
+		vkCmdDispatch(cb, 64, 1, 1);                    /* 64 workgroups x 64 = 4096 words */
+		vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &shToHost,
+		    0, NULL, 0, NULL);
+		vkEndCommandBuffer(cb);
+		if (!check("part 4: vkQueueSubmit", vkQueueSubmit(queue, 1, &si, fence)) &&
+		    !check("part 4: vkWaitForFences", vkWaitForFences(dev, 1, &fence, VK_TRUE, 2000000000ull))) {
+			VkMappedMemoryRange range = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, mem, 0, VK_WHOLE_SIZE };
+			vkInvalidateMappedMemoryRanges(dev, 1, &range);
+			unsigned bad = 0, first = 4096;
+			for (unsigned i = 0; i < 4096; i++) {
+				if (p[i] != i * 3u + 0x1000u) {
+					bad++;
+					first = first < i ? first : i;
+				}
+			}
+			say("VKTEST: part 4: words %08x %08x ... %08x, %u of 4096 wrong (first at %u)%s", p[0], p[1], p[4095],
+			    bad, bad ? first : 0, bad ? " FAIL" : "");
+			failures += bad != 0;
+		}
 	}
 done:
 	say("VKTEST: %s (%u failures)", failures ? "FAIL" : "PASS", failures);

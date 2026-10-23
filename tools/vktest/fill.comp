@@ -1,0 +1,11 @@
+#version 450
+// vktest part 4: every invocation writes its own index times 3 plus 0x1000, so a wrong word
+// shows which invocation or workgroup did not run.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Out { uint words[]; };
+
+void main()
+{
+	uint i = gl_GlobalInvocationID.x;
+	words[i] = i * 3u + 0x1000u;
+}
