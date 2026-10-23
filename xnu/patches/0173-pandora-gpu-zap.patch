@@ -1,0 +1,136 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 5f5c8fb..17a0658 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -408,7 +408,11 @@ static int
+ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
+ {
+ 	char name[48];
+-	snprintf(name, sizeof(name), "%s.mdt", base);
++	if (strchr(base, '.')) {
++		strlcpy(name, base, sizeof(name));      /* a whole image, e.g. gen80200_zap.mbn */
++	} else {
++		snprintf(name, sizeof(name), "%s.mdt", base);
++	}
+ 	struct fw_ent *mdt = fw_find(name);
+ 	if (!mdt || mdt->size < 52 || mdt->size > 0x10000) {
+ 		printf("PANDORA ADSP: %s missing\n", name);
+@@ -529,6 +533,24 @@ pas_auth(unsigned pas)
+ 	return (r.a0 || r.a1) ? EIO : 0;
+ }
+ 
++/* For bsd/dev/pandora_gpu.c: load FILE from the pinned pack as PAS image PAS into the
++ * carveout, then authenticate and reset it. */
++int pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size);
++
++int
++pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size)
++{
++	uint64_t bridge = 0;
++	int err = ad_nfiles ? 0 : fw_dir();
++	if (!err) {
++		err = pas_load(file, pas, mem_pa, mem_size, &bridge);
++	}
++	if (!err) {
++		err = pas_auth(pas);
++	}
++	return err;
++}
++
+ static void
+ adsp_boot(void)
+ {
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 82398e3..17ce2a4 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -81,6 +81,13 @@
+  * (power-up list pointer at a zeroed page), the write pointer written as Linux's fenced write
+  * (GMU_AHB_FENCE_STATUS bit 0 = dropped), idle wait; then one CP_MEM_WRITE while still secure
+  * to see whether it lands. Values: Linux a8xx_gpu.c / a6xx.xml A8XX and Qualcomm gen8_reg.h.
++ * (gpu10 log: CP_ME_INIT consumed, CP idle; CP_MEM_WRITE wrote 0xc0ffee00 even while secure.)
++ *
++ * Level 11 (patch 0173): leaving secure mode as a8xx hw_init does after cp_init: the zap shader
++ * gen80200_zap.mbn as PAS image 13 (a6xx_zap_shader_init) into the phone DT's
++ * gpu_microcode_region (0x9959a000, 8 KiB) through pandora_adsp.c's loader (metadata in
++ * ordinary contiguous memory, no SHM bridge of our own), then CP_SET_SECURE_MODE 0 in the
++ * ring and a second CP_MEM_WRITE.
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -1543,6 +1550,54 @@ gpu_level10(void)
+ 	return init;
+ }
+ 
++/* ---- level 11: zap shader, out of secure mode ---------------------------------------------- */
++
++extern int pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size);
++#define GPU_ZAP_PAS       13u
++#define GPU_ZAP_PA        0x9959a000ull     /* phone DT gpu_microcode_region, no-map */
++#define GPU_ZAP_SIZE      0x2000ull
++
++static bool
++gpu_level11(void)
++{
++	bool ok;
++	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
++	(void)gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 100000, &ok);
++	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
++	if (!ok) {
++		printf("PANDORA GPU: OOB GPU_SET NOT ACKED\n");
++		return false;
++	}
++	gpu_step("zap shader: PAS 13 load and auth");
++	int err = pandora_pas_load_auth("gen80200_zap.mbn", GPU_ZAP_PAS, GPU_ZAP_PA, GPU_ZAP_SIZE);
++	printf("PANDORA GPU: zap shader (PAS %u at %#llx) -> %d\n", GPU_ZAP_PAS, GPU_ZAP_PA, err);
++	bool secure_off = false, wrote = false;
++	if (!err) {
++		gpu_step("CP: CP_SET_SECURE_MODE 0, CP_MEM_WRITE");
++		ring_put(pkt7(0x66, 1));                /* CP_SET_SECURE_MODE */
++		ring_put(0);
++		ring_kick();
++		secure_off = ring_idle(1000);
++		printf("PANDORA GPU: CP_SET_SECURE_MODE 0 %s\n", secure_off ? "consumed" : "NOT consumed");
++		if (secure_off) {
++			ring_put(pkt7(0x3d, 3));        /* CP_MEM_WRITE */
++			ring_put((uint32_t)gpu_bufs[2].iova + 4);
++			ring_put(0);
++			ring_put(0x5ec0ff00);
++			ring_put(pkt7(0x12, 0));        /* CP_WAIT_MEM_WRITES */
++			ring_kick();
++			bool idle = ring_idle(1000);
++			flush_dcache64((addr64_t)gpu_bufs[2].pa, 64, TRUE);
++			uint32_t v = ((const uint32_t *)gpu_bufs[2].va)[1];
++			wrote = idle && v == 0x5ec0ff00;
++			printf("PANDORA GPU: CP_MEM_WRITE (non-secure) %s: scratch[1] = %08x\n",
++			    idle ? "consumed" : "NOT consumed", v);
++		}
++	}
++	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 31);
++	return secure_off && wrote;
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -1551,7 +1606,7 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
+ 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
+-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP)\n", level);
++	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap)\n", level);
+ 	gpu_cmddb();
+ 	if (gpu_read_cc(true)) {
+ 		gpu_read_smmu();
+@@ -1592,6 +1647,11 @@ gpu_thread(void *arg, wait_result_t result)
+ 										if (m && level >= 10) {
+ 											bool cp = gpu_level10();
+ 											printf("PANDORA GPU: level 10 (CP) %s\n", cp ? "done" : "stopped");
++											if (cp && level >= 11) {
++												bool z = gpu_level11();
++												printf("PANDORA GPU: level 11 (zap, non-secure) %s\n",
++												    z ? "done" : "stopped");
++											}
+ 										}
+ 									}
+ 								}
