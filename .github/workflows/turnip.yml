@@ -24,6 +24,7 @@ env:
   # UniXNU's pins for its Metal plugin (drivers/NativeMetal submodule, gpu-metal-vulkan-inputs.json)
   NATIVEMETAL_SHA: c6d29caad6d880cc8204ebe3bc34d77479a3255d
   M2V_SHA: 720ef1ce9ae2a2068999a8675717418b9416283e
+  ADRENOPM4_SHA: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
 
 jobs:
   build:
@@ -122,6 +123,8 @@ jobs:
           }
           fetch nativemetal https://github.com/UniXNU/NativeMetal.git "$NATIVEMETAL_SHA"
           fetch metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA"
+          rm -rf unixnu/kits/AdrenoPM4   # a submodule of UniXNU, not in its plain checkout
+          fetch unixnu/kits/AdrenoPM4 https://github.com/UniXNU/AdrenoPM4.git "$ADRENOPM4_SHA"
           bash tools/metal/build_plugin.sh unixnu nativemetal nativeadreno metal2vulkan mesa out/metal
 
       - name: Metal summary
