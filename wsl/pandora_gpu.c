@@ -32,6 +32,15 @@
  * native 4 KiB stage-1 tables built by UniXNU's ArmSmmu4K (MIT, bsd/dev/adreno/), ACTLR 0x32b
  * from the phone's DT for the GMU stream, the context programmed, read back and enabled by
  * ArmSmmu4K, then stream ID 5 routed to it through a free stream-match slot.
+ * (gpu4 log: context enabled and read back, slot 2 = SID 5 -> bank 1, no fault.)
+ *
+ * Level 5 (patch 0166, "4b"): the GMU cold start of Linux a6xx_gmu_fw_start() on the a8xx
+ * path (drivers/gpu/drm/msm/adreno/a6xx_gmu.c), checked line by line against that source:
+ * FAL veto, firmware blocks (gen80200_gmu.bin from the pinned pack) into ITCM/DTCM registers
+ * and the icache/dummy buffers, HFI queue table (a6xx_hfi_init), FW_INIT_RESULT/BOOT_CONFIG/
+ * HFI table/AHB fence/CM3_CFG/GENERAL_10 chip id/GENERAL_8 log, a840 GBIF (a6xx_catalog.c),
+ * MRC_GBIF_QOS_CTRL, power config, then a6xx_gmu_start (reset release, FW_INIT_RESULT poll)
+ * and a6xx_gmu_hfi_start (HFI_CTRL_INIT, HFI_CTRL_STATUS poll). No HFI message is sent yet.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -48,11 +57,13 @@
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
 #include <arm/caches_internal.h>
+#include <kern/kalloc.h>
 #include "adreno/ArmSmmu4KStreams.h"
 #include "adreno/ArmSmmu4KMmio.h"
 
 extern kern_return_t thread_terminate(thread_t);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);   /* bsd/dev/sweet_ufs.c */
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3,
     uint64_t *a0, uint64_t *a1);  /* bsd/dev/pandora_adsp.c */
@@ -577,6 +588,270 @@ gpu_level4a(void)
 	return st == ArmSmmu4KSuccess;
 }
 
+/* ---- level 5 (4b): GMU cold start --------------------------------------------------- */
+
+/* GMU registers, dword offsets from the GPU base (a6xx_gmu.xml, A8XX variants where they differ). */
+#define GMU_CM3_ITCM_START        0x1b400u
+#define GMU_CM3_DTCM_START        0x1c400u
+#define GMU_CORE_FW_VERSION       0x1d3f8u     /* = DTCM_START + 0xff8 */
+#define GMU_ICACHE_CONFIG         0x1f400u
+#define GMU_DCACHE_CONFIG         0x1f401u
+#define GMU_SYS_BUS_CONFIG        0x1f40fu
+#define GMU_MRC_GBIF_QOS_CTRL     0x1f50bu
+#define GMU_CX_FAL_INTF           0x1f7ecu     /* A8XX */
+#define GMU_CX_FALNEXT_INTF       0x1f7edu     /* A8XX */
+#define GMU_CM3_SYSRESET          0x1f800u
+#define GMU_CM3_BOOT_CONFIG       0x1f801u
+#define GMU_CM3_FW_INIT_RESULT    0x1f81cu
+#define GMU_CM3_CFG               0x1f82du
+#define GMU_HFI_CTRL_STATUS       0x1f980u
+#define GMU_HFI_QTBL_INFO         0x1f984u
+#define GMU_HFI_QTBL_ADDR         0x1f985u
+#define GMU_HFI_CTRL_INIT         0x1f986u
+#define GMU_GENERAL_8             0x1f9c8u     /* A8XX */
+#define GMU_GENERAL_9             0x1f9c9u     /* A8XX */
+#define GMU_GENERAL_10            0x1f9cau     /* A8XX */
+#define GMU_AO_HOST_INTR_STATUS   0x23b05u
+#define GMU_AHB_FENCE_RANGE_0     0x23b11u
+#define GBIF_CX_CONFIG            0x3c00u
+#define GBIF_QSB_SIDE0            0x3c03u
+#define GMU_DTCM_BASE             0x10004000u  /* a6xx_gmu_fw_load: a650 family, a7xx and a8xx */
+#define GMU_CHIPID                0x08020100u  /* a6xx_catalog.c, chip 0x44050a01 */
+
+static vm_offset_t gpu_gmu;
+
+static uint32_t
+gmu_rd(uint32_t dw)
+{
+	return gpu_rd(gpu_gmu, GMU_REG(dw));
+}
+
+static void
+gmu_wr(uint32_t dw, uint32_t v)
+{
+	gpu_wr(gpu_gmu, GMU_REG(dw), v);
+}
+
+struct pack_ent {
+	char name[48];
+	uint64_t off, size;
+};
+
+/* A file from the pinned firmware pack (tools/mkfwpack.py) into a new kalloc_data buffer. */
+static uint8_t *
+gpu_fw_file(const char *name, uint64_t *size)
+{
+	static uint8_t dir[4096];
+	if (pandora_fw_read(0, dir, sizeof(dir)) || memcmp(dir, "PANDFW01", 8)) {
+		printf("PANDORA GPU: no firmware pack\n");
+		return NULL;
+	}
+	uint32_t n;
+	memcpy(&n, dir + 8, 4);
+	for (uint32_t i = 0; i < n && i < 63; i++) {
+		struct pack_ent e;
+		memcpy(&e, dir + 16 + 64 * i, sizeof(e));
+		e.name[47] = 0;
+		if (strcmp(e.name, name) || e.size == 0 || e.size > (1u << 20)) {
+			continue;
+		}
+		uint8_t *buf = kalloc_data((vm_size_t)e.size, Z_WAITOK);
+		if (!buf || pandora_fw_read(e.off, buf, e.size)) {
+			printf("PANDORA GPU: %s: read failed\n", name);
+			return NULL;
+		}
+		*size = e.size;
+		return buf;
+	}
+	printf("PANDORA GPU: %s not in the firmware pack\n", name);
+	return NULL;
+}
+
+static struct gmu_buf *
+gmu_buf_for(uint32_t addr, uint32_t size)
+{
+	for (unsigned i = 0; i < GMU_NBUFS; i++) {
+		if (addr >= gmu_bufs[i].iova && size <= gmu_bufs[i].bytes &&
+		    addr - gmu_bufs[i].iova <= gmu_bufs[i].bytes - size) {
+			return &gmu_bufs[i];
+		}
+	}
+	return NULL;
+}
+
+/* a6xx_gmu_fw_load: route each block by address; registers get whole words, read back. */
+static bool
+gmu_fw_load(const uint8_t *fw, uint64_t len)
+{
+	unsigned itcm = 0, dtcm = 0, mem = 0, bad = 0;
+	for (uint64_t off = 0; off + 16 <= len;) {
+		uint32_t h[4];
+		memcpy(h, fw + off, 16);
+		uint32_t addr = h[0], size = h[1];
+		const uint8_t *data = fw + off + 16;
+		if (size > len - off - 16) {
+			printf("PANDORA GPU: fw block at %#llx: size %#x past the end\n", off, size);
+			return false;
+		}
+		off += 16 + (uint64_t)size;
+		if (size == 0) {
+			continue;
+		}
+		bool tcm = addr < 0x4000 || (addr >= GMU_DTCM_BASE && addr - GMU_DTCM_BASE < 0x4000);
+		if (tcm) {
+			if (size < 4) {
+				/* Linux writes these bytes too; the full ITCM block after them covers them. */
+				printf("PANDORA GPU: fw block addr %#x size %u type %#x skipped\n", addr, size, h[2]);
+				continue;
+			}
+			if ((size & 3) || (addr & 3)) {
+				printf("PANDORA GPU: fw block addr %#x size %#x not word sized\n", addr, size);
+				return false;
+			}
+			uint32_t reg = addr < 0x4000 ? GMU_CM3_ITCM_START + (addr >> 2) :
+			    GMU_CM3_DTCM_START + ((addr - GMU_DTCM_BASE) >> 2);
+			for (uint32_t k = 0; k < size / 4; k++) {
+				uint32_t w;
+				memcpy(&w, data + 4 * k, 4);
+				gmu_wr(reg + k, w);
+			}
+			for (uint32_t k = 0; k < size / 4; k++) {
+				uint32_t w;
+				memcpy(&w, data + 4 * k, 4);
+				bad += gmu_rd(reg + k) != w;
+			}
+			if (addr < 0x4000) {
+				itcm += size;
+			} else {
+				dtcm += size;
+			}
+			continue;
+		}
+		struct gmu_buf *b = gmu_buf_for(addr, size);
+		if (!b) {
+			printf("PANDORA GPU: fw block addr %#x size %#x matches no buffer\n", addr, size);
+			return false;
+		}
+		memcpy((void *)(b->va + (addr - b->iova)), data, size);
+		clean_dcache64((addr64_t)(b->pa + (addr - b->iova)), size, TRUE);
+		mem += size;
+	}
+	printf("PANDORA GPU: GMU firmware loaded: ITCM %#x DTCM %#x memory %#x bytes, %u register words differ, "
+	    "core fw version %08x\n", itcm, dtcm, mem, bad, gmu_rd(GMU_CORE_FW_VERSION));
+	return bad == 0;
+}
+
+/* a6xx_hfi_init: queue table header and three queue headers at the start of the hfi buffer. */
+static void
+gmu_hfi_init(void)
+{
+	struct gmu_buf *h = &gmu_bufs[3];
+	uint32_t *t = (uint32_t *)h->va;
+	bzero(t, (size_t)h->bytes);
+	t[0] = 0;               /* version */
+	t[1] = 24 + 3 * 48;     /* size: the header and the queue headers, in bytes as Linux writes it */
+	t[2] = 24 >> 2;         /* qhdr0_offset */
+	t[3] = 48 >> 2;         /* qhdr_size */
+	t[4] = 3;               /* num_queues */
+	t[5] = 3;               /* active_queues */
+	for (uint32_t q = 0; q < 3; q++) {
+		uint32_t *qh = t + 6 + 12 * q;
+		qh[0] = 1;                                     /* status */
+		qh[1] = (uint32_t)h->iova + 0x1000 * (q + 1);  /* iova */
+		qh[2] = (10u << 8) | q;                        /* type: CMD 0, RESP 1, DBG 2 (non-legacy) */
+		qh[3] = 0x1000 >> 2;                           /* size in dwords */
+		qh[6] = 1;                                     /* rx_watermark */
+		qh[7] = 1;                                     /* tx_watermark */
+		qh[8] = 1;                                     /* rx_request */
+	}
+	clean_dcache64((addr64_t)h->pa, (unsigned)h->bytes, TRUE);
+}
+
+static bool
+gpu_level5(void)
+{
+	bool ok;
+	gpu_gmu = ml_io_map(GMU_PA, GMU_SIZE);
+	vm_offset_t gbif = ml_io_map(GPU_PA + GBIF_CX_CONFIG * 4, 0x1000);
+	if (!gpu_gmu || !gbif) {
+		printf("PANDORA GPU: GMU or GBIF window not mapped\n");
+		return false;
+	}
+	uint32_t rst = gmu_rd(GMU_CM3_SYSRESET), hfi = gmu_rd(GMU_HFI_CTRL_STATUS);
+	uint32_t tcm = gpu_rd(gpu_gmu, 0x03d9e000u + 0x39u * 4 - GMU_PA);
+	uint32_t rscc = gpu_rd(gpu_gmu, 0x03d50000u + 0x101u * 4 - GMU_PA);
+	if (rst != 1 || (hfi & 1) || tcm || rscc) {
+		printf("PANDORA GPU: GMU not idle in reset (sysreset %u hfi %08x tcm_ret %u rscc %u): stop\n",
+		    rst, hfi, tcm, rscc);
+		return false;
+	}
+	uint64_t fwlen = 0;
+	uint8_t *fw = gpu_fw_file("gen80200_gmu.bin", &fwlen);
+	if (!fw) {
+		return false;
+	}
+
+	/* a6xx_gmu_fw_start, a8xx path. */
+	gpu_step("GMU: FAL veto, firmware, HFI table, configuration");
+	gmu_wr(GMU_CX_FALNEXT_INTF, 1);
+	gmu_wr(GMU_CX_FAL_INTF, 1);
+	bool loaded = gmu_fw_load(fw, fwlen);
+	kfree_data(fw, (vm_size_t)fwlen);
+	if (!loaded) {
+		return false;
+	}
+	gmu_hfi_init();
+	gmu_wr(GMU_CM3_FW_INIT_RESULT, 0);
+	gmu_wr(GMU_CM3_BOOT_CONFIG, 0x02);
+	gmu_wr(GMU_HFI_QTBL_ADDR, (uint32_t)gmu_bufs[3].iova);
+	gmu_wr(GMU_HFI_QTBL_INFO, 1);
+	gmu_wr(GMU_AHB_FENCE_RANGE_0, (1u << 31) | (0x32u << 18) | 0x8c0u);
+	gmu_wr(GMU_CM3_CFG, 0x4052);
+	gmu_wr(GMU_GENERAL_10, GMU_CHIPID);
+	gmu_wr(GMU_GENERAL_8, ((uint32_t)gmu_bufs[2].iova & 0xfffff000u) |
+	    ((uint32_t)(gmu_bufs[2].bytes / 0x1000 - 1) & 0xffu));
+	for (uint32_t i = 0; i < 4; i++) {
+		gpu_wr(gbif, 4 * (GBIF_QSB_SIDE0 + i - GBIF_CX_CONFIG), 0x00071e20);   /* a840_gbif */
+	}
+	gpu_wr(gbif, 0, 0x20023000);    /* a840_gbif GBIF_CX_CONFIG, written again for a8xx */
+	gpu_wr(gbif, 0, 0x20023000);
+	gmu_wr(GMU_MRC_GBIF_QOS_CTRL, 0x33);
+	gmu_wr(GMU_SYS_BUS_CONFIG, 1);  /* a6xx_gmu_power_config; a8xx returns after these three */
+	gmu_wr(GMU_ICACHE_CONFIG, 1);
+	gmu_wr(GMU_DCACHE_CONFIG, 1);
+	printf("PANDORA GPU: GMU config: boot %x qtbl %08x/%x fence %08x cm3_cfg %08x gen10 %08x gen8 %08x "
+	    "gbif cx %08x qsb0 %08x qos %x bus/i/d %x%x%x\n", gmu_rd(GMU_CM3_BOOT_CONFIG),
+	    gmu_rd(GMU_HFI_QTBL_ADDR), gmu_rd(GMU_HFI_QTBL_INFO), gmu_rd(GMU_AHB_FENCE_RANGE_0),
+	    gmu_rd(GMU_CM3_CFG), gmu_rd(GMU_GENERAL_10), gmu_rd(GMU_GENERAL_8), gpu_rd(gbif, 0),
+	    gpu_rd(gbif, 4 * (GBIF_QSB_SIDE0 - GBIF_CX_CONFIG)), gmu_rd(GMU_MRC_GBIF_QOS_CTRL),
+	    gmu_rd(GMU_SYS_BUS_CONFIG), gmu_rd(GMU_ICACHE_CONFIG), gmu_rd(GMU_DCACHE_CONFIG));
+
+	/* a6xx_gmu_start. */
+	uint32_t ver = gmu_rd(GMU_CORE_FW_VERSION);
+	uint32_t mask = ver <= 0x20010004 ? 0xffffffffu : 0x1ffu, want = ver <= 0x20010004 ? 0xbabefaceu : 0x100u;
+	gmu_wr(GMU_CM3_SYSRESET, 1);
+	gmu_wr(GMU_GENERAL_9, 0);
+	gpu_step("GMU: release CM3 reset");
+	gmu_wr(GMU_CM3_SYSRESET, 0);
+	uint32_t r = gpu_poll(gpu_gmu, GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, want, 100000, &ok);
+	printf("PANDORA GPU: GMU fw init result %08x (want %#x under mask %#x) %s; ao_host_irq %08x\n", r, want,
+	    mask, ok ? "BOOTED" : "TIMED OUT", gmu_rd(GMU_AO_HOST_INTR_STATUS));
+	if (!ok) {
+		gmu_wr(GMU_CM3_SYSRESET, 1);
+		return false;
+	}
+
+	/* a6xx_gmu_hfi_start. */
+	gmu_wr(GMU_HFI_CTRL_INIT, 1);
+	r = gpu_poll(gpu_gmu, GMU_REG(GMU_HFI_CTRL_STATUS), 1, 1, 10000, &ok);
+	printf("PANDORA GPU: GMU HFI ctrl status %08x %s\n", r, ok ? "READY" : "NOT READY");
+	const uint32_t *log = (const uint32_t *)gmu_bufs[2].va;
+	flush_dcache64((addr64_t)gmu_bufs[2].pa, 64, TRUE);
+	printf("PANDORA GPU: GMU log %08x %08x %08x %08x %08x %08x %08x %08x\n", log[0], log[1], log[2], log[3],
+	    log[4], log[5], log[6], log[7]);
+	return ok;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -585,7 +860,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -607,6 +882,10 @@ gpu_thread(void *arg, wait_result_t result)
 					bool ctx = gpu_level4a();
 					printf("PANDORA GPU: level 4a (GMU SMMU context) %s\n", ctx ? "done" : "stopped");
 					gpu_read_gmu();
+					if (ctx && level >= 5) {
+						bool up = gpu_level5();
+						printf("PANDORA GPU: level 5 (GMU cold start) %s\n", up ? "done" : "stopped");
+					}
 				}
 			}
 		}
