@@ -118,6 +118,8 @@
  * pandora-gpu-pool (mkadt_pandora.py --gpu-pool, boot_ios.sh GPUPOOL=MiB); the kernel-memory pool
  * stays as the fallback. (pgpu2 log: mapping the carved 1 GiB at once panicked in io_map.)
  * Patch 0179: the kernel maps carved-pool windows write-combined only while it touches them.
+ * (pgpu3 log: unmapping an ml_io_map_wcomb window panicked, those entries are permanent.)
+ * Patch 0180: the windows come from ml_io_map_unmappable, which ml_io_unmap can take back.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -139,6 +141,7 @@
 #include <pexpert/device_tree.h>
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 extern void ml_io_unmap(vm_offset_t, vm_size_t);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 #include "adreno/ArmSmmu4KStreams.h"
 #include "adreno/ArmSmmu4KMmio.h"
 
@@ -1780,8 +1783,11 @@ gpu_pool_map(uint64_t off, uint64_t len)
 	if (!gpu_pool_carved) {
 		return gpu_pool_va + (vm_offset_t)off;
 	}
+	/* The removable kind: ml_io_map_wcomb's io_submap entries are permanent and merge with their
+	 * neighbours, so ml_io_unmap on them panics (pgpu3 log, vm_map_delete of a permanent entry). */
 	uint64_t lead = off & 0xfff;
-	vm_offset_t va = ml_io_map_wcomb((vm_offset_t)(gpu_pool_pa + off - lead), (vm_size_t)((lead + len + 0xfff) & ~0xfffull));
+	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)(gpu_pool_pa + off - lead),
+	    (vm_size_t)((lead + len + 0xfff) & ~0xfffull), VM_WIMG_WCOMB);
 	return va ? va + (vm_offset_t)lead : 0;
 }
 
