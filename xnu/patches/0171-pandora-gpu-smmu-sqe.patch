@@ -1,0 +1,306 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 677d0c2..d327861 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -66,6 +66,12 @@
+  * instead: a6xx_gmu_resume, after a6xx_hfi_start, clears GMU2HOST_INTR, sets its mask to
+  * ~CM3_FAULT and sends the GX vote (a6xx_gmu_set_initial_freq); the OOB GPU_SET comes later,
+  * from a8xx hw_init. Here: interrupts, vote, then OOB with 100 ms (the GMU runs on XO).
++ * (gpu8b log: vote acked, OOB acked, PWR_CLK_STATUS 0, RBBM_STATUS 1.)
++ *
++ * Level 9 (patch 0171): the GPU's own SMMU context (stream 0 = gfx3d_user, context bank 0 as
++ * arm-smmu-qcom gives the Adreno, ACTLR 0x32b) with a ring, the SQE (gen80200_sqe.fw without
++ * its first word, as adreno_fw_create_bo loads it) and a scratch page mapped; the SMMU code
++ * is the level 4a routine made generic. Nothing is submitted yet.
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -481,14 +487,19 @@ static struct gmu_buf gmu_bufs[] = {
+ };
+ #define GMU_NBUFS (sizeof(gmu_bufs) / sizeof(gmu_bufs[0]))
+ 
+-static ArmSmmu4KMmio gmu_mmio;
+-static ArmSmmu4KIo gmu_io;
+-static ArmSmmu4KConfig gmu_tcfg;
+-static ArmSmmu4KResult gmu_tables;
+-static ArmSmmu4KContextConfig gmu_ctx;
+-static ArmSmmu4KProgramResult gmu_prog;
+-static ArmSmmu4KStreamState gmu_streams;
+-static ArmSmmu4KStreamResult gmu_sres;
++static ArmSmmu4KMmio smmu_mmio;
++static ArmSmmu4KIo smmu_io;
++
++/* One context bank with its tables and one routed stream; lives for the rest of the boot. */
++struct smmu_ctx {
++	ArmSmmu4KConfig tcfg;
++	ArmSmmu4KResult tables;
++	ArmSmmu4KContextConfig ctx;
++	ArmSmmu4KProgramResult prog;
++	ArmSmmu4KStreamState streams;
++	ArmSmmu4KStreamResult sres;
++};
++static struct smmu_ctx gmu_smmu, gpu_smmu;
+ 
+ /* Physically contiguous, zeroed, wired for good; returns the kernel address and fills *pa. */
+ static vm_offset_t
+@@ -505,37 +516,51 @@ gpu_contig(uint64_t bytes, uint64_t *pa)
+ 	return va;
+ }
+ 
++static vm_offset_t gpu_smmu_va;
++
++/* Allocate the buffers (physically contiguous, zeroed) and log where they are. */
+ static bool
+-gpu_level4a(void)
++gpu_alloc_bufs(const char *who, struct gmu_buf *bufs, unsigned n)
+ {
+-	/* Memory. */
+-	for (unsigned i = 0; i < GMU_NBUFS; i++) {
+-		struct gmu_buf *b = &gmu_bufs[i];
++	for (unsigned i = 0; i < n; i++) {
++		struct gmu_buf *b = &bufs[i];
+ 		b->va = gpu_contig(b->bytes, &b->pa);
+ 		if (!b->va) {
+-			printf("PANDORA GPU: GMU %s: no %#llx contiguous bytes\n", b->name, b->bytes);
++			printf("PANDORA GPU: %s %s: no %#llx contiguous bytes\n", who, b->name, b->bytes);
+ 			return false;
+ 		}
+-		printf("PANDORA GPU: GMU %s: iova %#llx bytes %#llx pa %#llx\n", b->name, b->iova, b->bytes, b->pa);
++		printf("PANDORA GPU: %s %s: iova %#llx bytes %#llx pa %#llx\n", who, b->name, b->iova, b->bytes, b->pa);
+ 	}
++	return true;
++}
++
++/* Tables for bufs, context bank BANK (ACTLR, programmed, read back, enabled) and stream SID
++ * routed to it through stream-match slot SLOT, all through ArmSmmu4K. */
++static bool
++smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned n, unsigned bank,
++    unsigned asid, unsigned slot, unsigned sid)
++{
+ 	uint64_t tpa;
+ 	vm_offset_t tva = gpu_contig(GMU_TABLE_PAGES * 0x1000ull, &tpa);
+ 	if (!tva) {
+-		printf("PANDORA GPU: GMU tables: no memory\n");
++		printf("PANDORA GPU: %s tables: no memory\n", who);
+ 		return false;
+ 	}
+ 
+ 	/* SMMU window and what the context encoding needs from it. */
+-	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+-	if (!smmu) {
+-		printf("PANDORA GPU: SMMU window not mapped\n");
+-		return false;
+-	}
+-	gmu_mmio.mapping = (volatile unsigned char *)smmu;
+-	gmu_mmio.bytes = SMMU_SIZE;
+-	if (ArmSmmu4KBindMmio(&gmu_mmio, &gmu_io) != ArmSmmu4KSuccess) {
+-		return false;
++	if (!gpu_smmu_va) {
++		gpu_smmu_va = ml_io_map(SMMU_PA, SMMU_SIZE);
++		if (!gpu_smmu_va) {
++			printf("PANDORA GPU: SMMU window not mapped\n");
++			return false;
++		}
++		smmu_mmio.mapping = (volatile unsigned char *)gpu_smmu_va;
++		smmu_mmio.bytes = SMMU_SIZE;
++		if (ArmSmmu4KBindMmio(&smmu_mmio, &smmu_io) != ArmSmmu4KSuccess) {
++			return false;
++		}
+ 	}
++	vm_offset_t smmu = gpu_smmu_va;
+ 	uint32_t id0 = gpu_rd(smmu, SMMU_ID0), id1 = gpu_rd(smmu, SMMU_ID1), id2 = gpu_rd(smmu, SMMU_ID2);
+ 	static const uint8_t oas_bits[16] = {32, 36, 40, 42, 44, 48};
+ 	unsigned oas = ((id2 >> 4) & 15) < 6 ? oas_bits[(id2 >> 4) & 15] : 0;
+@@ -544,75 +569,83 @@ gpu_level4a(void)
+ 	}
+ 
+ 	/* Tables. */
+-	ArmSmmu4KRange ranges[GMU_NBUFS];
++	ArmSmmu4KRange ranges[8];
+ 	uint64_t leaves = 0;
+-	for (unsigned i = 0; i < GMU_NBUFS; i++) {
+-		ranges[i] = (ArmSmmu4KRange){ gmu_bufs[i].iova, gmu_bufs[i].pa, gmu_bufs[i].bytes,
+-			                      gmu_bufs[i].perm, 0, 2 };
+-		leaves += gmu_bufs[i].bytes / 0x1000;
+-		if ((gmu_bufs[i].pa >> oas) != 0) {
+-			printf("PANDORA GPU: GMU %s above the %u-bit output size\n", gmu_bufs[i].name, oas);
++	if (n > 8) {
++		return false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		ranges[i] = (ArmSmmu4KRange){ bufs[i].iova, bufs[i].pa, bufs[i].bytes, bufs[i].perm, 0, 2 };
++		leaves += bufs[i].bytes / 0x1000;
++		if ((bufs[i].pa >> oas) != 0) {
++			printf("PANDORA GPU: %s %s above the %u-bit output size\n", who, bufs[i].name, oas);
+ 			return false;
+ 		}
+ 	}
+-	gmu_tcfg = (ArmSmmu4KConfig){ 32, oas, tpa, (size_t)leaves };
+-	ArmSmmu4KStatus st = ArmSmmu4KBuild(&gmu_tcfg, ranges, GMU_NBUFS, (uint64_t *)tva,
+-	    GMU_TABLE_PAGES, &gmu_tables);
+-	printf("PANDORA GPU: GMU tables: status %d root %#llx pages %zu leaves %zu start level %u mair %#llx "
+-	    "(oas %u, id0 %08x id1 %08x id2 %08x)\n", st, gmu_tables.root_physical, gmu_tables.table_pages,
+-	    gmu_tables.leaf_pages, gmu_tables.start_level, gmu_tables.mair, oas, id0, id1, id2);
++	c->tcfg = (ArmSmmu4KConfig){ 32, oas, tpa, (size_t)leaves };
++	ArmSmmu4KStatus st = ArmSmmu4KBuild(&c->tcfg, ranges, n, (uint64_t *)tva, GMU_TABLE_PAGES, &c->tables);
++	printf("PANDORA GPU: %s tables: status %d root %#llx pages %zu leaves %zu start level %u mair %#llx "
++	    "(oas %u, id0 %08x id1 %08x id2 %08x)\n", who, st, c->tables.root_physical, c->tables.table_pages,
++	    c->tables.leaf_pages, c->tables.start_level, c->tables.mair, oas, id0, id1, id2);
+ 	if (st != ArmSmmu4KSuccess) {
+ 		return false;
+ 	}
+-	clean_dcache64((addr64_t)tpa, (unsigned)(gmu_tables.table_pages * 0x1000), TRUE);
++	clean_dcache64((addr64_t)tpa, (unsigned)(c->tables.table_pages * 0x1000), TRUE);
+ 
+ 	/* Context bank: must be disabled; ACTLR is the platform's part (the kit does not write it). */
+ 	uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
+ 	uint64_t numpage = 1ull << (((id1 >> 28) & 7) + 1);
+-	uint64_t cb = numpage * page + GMU_BANK * page;
++	uint64_t cb = numpage * page + bank * page;
+ 	if (cb + 0x1000 > SMMU_SIZE) {
+-		printf("PANDORA GPU: context bank %u at %#llx outside the window\n", GMU_BANK, cb);
++		printf("PANDORA GPU: context bank %u at %#llx outside the window\n", bank, cb);
+ 		return false;
+ 	}
+ 	uint32_t sctlr = gpu_rd(smmu, (uint32_t)cb);
+-	printf("PANDORA GPU: SMMU bank %u at %#llx: sctlr %08x actlr %08x cbar %08x\n", GMU_BANK, cb, sctlr,
+-	    gpu_rd(smmu, (uint32_t)cb + 4), gpu_rd(smmu, (uint32_t)(page + 4 * GMU_BANK)));
++	printf("PANDORA GPU: SMMU bank %u at %#llx: sctlr %08x actlr %08x cbar %08x\n", bank, cb, sctlr,
++	    gpu_rd(smmu, (uint32_t)cb + 4), gpu_rd(smmu, (uint32_t)(page + 4 * bank)));
+ 	if (sctlr & 1) {
+-		printf("PANDORA GPU: bank %u already enabled: stop\n", GMU_BANK);
++		printf("PANDORA GPU: bank %u already enabled: stop\n", bank);
+ 		return false;
+ 	}
+-	gpu_step("SMMU: ACTLR, then program and enable the GMU context");
++	gpu_step("SMMU: ACTLR, then program and enable the context");
+ 	gpu_wr(smmu, (uint32_t)cb + 4, GMU_ACTLR);
+-	gmu_ctx = (ArmSmmu4KContextConfig){ &gmu_tcfg, NULL, &gmu_tables, NULL, id0, id2, GMU_ASID, 0, 0, 0 };
+-	st = ArmSmmu4KProgramDisabledContext(&gmu_io, GMU_BANK, &gmu_ctx, 1000, &gmu_prog);
+-	printf("PANDORA GPU: SMMU context: status %d phase %u writes %u enabled %u fsr %08x actlr %08x sctlr %08x "
+-	    "tcr %08x ttbr0 %#llx mair0 %08x\n", st, gmu_prog.phase, gmu_prog.writes, gmu_prog.enabled,
+-	    gmu_prog.fault_status, gpu_rd(smmu, (uint32_t)cb + 4), gmu_prog.readback.sctlr, gmu_prog.readback.tcr,
+-	    gmu_prog.readback.ttbr0, gmu_prog.readback.mair0);
++	c->ctx = (ArmSmmu4KContextConfig){ &c->tcfg, NULL, &c->tables, NULL, id0, id2, asid, 0, 0, 0 };
++	st = ArmSmmu4KProgramDisabledContext(&smmu_io, bank, &c->ctx, 1000, &c->prog);
++	printf("PANDORA GPU: %s SMMU context: status %d phase %u writes %u enabled %u fsr %08x actlr %08x sctlr %08x "
++	    "tcr %08x ttbr0 %#llx mair0 %08x\n", who, st, c->prog.phase, c->prog.writes, c->prog.enabled,
++	    c->prog.fault_status, gpu_rd(smmu, (uint32_t)cb + 4), c->prog.readback.sctlr, c->prog.readback.tcr,
++	    c->prog.readback.ttbr0, c->prog.readback.mair0);
+ 	if (st != ArmSmmu4KSuccess) {
+ 		return false;
+ 	}
+ 
+ 	/* Stream: the free slot's S2CR must fault before the kit attaches it. */
+-	uint32_t smr = gpu_rd(smmu, SMMU_SMR(GMU_SLOT)), s2cr = gpu_rd(smmu, SMMU_S2CR(GMU_SLOT));
+-	printf("PANDORA GPU: SMMU slot %u before: smr %08x s2cr %08x\n", GMU_SLOT, smr, s2cr);
++	uint32_t smr = gpu_rd(smmu, SMMU_SMR(slot)), s2cr = gpu_rd(smmu, SMMU_S2CR(slot));
++	printf("PANDORA GPU: SMMU slot %u before: smr %08x s2cr %08x\n", slot, smr, s2cr);
+ 	if (smr & (1u << 31)) {
+-		printf("PANDORA GPU: slot %u in use: stop\n", GMU_SLOT);
++		printf("PANDORA GPU: slot %u in use: stop\n", slot);
+ 		return false;
+ 	}
+ 	if (s2cr != (2u << 16)) {
+-		gpu_wr(smmu, SMMU_S2CR(GMU_SLOT), 2u << 16);
+-		printf("PANDORA GPU: slot %u S2CR set to fault: %08x\n", GMU_SLOT, gpu_rd(smmu, SMMU_S2CR(GMU_SLOT)));
+-	}
+-	gpu_step("SMMU: route stream 5 to the GMU context");
+-	ArmSmmu4KStream route = { GMU_SLOT, (uint16_t)GMU_SID };
+-	st = ArmSmmu4KAttachStreams(&gmu_io, &gmu_streams, &route, 1, GMU_BANK, &gmu_ctx, &gmu_sres);
+-	printf("PANDORA GPU: SMMU stream: status %d phase %u writes %u verified %u global fault %08x; "
+-	    "slot %u smr %08x s2cr %08x\n", st, gmu_sres.phase, gmu_sres.writes, gmu_sres.streams_verified,
+-	    gmu_sres.global_fault, GMU_SLOT, gpu_rd(smmu, SMMU_SMR(GMU_SLOT)), gpu_rd(smmu, SMMU_S2CR(GMU_SLOT)));
++		gpu_wr(smmu, SMMU_S2CR(slot), 2u << 16);
++		printf("PANDORA GPU: slot %u S2CR set to fault: %08x\n", slot, gpu_rd(smmu, SMMU_S2CR(slot)));
++	}
++	gpu_step("SMMU: route the stream to the context");
++	ArmSmmu4KStream route = { slot, (uint16_t)sid };
++	st = ArmSmmu4KAttachStreams(&smmu_io, &c->streams, &route, 1, bank, &c->ctx, &c->sres);
++	printf("PANDORA GPU: %s SMMU stream %u: status %d phase %u writes %u verified %u global fault %08x; "
++	    "slot %u smr %08x s2cr %08x\n", who, sid, st, c->sres.phase, c->sres.writes, c->sres.streams_verified,
++	    c->sres.global_fault, slot, gpu_rd(smmu, SMMU_SMR(slot)), gpu_rd(smmu, SMMU_S2CR(slot)));
+ 	return st == ArmSmmu4KSuccess;
+ }
+ 
++static bool
++gpu_level4a(void)
++{
++	return gpu_alloc_bufs("GMU", gmu_bufs, GMU_NBUFS) &&
++	       smmu_ctx_up("GMU", &gmu_smmu, gmu_bufs, GMU_NBUFS, GMU_BANK, GMU_ASID, GMU_SLOT, GMU_SID);
++}
++
+ /* ---- level 5 (4b): GMU cold start --------------------------------------------------- */
+ 
+ /* GMU registers, dword offsets from the GPU base (a6xx_gmu.xml, A8XX variants where they differ). */
+@@ -1262,6 +1295,49 @@ gpu_level8(void)
+ 	return voted && ok;
+ }
+ 
++/* ---- level 9: the GPU's own SMMU context, ring, SQE, scratch ----------------------------- */
++
++#define GPU_SID           0u           /* DT qcom,kgsl-iommu gfx3d_user iommus = <&kgsl_smmu 0x0 0x0> */
++#define GPU_BANK          0u           /* arm-smmu-qcom gives the Adreno its context bank 0 */
++#define GPU_ASID          2u
++#define GPU_SLOT          3u
++
++/* GPU addresses of the first command test; the SQE is the firmware without its first word
++ * (adreno_fw_create_bo), mapped read-only and executable as Linux maps it. */
++static struct gmu_buf gpu_bufs[] = {
++	{ "ring", 0x00100000u, 0x8000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++	{ "sqe", 0x00200000u, 0x20000u, ArmSmmu4KRead | ArmSmmu4KExecute, 0, 0 },
++	{ "scratch", 0x00300000u, 0x1000u, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 0 },
++};
++#define GPU_NBUFS (sizeof(gpu_bufs) / sizeof(gpu_bufs[0]))
++
++static bool
++gpu_level9(void)
++{
++	uint64_t len = 0;
++	uint8_t *sqe = gpu_fw_file("gen80200_sqe.fw", &len);
++	if (!sqe) {
++		return false;
++	}
++	if (len <= 4 || len - 4 > gpu_bufs[1].bytes) {
++		printf("PANDORA GPU: sqe size %llu does not fit\n", len);
++		kfree_data(sqe, (vm_size_t)len);
++		return false;
++	}
++	if (!gpu_alloc_bufs("GPU", gpu_bufs, GPU_NBUFS)) {
++		kfree_data(sqe, (vm_size_t)len);
++		return false;
++	}
++	memcpy((void *)gpu_bufs[1].va, sqe + 4, (size_t)(len - 4));
++	clean_dcache64((addr64_t)gpu_bufs[1].pa, (unsigned)gpu_bufs[1].bytes, TRUE);
++	uint32_t w[4];
++	memcpy(w, sqe + 4, sizeof(w));
++	printf("PANDORA GPU: SQE %llu bytes loaded at iova %#llx: %08x %08x %08x %08x\n", len - 4, gpu_bufs[1].iova,
++	    w[0], w[1], w[2], w[3]);
++	kfree_data(sqe, (vm_size_t)len);
++	return smmu_ctx_up("GPU", &gpu_smmu, gpu_bufs, GPU_NBUFS, GPU_BANK, GPU_ASID, GPU_SLOT, GPU_SID);
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -1270,7 +1346,7 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
+ 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
+-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on)\n", level);
++	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context)\n", level);
+ 	gpu_cmddb();
+ 	if (gpu_read_cc(true)) {
+ 		gpu_read_smmu();
+@@ -1304,6 +1380,11 @@ gpu_thread(void *arg, wait_result_t result)
+ 								if (s && level >= 8) {
+ 									bool gx = gpu_level8();
+ 									printf("PANDORA GPU: level 8 (GX on) %s\n", gx ? "done" : "stopped");
++									if (gx && level >= 9) {
++										bool m = gpu_level9();
++										printf("PANDORA GPU: level 9 (GPU SMMU context, SQE) %s\n",
++										    m ? "done" : "stopped");
++									}
+ 								}
+ 							}
+ 						}
