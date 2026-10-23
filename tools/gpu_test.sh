@@ -1,7 +1,7 @@
 #!/bin/bash
 # One GPU test round on the phone, from Git Bash:
 #
-#   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"]
+#   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -20,7 +20,7 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
-WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0184-amfi.macho LEVEL=15 ARGS=
+WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0185-amfi.macho LEVEL=15 ARGS= METAL=1
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -28,6 +28,7 @@ while [ $# -gt 0 ]; do
 	--kernel) KERNEL=$2; shift 2 ;;
 	--level) LEVEL=$2; shift 2 ;;
 	--args) ARGS=$2; shift 2 ;;
+	--no-metal) METAL=0; shift ;;
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -45,24 +46,48 @@ if [ "$ZIP" = release ]; then
 		curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
 	done
 	cat "$T/BUILD.txt"
+	# The Metal plugin and mtltest, when the build published them (and --no-metal is not given).
+	if [ $METAL = 1 ] && curl -sSfL --retry 3 -o "$(winp "$T/SHA256SUMS.metal")" "$R/SHA256SUMS.metal"; then
+		for f in NativeAdrenoMetal NativeAdrenoMetal.Info.plist mtltest; do
+			curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
+		done
+		# SHA256SUMS.metal names the bundle paths; the release carries the same bytes under flat names.
+		sed -e 's|NativeAdrenoMetal.bundle/NativeAdrenoMetal$|NativeAdrenoMetal|' \
+			-e 's|NativeAdrenoMetal.bundle/Info.plist$|NativeAdrenoMetal.Info.plist|' "$T/SHA256SUMS.metal" >> "$T/SHA256SUMS"
+	fi
 else
 	python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
 fi
 (cd "$T" && sha256sum -c SHA256SUMS)
+HAVE_METAL=0; [ -f "$T/NativeAdrenoMetal" ] && HAVE_METAL=1
 
 echo "== 2. trust cache"
-python -I "$(winp "$ROOT/tools/pgputest/mktc.py")" "$(winp "$T/gpu.tc")" "$(winp "$T/vktest")" \
-	"$(winp "$T/libvulkan_freedreno.dylib")"
+SIGNED=("$(winp "$T/vktest")" "$(winp "$T/libvulkan_freedreno.dylib")")
+[ $HAVE_METAL = 1 ] && SIGNED+=("$(winp "$T/NativeAdrenoMetal")" "$(winp "$T/mtltest")")
+python -I "$(winp "$ROOT/tools/pgputest/mktc.py")" "$(winp "$T/gpu.tc")" "${SIGNED[@]}"
 wsl -d Ubuntu-24.04 -u root -- bash -c "mkdir -p /opt/work/gputest && cp '$(wslp "$T/gpu.tc")' /opt/work/gputest/$NAME.tc"
 
 echo "== 3. firmware pack"
 printf 'vktest 755 /usr/libexec/vktest\nlibvulkan_freedreno.dylib 755 /usr/lib/libvulkan_freedreno.dylib\n' > "$T/files.txt"
 F=$ROOT/out-root/fwpack_src
-python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "$(winp "$F/gen80200_gmu.bin")" \
-	"$(winp "$F/gen80200_sqe.fw")" "$(winp "$F/gen80200_zap.mbn")" "$(winp "$T/vktest")" \
-	"$(winp "$T/libvulkan_freedreno.dylib")" "$(winp "$T/files.txt")"
+PARTS=("$(winp "$F/gen80200_gmu.bin")" "$(winp "$F/gen80200_sqe.fw")" "$(winp "$F/gen80200_zap.mbn")"
+	"$(winp "$T/vktest")" "$(winp "$T/libvulkan_freedreno.dylib")")
+if [ $HAVE_METAL = 1 ]; then
+	# The bundle directory first (patch 0185), then its files; the plugin hands a device only to the
+	# processes named in NativeAdrenoMetal.clients (tools/metal/adapt_ios16.py).
+	E=/System/Library/Extensions
+	printf 'bluetoothd vktest mtltest\n' > "$T/NativeAdrenoMetal.clients"
+	printf -- '- 755 %s\nNativeAdrenoMetal 755 %s\nNativeAdrenoMetal.Info.plist 644 %s\nNativeAdrenoMetal.clients 644 %s\nmtltest 755 /usr/libexec/mtltest\n' \
+		"$E/NativeAdrenoMetal.bundle" "$E/NativeAdrenoMetal.bundle/NativeAdrenoMetal" \
+		"$E/NativeAdrenoMetal.bundle/Info.plist" "$E/NativeAdrenoMetal.clients" >> "$T/files.txt"
+	PARTS+=("$(winp "$T/NativeAdrenoMetal")" "$(winp "$T/NativeAdrenoMetal.Info.plist")"
+		"$(winp "$T/NativeAdrenoMetal.clients")" "$(winp "$T/mtltest")")
+fi
+cat "$T/files.txt"
+python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"
 SZ=$(stat -c %s "$PACK"); N=$((SZ / 4096)); WANT=$(sha256sum "$PACK" | cut -c1-64)
 echo "pack $SZ bytes, $N blocks, sha256 $WANT"
+[ "$SZ" -le 41943040 ] || { echo "the pack is larger than the 40 MiB pinned file on the phone"; exit 5; }
 
 echo "== 4. pack on the phone"
 P=/data/local/tmp/pinfile; FILE=/data/local/tmp/adspfw.img
@@ -85,5 +110,5 @@ GPUPOOL=1024 KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.s
 
 echo "== 6. results"
 L=$ROOT/device/logs/$NAME.txt
-grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA GPU UC: (AGX|client|open)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|AMFI: .*(vktest|libvulkan)|dyld|NativeAdrenoMetal|panic\(" "$L" | cut -c1-240 | head -120
+grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA GPU UC: (AGX|client|open)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|MTLTEST:|AMFI: .*(vktest|libvulkan)|dyld|NativeAdrenoMetal|panic\(" "$L" | cut -c1-240 | head -120
 echo "VKTEST PASS $(grep -c 'VKTEST: PASS' "$L"), FAIL lines $(grep -c 'VKTEST: .*FAIL' "$L"), restarts $(grep -c 'restart type' "$L")"
