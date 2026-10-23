@@ -2866,7 +2866,7 @@ gpu_level14(bool rest)
 }
 
 /*
- * Patch 0189, with pandora_gpu_metal=1: every 5 s for 5 minutes, what each client has done
+ * Patch 0189, with pandora_gpu_metal=1: every 5 s for 10 minutes (0190), what each client has done
  * (allocations, imports, mappings, frees, submissions, its last fence), the ring timestamp, and
  * any GPU SMMU context fault (FSR, FAR, FSYNR0 of bank 0; cleared once logged); a line only when
  * something changed. Which process renders through the GPU, and whether the GPU faults on it.
@@ -2875,8 +2875,8 @@ static void
 gpu_watch(void)
 {
 	char last[GPU_MAX_CLIENTS][96] = {};
-	uint32_t last_ring = ~0u;
-	for (unsigned t = 0; t < 60; t++) {
+	uint32_t last_ring = ~0u, last_fsr = 0;
+	for (unsigned t = 0; t < 120; t++) {   /* 10 minutes: shader compiling can take minutes */
 		gpu_sleep(5000);
 		lck_mtx_lock(&gpu_lock);
 		for (unsigned i = 0; i < GPU_MAX_CLIENTS; i++) {
@@ -2896,18 +2896,19 @@ gpu_watch(void)
 		const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
 		flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
 		uint32_t ring = mem[1], fsr = gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x58);
-		if (ring != last_ring || fsr) {
+		if (ring != last_ring || fsr != last_fsr) {
 			printf("PANDORA GPU WATCH: %u s ring timestamp %u (issued %u) rbbm %08x cp int %08x rptr %u wptr %u\n",
 			    (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(CP_INTERRUPT_STATUS_GLOBAL),
 			    gr(CP_RB_RPTR), ring_wptr);
 			last_ring = ring;
 		}
-		if (fsr) {
+		if (fsr && fsr != last_fsr) {
 			printf("PANDORA GPU WATCH: SMMU fault fsr %08x far %08x%08x fsynr0 %08x\n", fsr,
 			    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x64), gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x60),
 			    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x68));
 			gpu_wr(gpu_smmu_va, gpu_smmu.cb + 0x58, fsr);
 		}
+		last_fsr = fsr;   /* bit 10 stays set from boot on (bb2 log); log changes only */
 		lck_mtx_unlock(&gpu_lock);
 	}
 }
