@@ -50,8 +50,6 @@ run(void)
 {
 		/* ---- part 1: the device ---- */
 		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-		NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
-		say("MTLTEST: MTLCopyAllDevices: %lu", (unsigned long)all.count);
 		if (check("part 1: MTLCreateSystemDefaultDevice", dev, nil)) {
 			return;
 		}
