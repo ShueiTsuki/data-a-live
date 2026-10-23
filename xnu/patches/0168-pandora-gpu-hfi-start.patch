@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index fe25705..768f740 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -49,6 +49,12 @@
+  * and the a8xx perf table HFI_H2F_MSG_TABLE (a8xx_hfi_send_perf_table): GPU levels of the
+  * phone's speed bin 0xfc and the GMU frequency table from its DT, votes built as
+  * a6xx_gmu_rpmh_arc_votes_init / a6xx_gmu_rpmh_dep_votes_init from cmd-db's level lists.
++ * (gpu6 log: the GMU acked the perf table, error 0.)
++ *
++ * Level 7 (patch 0168): the rest of a6xx_hfi_start: the bandwidth table HFI_H2F_MSG_BW_TABLE
++ * (a6xx_generate_bw_table with a6xx_gmu_rpmh_bw_votes_init's BCM votes for a840's SH0/MC0/ACV,
++ * CN0 for the CX path; the levels are the phone DT's qcom,bus-table-ddr, as KGSL builds them),
++ * then HFI_H2F_MSG_CORE_FW_START and HFI_H2F_MSG_START. ACD and IFPC stay off.
+  *
+  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
+  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
+@@ -1092,6 +1098,106 @@ gpu_level6(void)
+ 	return ok;
+ }
+ 
++/* ---- level 7: bandwidth table, CORE_FW_START, START ------------------------------------ */
++
++#define HFI_H2F_MSG_BW_TABLE      3u
++#define HFI_H2F_MSG_START         10u
++#define HFI_H2F_MSG_CORE_FW_START 14u
++#define BCM_CMD(commit, valid, x, y) \
++	(((uint32_t)(commit) << 30) | ((uint32_t)(valid) << 29) | (((uint32_t)(x) & 0x3fff) << 14) | ((uint32_t)(y) & 0x3fff))
++
++/* Phone DT qcom,kgsl-3d0 qcom,bus-table-ddr, KBps; the pwrlevels' qcom,bus-freq index it. */
++static const uint32_t gpu_ddr_kbps[] = {
++	0, 2136718, 5285156, 6074218, 6672899, 8171875, 10687500, 12449218, 14398437, 16500000, 18671875,
++	20832031,
++};
++#define NBW (sizeof(gpu_ddr_kbps) / sizeof(gpu_ddr_kbps[0]))
++
++/* a6xx_catalog.c a840 .bcms */
++static const struct { const char *name; uint32_t buswidth; bool fixed; uint32_t perfmode; } a840_bcms[] = {
++	{ "SH0", 16, false, 0 }, { "MC0", 4, false, 0 }, { "ACV", 0, true, 1u << 2 },
++};
++#define NBCM (sizeof(a840_bcms) / sizeof(a840_bcms[0]))
++
++static bool
++gpu_level7(void)
++{
++	/* a6xx_hfi_msg_bw_table: header, bw_level_num, cnoc_cmds_num, ddr_cmds_num, cnoc_wait_bitmask,
++	 * ddr_wait_bitmask, cnoc_cmds_addrs[6], cnoc_cmds_data[2][6], ddr_cmds_addrs[8], ddr_cmds_data[16][8] */
++	static uint32_t bw[160];
++	uint32_t *cnoc_addrs = bw + 6, *cnoc_data = bw + 12, *ddr_addrs = bw + 24, *ddr_data = bw + 32;
++	uint32_t unit[NBCM], width[NBCM], vcd[NBCM];
++	bzero(bw, sizeof(bw));
++	for (unsigned j = 0; j < NBCM; j++) {
++		uint32_t addr, aux, len;
++		if (cmddb_find(a840_bcms[j].name, &addr, &aux, &len) || len < 8) {
++			printf("PANDORA GPU: cmd-db %s missing\n", a840_bcms[j].name);
++			return false;
++		}
++		/* struct bcm_db { le32 unit; le16 width; u8 vcd; u8 reserved; } */
++		unit[j] = db16(aux) | ((uint32_t)db16(aux + 2) << 16);
++		width[j] = db16(aux + 4);
++		vcd[j] = db16(aux + 6) & 0xff;
++		ddr_addrs[j] = addr;
++	}
++	for (unsigned i = 0; i < NBW; i++) {
++		for (unsigned j = 0; j < NBCM; j++) {
++			bool commit = j == NBCM - 1 || vcd[j] != vcd[j + 1];
++			uint32_t v;
++			if (!gpu_ddr_kbps[i]) {
++				v = BCM_CMD(commit, 0, 0, 0);
++			} else if (a840_bcms[j].fixed) {
++				v = BCM_CMD(commit, 1, 0, a840_bcms[j].perfmode);   /* a8xx: perfmode on every level */
++			} else {
++				uint64_t peak = (uint64_t)gpu_ddr_kbps[i] * width[j] / a840_bcms[j].buswidth;
++				peak = peak * 1000 / unit[j];
++				uint32_t vote = (uint32_t)MAX(1ull, MIN(peak, 0x3fffull));
++				v = BCM_CMD(commit, 1, vote, vote);
++			}
++			ddr_data[8 * i + j] = v;
++		}
++	}
++	bw[1] = NBW;
++	bw[3] = NBCM;
++	for (unsigned j = 0; j < NBCM; j++) {
++		if (ddr_data[j] & (1u << 30)) {
++			bw[5] |= 1u << j;
++		}
++	}
++	uint32_t cn0, aux, len;
++	if (cmddb_find("CN0", &cn0, &aux, &len)) {
++		printf("PANDORA GPU: cmd-db CN0 missing\n");
++		return false;
++	}
++	cnoc_addrs[0] = cn0;
++	bw[2] = 1;
++	cnoc_data[0] = BCM_CMD(1, 0, 0, 0);
++	cnoc_data[6] = BCM_CMD(1, 1, 0, 1);
++	bw[4] = 1;
++	printf("PANDORA GPU: bw table: %u levels, ddr %05x %05x %05x wait %x, level 1 %08x %08x %08x, level %u "
++	    "%08x %08x %08x, cnoc %05x %08x/%08x\n", bw[1], ddr_addrs[0], ddr_addrs[1], ddr_addrs[2], bw[5],
++	    ddr_data[8], ddr_data[9], ddr_data[10], (unsigned)NBW - 1, ddr_data[8 * (NBW - 1)],
++	    ddr_data[8 * (NBW - 1) + 1], ddr_data[8 * (NBW - 1) + 2], cn0, cnoc_data[0], cnoc_data[6]);
++
++	gpu_step("HFI: bandwidth table, CORE_FW_START, START");
++	bool ok = hfi_send(HFI_H2F_MSG_BW_TABLE, bw, 160);
++	printf("PANDORA GPU: HFI bandwidth table %s\n", ok ? "ACKED" : "NOT ACKED");
++	if (!ok) {
++		return false;
++	}
++	static uint32_t fw_start[2], start[1];
++	fw_start[1] = 0;        /* handle */
++	ok = hfi_send(HFI_H2F_MSG_CORE_FW_START, fw_start, 2);
++	printf("PANDORA GPU: HFI CORE_FW_START %s\n", ok ? "ACKED" : "NOT ACKED");
++	if (!ok) {
++		return false;
++	}
++	ok = hfi_send(HFI_H2F_MSG_START, start, 1);
++	printf("PANDORA GPU: HFI START %s; gfx_pwr_clk_status %08x rpmh_power_state %08x ao_host_irq %08x\n",
++	    ok ? "ACKED" : "NOT ACKED", gmu_rd(0x1f7e8), gmu_rd(0x1f7e9), gmu_rd(GMU_AO_HOST_INTR_STATUS));
++	return ok;
++}
++
+ static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+@@ -1100,7 +1206,7 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
+ 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
+-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table)\n", level);
++	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start)\n", level);
+ 	gpu_cmddb();
+ 	if (gpu_read_cc(true)) {
+ 		gpu_read_smmu();
+@@ -1128,6 +1234,10 @@ gpu_thread(void *arg, wait_result_t result)
+ 						if (up && level >= 6) {
+ 							bool t = gpu_level6();
+ 							printf("PANDORA GPU: level 6 (HFI perf table) %s\n", t ? "done" : "stopped");
++							if (t && level >= 7) {
++								bool s = gpu_level7();
++								printf("PANDORA GPU: level 7 (HFI start) %s\n", s ? "done" : "stopped");
++							}
+ 						}
+ 					}
+ 				}
