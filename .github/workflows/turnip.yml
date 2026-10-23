@@ -5,6 +5,12 @@ name: turnip
 # ABI header are fetched at pinned commits; nothing from them is committed here.
 on:
   workflow_dispatch:
+  # A push that touches the build also starts it (the repository is public: no minute limit)
+  push:
+    paths:
+      - .github/workflows/turnip.yml
+      - tools/turnip/**
+      - tools/vktest/**
 
 concurrency:
   group: turnip-${{ github.ref }}
