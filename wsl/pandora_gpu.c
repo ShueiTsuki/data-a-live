@@ -93,6 +93,14 @@
  * Level 12 (patch 0174): commands from a separate buffer as Mesa submits them: a page mapped at
  * GPU address 0x400000 holding one CP_MEM_WRITE, called from the ring with CP_INDIRECT_BUFFER;
  * then the BR and BV copies of CP_IB1_BASE / REM_SIZE / INIT_SIZE.
+ * (gpu12 log: IB ran on BR, BR IB1 base 0x400000 rem 0 init 4; BV IB1 all 0.)
+ *
+ * Level 13 (patch 0175): what the user interface will stand on. A contiguous buffer pool (1 GiB
+ * asked, halved to 16 MiB on refusal), GPU mappings added to the live context afterwards (the
+ * GPU context's table pool is now 4 MiB), and two submissions framed as Linux a7xx_submit and
+ * NativeAdrenoRing do (context entry with SRAM init on the first, A8XX registers from gen8_reg.h)
+ * with IBs in a pool buffer at 0x20000000, the first IB on BR, the second on BOTH; completion by
+ * the ring timestamp in msm_rbmemptrs layout at scratch + 0x100.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -489,6 +497,7 @@ gpu_level3(void)
 #define GMU_ASID          1u
 #define GMU_SLOT          2u
 #define GMU_TABLE_PAGES   64u
+#define GPU_TABLE_PAGES   1024u     /* 4 MiB: the level-9 tables plus room for ~2 GiB of later 4K maps */
 
 struct gmu_buf {
 	const char *name;
@@ -519,6 +528,9 @@ struct smmu_ctx {
 	ArmSmmu4KProgramResult prog;
 	ArmSmmu4KStreamState streams;
 	ArmSmmu4KStreamResult sres;
+	vm_offset_t tva;                /* table pool: kernel address, size in pages, next unused page */
+	unsigned tpages, tnext;
+	unsigned bank;
 };
 static struct smmu_ctx gmu_smmu, gpu_smmu;
 
@@ -559,10 +571,10 @@ gpu_alloc_bufs(const char *who, struct gmu_buf *bufs, unsigned n)
  * routed to it through stream-match slot SLOT, all through ArmSmmu4K. */
 static bool
 smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned n, unsigned bank,
-    unsigned asid, unsigned slot, unsigned sid)
+    unsigned asid, unsigned slot, unsigned sid, unsigned tpages)
 {
 	uint64_t tpa;
-	vm_offset_t tva = gpu_contig(GMU_TABLE_PAGES * 0x1000ull, &tpa);
+	vm_offset_t tva = gpu_contig(tpages * 0x1000ull, &tpa);
 	if (!tva) {
 		printf("PANDORA GPU: %s tables: no memory\n", who);
 		return false;
@@ -604,7 +616,7 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned 
 		}
 	}
 	c->tcfg = (ArmSmmu4KConfig){ 32, oas, tpa, (size_t)leaves };
-	ArmSmmu4KStatus st = ArmSmmu4KBuild(&c->tcfg, ranges, n, (uint64_t *)tva, GMU_TABLE_PAGES, &c->tables);
+	ArmSmmu4KStatus st = ArmSmmu4KBuild(&c->tcfg, ranges, n, (uint64_t *)tva, tpages, &c->tables);
 	printf("PANDORA GPU: %s tables: status %d root %#llx pages %zu leaves %zu start level %u mair %#llx "
 	    "(oas %u, id0 %08x id1 %08x id2 %08x)\n", who, st, c->tables.root_physical, c->tables.table_pages,
 	    c->tables.leaf_pages, c->tables.start_level, c->tables.mair, oas, id0, id1, id2);
@@ -612,6 +624,10 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned 
 		return false;
 	}
 	clean_dcache64((addr64_t)tpa, (unsigned)(c->tables.table_pages * 0x1000), TRUE);
+	c->tva = tva;
+	c->tpages = tpages;
+	c->tnext = (unsigned)c->tables.table_pages;
+	c->bank = bank;
 
 	/* Context bank: must be disabled; ACTLR is the platform's part (the kit does not write it). */
 	uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
@@ -664,7 +680,8 @@ static bool
 gpu_level4a(void)
 {
 	return gpu_alloc_bufs("GMU", gmu_bufs, GMU_NBUFS) &&
-	       smmu_ctx_up("GMU", &gmu_smmu, gmu_bufs, GMU_NBUFS, GMU_BANK, GMU_ASID, GMU_SLOT, GMU_SID);
+	       smmu_ctx_up("GMU", &gmu_smmu, gmu_bufs, GMU_NBUFS, GMU_BANK, GMU_ASID, GMU_SLOT, GMU_SID,
+	           GMU_TABLE_PAGES);
 }
 
 /* ---- level 5 (4b): GMU cold start --------------------------------------------------- */
@@ -1357,7 +1374,8 @@ gpu_level9(void)
 	printf("PANDORA GPU: SQE %llu bytes loaded at iova %#llx: %08x %08x %08x %08x\n", len - 4, gpu_bufs[1].iova,
 	    w[0], w[1], w[2], w[3]);
 	kfree_data(sqe, (vm_size_t)len);
-	return smmu_ctx_up("GPU", &gpu_smmu, gpu_bufs, GPU_NBUFS, GPU_BANK, GPU_ASID, GPU_SLOT, GPU_SID);
+	return smmu_ctx_up("GPU", &gpu_smmu, gpu_bufs, GPU_NBUFS, GPU_BANK, GPU_ASID, GPU_SLOT, GPU_SID,
+	    GPU_TABLE_PAGES);
 }
 
 /* ---- level 10: the CP ------------------------------------------------------------------- */
@@ -1650,6 +1668,252 @@ gpu_level12(void)
 	return idle && v == 0x1b000012;
 }
 
+/* ---- level 13: buffer pool, later GPU mappings, a framed submission --------------------------- */
+
+/* Map [iova, iova + bytes) to pa in a live context's tables, 4K leaves in the ArmSmmu4K format
+ * (normal non-cacheable, outer shareable, as NativeAdreno maps user buffers), table pages taken
+ * from the rest of the context's pool, then TLBIALL for the bank. Refuses pages already mapped. */
+static bool
+smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigned perm)
+{
+	uint64_t pool = c->tables.root_physical, attr = (1u << 11) | (1u << 10) | 3 | (2u << 8);
+	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
+	if (((iova | pa | bytes) & 0xfff) || !bytes || iova + bytes > (1ull << in) || !(perm & ArmSmmu4KRead)) {
+		return false;
+	}
+	if (!(perm & ArmSmmu4KExecute)) {
+		attr |= 3ull << 53;
+	}
+	attr |= 1u << 6;                        /* unprivileged, as Build's default */
+	if (!(perm & ArmSmmu4KWrite)) {
+		attr |= 1u << 7;
+	}
+	for (uint64_t off = 0; off < bytes; off += 0x1000) {
+		uint64_t va = iova + off;
+		uint64_t *t = (uint64_t *)c->tva;      /* root page */
+		for (unsigned level = start; level < 3; level++) {
+			unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+			uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
+			if (!*e) {
+				if (c->tnext >= c->tpages) {
+					printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
+					return false;
+				}
+				*e = (pool + 0x1000ull * c->tnext++) | 3;
+				clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - c->tva)), 8, TRUE);
+			}
+			t = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
+		}
+		uint64_t *leaf = &t[(va >> 12) & 511];
+		if (*leaf) {
+			printf("PANDORA GPU: iova %#llx already mapped (%#llx)\n", va, *leaf);
+			return false;
+		}
+		*leaf = (pa + off) | attr;
+		clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - c->tva)), 8, TRUE);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ArmSmmu4KProgramResult r;
+	ArmSmmu4KStatus st = ArmSmmu4KInvalidateAllOwnedContext(&smmu_io, c->bank, &c->ctx, 1000, &r);
+	if (st != ArmSmmu4KSuccess) {
+		printf("PANDORA GPU: TLB invalidate for bank %u: status %d\n", c->bank, st);
+		return false;
+	}
+	return true;
+}
+
+/* The buffer pool: physically contiguous, 1 GiB asked (myron: big, before anything else runs),
+ * halved down to 16 MiB as NativeAdreno's GpuContext does when the allocator refuses. */
+#define GPU_POOL_WANT     (1024ull << 20)
+#define GPU_POOL_MIN      (16ull << 20)
+static vm_offset_t gpu_pool_va;
+static uint64_t gpu_pool_pa, gpu_pool_bytes, gpu_pool_used;
+
+static bool
+gpu_pool_reserve(void)
+{
+	for (uint64_t want = GPU_POOL_WANT; want >= GPU_POOL_MIN; want /= 2) {
+		uint64_t t0 = mach_absolute_time(), ns;
+		gpu_pool_va = gpu_contig(want, &gpu_pool_pa);
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+		printf("PANDORA GPU: buffer pool %llu MiB: %s (%llu ms)\n", want >> 20,
+		    gpu_pool_va ? "reserved" : "refused", ns / 1000000);
+		if (gpu_pool_va) {
+			gpu_pool_bytes = want;
+			printf("PANDORA GPU: buffer pool at pa %#llx\n", gpu_pool_pa);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* For this level only: take bytes from the front of the pool. */
+static vm_offset_t
+gpu_pool_take(uint64_t bytes, uint64_t *pa)
+{
+	if (bytes > gpu_pool_bytes - gpu_pool_used) {
+		return 0;
+	}
+	*pa = gpu_pool_pa + gpu_pool_used;
+	vm_offset_t va = gpu_pool_va + (vm_offset_t)gpu_pool_used;
+	gpu_pool_used += bytes;
+	return va;
+}
+
+static uint32_t
+pkt4(uint32_t reg, uint32_t cnt)
+{
+	return 0x40000000u | cnt | (pm4_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (pm4_parity(reg) << 27);
+}
+
+/* A8XX registers for the submission frame (gen8_reg.h; a6xx.xml CP_SCRATCH_GLOBAL at 0x82a). */
+#define RBBM_PERFCTR_SRAM_INIT_CMD        0x449u
+#define RBBM_SLICE_PERFCTR_SRAM_INIT_CMD  0x5e8u
+#define RBBM_PERFCTR_SRAM_INIT_STATUS     0x19fu
+#define CP_SCRATCH_GLOBAL2                0x82cu
+/* msm_rbmemptrs in the scratch page: rptr +0, fence +4, bv_rptr +8, bv_fence +12; the CP's
+ * read-pointer copies already sit at scratch + 0x100 and + 0x108 (level 10). */
+#define MEMPTRS_OFF       0x100u
+
+static uint32_t gpu_seqno;
+
+static void
+ring_put_n(uint32_t op, const uint32_t *p, uint32_t n)
+{
+	ring_put(pkt7(op, n));
+	for (uint32_t i = 0; i < n; i++) {
+		ring_put(p[i]);
+	}
+}
+
+/* One submission as a7xx_submit (Linux) and NativeAdrenoRing frame it: BR, the context entry of
+ * a6xx_set_pagetable on the first one, cache flush and invalidate, THREAD (BR 1 or BOTH 3) and
+ * IFPC off, the IB, then the fence: scratch, CCU invalidates, BV timestamp, BR waits for it,
+ * ring timestamp, BOTH, IFPC on. Returns the sequence number. */
+static uint32_t
+gpu_submit(uint64_t ib, uint32_t dwords, uint32_t thread, bool reset)
+{
+	const uint64_t mem = gpu_bufs[2].iova + MEMPTRS_OFF, fence = mem + 4, bv = mem + 12;
+	const uint32_t seq = ++gpu_seqno;
+	uint32_t v;
+	v = 0x80000001u; ring_put_n(0x17, &v, 1);               /* CP_THREAD_CONTROL SYNC|BR */
+	if (reset) {
+		const uint32_t wait[4] = { 0, (uint32_t)fence, (uint32_t)(fence >> 32), seq - 1 };
+		ring_put_n(0x14, wait, 4);                       /* CP_WAIT_TIMESTAMP */
+		v = 0x80000003u; ring_put_n(0x17, &v, 1);
+		v = 0xf; ring_put_n(0x1f, &v, 1);                /* CP_RESET_CONTEXT_STATE */
+		v = 0x80000003u; ring_put_n(0x17, &v, 1);
+		v = 0x26; ring_put_n(0x46, &v, 1);               /* LRZ_FLUSH_INVALIDATE */
+		v = 0x80000001u; ring_put_n(0x17, &v, 1);
+		ring_put(pkt4(RBBM_PERFCTR_SRAM_INIT_CMD, 1));
+		ring_put(1);
+		ring_put(pkt4(RBBM_SLICE_PERFCTR_SRAM_INIT_CMD, 1));
+		ring_put(1);
+		v = 0x31; ring_put_n(0x46, &v, 1);               /* CACHE_INVALIDATE */
+		const uint32_t sram[6] = { 3, RBBM_PERFCTR_SRAM_INIT_STATUS, 0, 1, 1, 0 };
+		ring_put_n(0x3c, sram, 6);                       /* CP_WAIT_REG_MEM, WRITE_EQ */
+	}
+	v = 0x32; ring_put_n(0x46, &v, 1);                       /* CACHE_FLUSH7 */
+	v = 0x33; ring_put_n(0x46, &v, 1);                       /* CACHE_INVALIDATE7 */
+	ring_put_n(0x26, NULL, 0);                               /* CP_WAIT_FOR_IDLE */
+	ring_put_n(0x17, &thread, 1);
+	v = 0x101; ring_put_n(0x65, &v, 1);                      /* CP_SET_MARKER: IFPC off */
+	const uint32_t ibp[3] = { (uint32_t)ib, (uint32_t)(ib >> 32), dwords };
+	ring_put_n(0x3f, ibp, 3);                                /* CP_INDIRECT_BUFFER */
+	ring_put(pkt4(CP_SCRATCH_GLOBAL2, 1));
+	ring_put(seq);
+	v = 1; ring_put_n(0x17, &v, 1);
+	v = 0x18; ring_put_n(0x46, &v, 1);                       /* CCU_INVALIDATE_DEPTH */
+	v = 0x19; ring_put_n(0x46, &v, 1);                       /* CCU_INVALIDATE_COLOR */
+	v = 2; ring_put_n(0x17, &v, 1);
+	const uint32_t bvw[4] = { 0x31u | (1u << 27), (uint32_t)bv, (uint32_t)(bv >> 32), seq };
+	ring_put_n(0x46, bvw, 4);                                /* BV timestamp */
+	v = 1; ring_put_n(0x17, &v, 1);
+	const uint32_t bvwait[4] = { 0, (uint32_t)bv, (uint32_t)(bv >> 32), seq };
+	ring_put_n(0x14, bvwait, 4);
+	const uint32_t fw[4] = { 0x31u | (1u << 27) | (1u << 31), (uint32_t)fence, (uint32_t)(fence >> 32), seq };
+	ring_put_n(0x46, fw, 4);                                 /* ring timestamp, IRQ */
+	v = 3; ring_put_n(0x17, &v, 1);
+	v = 0x100; ring_put_n(0x65, &v, 1);                      /* IFPC on */
+	ring_kick();
+	return seq;
+}
+
+/* Until the ring timestamp reaches seq, at most ms; logs both timestamps and CP_SCRATCH_GLOBAL(2). */
+static bool
+gpu_wait_fence(uint32_t seq, unsigned ms)
+{
+	const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
+	uint32_t f = 0;
+	for (unsigned t = 0; t < ms * 10; t++) {
+		flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
+		f = mem[1];
+		if ((int32_t)(f - seq) >= 0) {
+			break;
+		}
+		delay(100);
+	}
+	bool ok = (int32_t)(f - seq) >= 0;
+	printf("PANDORA GPU: fence %u %s: ring timestamp %u, bv timestamp %u, scratch_global2 %u\n", seq,
+	    ok ? "reached" : "NOT reached", f, mem[3], gr(CP_SCRATCH_GLOBAL2));
+	(void)ring_idle(10);
+	return ok;
+}
+
+#define GPU_TEST_IOVA     0x20000000ull     /* first user window address in NativeAdreno's layout */
+
+static bool
+gpu_level13(void)
+{
+	bool ok;
+	if (!gpu_pool_reserve()) {
+		printf("PANDORA GPU: no buffer pool\n");
+		return false;
+	}
+	/* A 64 KiB buffer: the IB at +0, its target at +0x8000, mapped at the first user address. */
+	uint64_t bo_pa;
+	vm_offset_t bo = gpu_pool_take(0x10000, &bo_pa);
+	gpu_step("SMMU: map a pool buffer at 0x20000000");
+	if (!bo || !smmu_map(&gpu_smmu, GPU_TEST_IOVA, bo_pa, 0x10000, ArmSmmu4KRead | ArmSmmu4KWrite)) {
+		printf("PANDORA GPU: test buffer not mapped\n");
+		return false;
+	}
+	printf("PANDORA GPU: test buffer pa %#llx at iova %#llx; table pages used %u of %u\n", bo_pa,
+	    GPU_TEST_IOVA, gpu_smmu.tnext, gpu_smmu.tpages);
+
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
+	(void)gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 100000, &ok);
+	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+	if (!ok) {
+		printf("PANDORA GPU: OOB GPU_SET NOT ACKED\n");
+		return false;
+	}
+	/* Two submissions: the first with the context entry and the IB on BR, the second with the
+	 * IB on BOTH as a7xx_submit runs user IBs. Each IB writes its own word. */
+	static const uint32_t threads[2] = { 1, 3 };
+	bool all = true;
+	for (unsigned k = 0; k < 2 && all; k++) {
+		uint32_t *ib = (uint32_t *)(bo + 0x100 * k);
+		const uint64_t target = GPU_TEST_IOVA + 0x8000 + 4 * k;
+		ib[0] = pkt7(0x3d, 3);          /* CP_MEM_WRITE */
+		ib[1] = (uint32_t)target;
+		ib[2] = (uint32_t)(target >> 32);
+		ib[3] = 0x13130000u + k;
+		clean_dcache64((addr64_t)bo_pa + 0x100 * k, 16, TRUE);
+		char what[64];
+		snprintf(what, sizeof(what), "CP: framed submission %u (IB on %s)", k + 1, k ? "BOTH" : "BR");
+		gpu_step(what);
+		uint32_t seq = gpu_submit(GPU_TEST_IOVA + 0x100 * k, 4, threads[k], k == 0);
+		bool f = gpu_wait_fence(seq, 1000);
+		flush_dcache64((addr64_t)bo_pa + 0x8000, 64, TRUE);
+		uint32_t w = ((const volatile uint32_t *)(bo + 0x8000))[k];
+		printf("PANDORA GPU: submission %u: buffer word %u = %08x (want %08x)\n", seq, k, w, 0x13130000u + k);
+		all = f && w == 0x13130000u + k;
+	}
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 31);
+	return all;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -1658,7 +1922,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer, 13 = pool and framed submit)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -1707,6 +1971,11 @@ gpu_thread(void *arg, wait_result_t result)
 													bool i = gpu_level12();
 													printf("PANDORA GPU: level 12 (indirect buffer) %s\n",
 													    i ? "done" : "stopped");
+													if (i && level >= 13) {
+														bool s = gpu_level13();
+														printf("PANDORA GPU: level 13 (pool, framed submit) %s\n",
+														    s ? "done" : "stopped");
+													}
 												}
 											}
 										}
