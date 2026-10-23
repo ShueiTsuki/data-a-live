@@ -55,6 +55,13 @@
  * (a6xx_generate_bw_table with a6xx_gmu_rpmh_bw_votes_init's BCM votes for a840's SH0/MC0/ACV,
  * CN0 for the CX path; the levels are the phone DT's qcom,bus-table-ddr, as KGSL builds them),
  * then HFI_H2F_MSG_CORE_FW_START and HFI_H2F_MSG_START. ACD and IFPC stay off.
+ * (gpu7 log: all three acked; GX still off, PWR_CLK_STATUS 3.)
+ *
+ * Level 8 (patch 0169): GX on. The OOB GPU_SET handshake of a6xx_gmu_set_oob (non-legacy:
+ * request bit 30, ack bit 31, ack cleared), then a6xx_hfi_set_freq's HFI_H2F_MSG_GX_BW_PERF_VOTE
+ * with the lowest levels (perf index 1 = 160 MHz, bw index 1) where Linux starts at the top,
+ * then a8xx_gmu_gx_is_on (PWR_CLK_STATUS & 3 == 0); only then RBBM_STATUS (A8XX 0x012) is
+ * read from the GPU's own registers. a6xx_gmu_clear_oob (bit 31) at the end.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -1198,6 +1205,50 @@ gpu_level7(void)
 	return ok;
 }
 
+/* ---- level 8: GX on ------------------------------------------------------------------ */
+
+#define HFI_H2F_MSG_GX_BW_PERF_VOTE 30u
+#define GMU_PWR_CLK_STATUS        0x1f7e8u     /* A8XX GMUCX_GFX_PWR_CLK_STATUS */
+#define RBBM_STATUS_A8XX          0x012u
+
+static bool
+gpu_level8(void)
+{
+	bool ok;
+	vm_offset_t gpu = ml_io_map(GPU_PA, 0x1000);
+	if (!gpu) {
+		printf("PANDORA GPU: GPU window not mapped\n");
+		return false;
+	}
+	gpu_step("GMU: OOB GPU_SET, GX vote (160 MHz, lowest bandwidth)");
+	/* a6xx_gmu_set_oob(GMU_OOB_GPU_SET), non-legacy bits */
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
+	uint32_t info = gpu_poll(gpu_gmu, GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << 31, 1u << 31, 10000, &ok);
+	gmu_wr(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+	printf("PANDORA GPU: OOB GPU_SET %s (intr info %08x)\n", ok ? "acked" : "NOT ACKED", info);
+	if (!ok) {
+		return false;
+	}
+	/* a6xx_hfi_set_freq */
+	static uint32_t vote[4];
+	vote[1] = 1;            /* ack_type: blocking */
+	vote[2] = 1;            /* perf index: 160 MHz */
+	vote[3] = 1;            /* bw index: 2136718 KBps */
+	bool voted = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, 4);
+	printf("PANDORA GPU: HFI GX vote %s\n", voted ? "ACKED" : "NOT ACKED");
+	/* a8xx_gmu_gx_is_on */
+	uint32_t st = gpu_poll(gpu_gmu, GMU_REG(GMU_PWR_CLK_STATUS), 3, 0, 100000, &ok);
+	printf("PANDORA GPU: GX %s: pwr_clk_status %08x rpmh_power_state %08x ao_host_irq %08x\n",
+	    ok ? "ON" : "still off", st, gmu_rd(0x1f7e9), gmu_rd(GMU_AO_HOST_INTR_STATUS));
+	if (ok) {
+		gpu_step("GPU: RBBM_STATUS");
+		printf("PANDORA GPU: RBBM_STATUS %08x\n", gpu_rd(gpu, 4 * RBBM_STATUS_A8XX));
+	}
+	/* a6xx_gmu_clear_oob(GMU_OOB_GPU_SET) */
+	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 31);
+	return voted && ok;
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -1206,7 +1257,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -1237,6 +1288,10 @@ gpu_thread(void *arg, wait_result_t result)
 							if (t && level >= 7) {
 								bool s = gpu_level7();
 								printf("PANDORA GPU: level 7 (HFI start) %s\n", s ? "done" : "stopped");
+								if (s && level >= 8) {
+									bool gx = gpu_level8();
+									printf("PANDORA GPU: level 8 (GX on) %s\n", gx ? "done" : "stopped");
+								}
 							}
 						}
 					}
