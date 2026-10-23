@@ -101,6 +101,10 @@
  * NativeAdrenoRing do (context entry with SRAM init on the first, A8XX registers from gen8_reg.h)
  * with IBs in a pool buffer at 0x20000000, the first IB on BR, the second on BOTH; completion by
  * the ring timestamp in msm_rbmemptrs layout at scratch + 0x100.
+ * (gpu13 log: both fences reached, both words written; but the pool, asked for at level 13's
+ * turn while userland ran, got only 128 MiB: 1024/512/256 found no free run.)
+ * Patch 0176: the pool is reserved in pandora_gpu_init, before launchd, as the myron driver
+ * reserves it at start (1 GiB there on the same phone).
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -1866,7 +1870,7 @@ static bool
 gpu_level13(void)
 {
 	bool ok;
-	if (!gpu_pool_reserve()) {
+	if (!gpu_pool_va) {
 		printf("PANDORA GPU: no buffer pool\n");
 		return false;
 	}
@@ -2001,6 +2005,11 @@ pandora_gpu_init(void)
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	if (level <= 0) {
 		return;
+	}
+	/* Before launchd: by level 13's turn userland has run for a minute and the largest free
+	 * run was between 128 and 256 MiB (gpu13 log). */
+	if (level >= 13) {
+		(void)gpu_pool_reserve();
 	}
 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
