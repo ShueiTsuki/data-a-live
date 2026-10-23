@@ -70,6 +70,12 @@ edit('NativeAdrenoMetalPlugin.mm',
     }
     return device;""")
 edit('NativeBridgeMetalFrontend.mm',
+     """static NSError *nbError(NSString *why) {
+ return""",
+     """static NSError *nbError(NSString *why) {
+ NSLog(@"pandora-metal refused: %@", why);   // ios-pandora: every refusal in the log (backboardd: specialize, bb7)
+ return""")
+edit('NativeBridgeMetalFrontend.mm',
      """ if(!base || class_getInstanceSize(base)!=536){""",
      """ // ios-pandora: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
  if(!base || (class_getInstanceSize(base)!=536 && class_getInstanceSize(base)!=528)){""")
