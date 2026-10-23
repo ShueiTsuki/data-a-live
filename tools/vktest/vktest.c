@@ -19,12 +19,16 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <vulkan/vulkan_core.h>
 #include "fill_spv.h"           /* fill.comp as SPIR-V, made by glslangValidator in build_ios.sh */
 #include "tri_vert_spv.h"       /* tri.vert */
 #include "tri_frag_spv.h"       /* tri.frag */
 
 #define DRIVER "/usr/lib/libvulkan_freedreno.dylib"
+#define MTLTEST "/usr/libexec/mtltest"
+extern char **environ;
 
 static int con = -1;
 static unsigned failures;
@@ -504,5 +508,16 @@ main(void)
 	}
 done:
 	say("VKTEST: %s (%u failures)", failures ? "FAIL" : "PASS", failures);
+	/* The Metal test, when installed (one sweetexecswap starts vktest; mtltest follows it). */
+	if (access(MTLTEST, X_OK) == 0) {
+		char *argv[] = { "mtltest", NULL };
+		pid_t pid;
+		int status = 0;
+		int e = posix_spawn(&pid, MTLTEST, NULL, NULL, argv, environ);
+		if (!e) {
+			waitpid(pid, &status, 0);
+		}
+		say("VKTEST: %s -> spawn %d, exit status %#x", MTLTEST, e, status);
+	}
 	return failures != 0;
 }
