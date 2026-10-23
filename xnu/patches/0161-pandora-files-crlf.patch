@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+index 9429ea1..876d589 100644
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -143,6 +143,9 @@ pf_thread(void *arg, wait_result_t result)
+ 		if (next) {
+ 			*next++ = 0;
+ 		}
++		for (size_t len = strlen(line); len && (line[len - 1] == '\r' || line[len - 1] == ' '); len--) {
++			line[len - 1] = 0;
++		}
+ 		char *sp1 = strchr(line, ' '), *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+ 		if (!sp1 || !sp2) {
+ 			continue;
