@@ -42,7 +42,7 @@ if [ "$ZIP" = release ]; then
 	# The rolling turnip-ci pre-release (turnip.yml): public, no sign-in needed.
 	R=https://github.com/ShueiTsuki/ios-pandora/releases/download/turnip-ci
 	for f in libvulkan_freedreno.dylib vktest SHA256SUMS BUILD.txt; do
-		curl -sSfL --retry 3 -o "$T/$f" "$R/$f"
+		curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
 	done
 	cat "$T/BUILD.txt"
 else
