@@ -6,6 +6,7 @@
  * same is left alone. First user: the default iOS 16 wallpaper's layers with PNG images in
  * place of the HEIC ones (tools/mkwallpaper.py), which need the hardware HEVC decoder.
  * Boot-arg pandora_files=0 turns it off.
+ * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -27,7 +28,7 @@ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vnode_t rootvnode;
 void pandora_files_init(void);
 
-#define PF_MAX_FILE   (4u << 20)
+#define PF_MAX_FILE   (64u << 20)
 
 struct pf_ent {
 	char name[48];
@@ -58,9 +59,13 @@ pf_find(const char *name)
 	return NULL;
 }
 
-/* 1 = same content, 0 = differs or missing, <0 error. */
+/* Files are copied a chunk at a time (patch 0182: the Turnip library is far bigger than one
+ * kernel allocation should be): pack bytes in A, file bytes in B. */
+#define PF_CHUNK      (1u << 20)
+
+/* 1 = same content, 0 = differs or missing. */
 static int
-pf_same(const char *path, const uint8_t *data, uint64_t size, vfs_context_t ctx)
+pf_same(const char *path, const struct pf_ent *e, uint8_t *a, uint8_t *b, vfs_context_t ctx)
 {
 	vnode_t vp = NULLVP;
 	if (vnode_open(path, FREAD, 0, 0, &vp, ctx)) {
@@ -69,35 +74,35 @@ pf_same(const char *path, const uint8_t *data, uint64_t size, vfs_context_t ctx)
 	struct vnode_attr va;
 	VATTR_INIT(&va);
 	VATTR_WANTED(&va, va_data_size);
-	int same = 0;
-	if (!vnode_getattr(vp, &va, ctx) && va.va_data_size == size) {
-		uint8_t *buf = kalloc_data(size ? size : 1, Z_WAITOK);
-		int resid = 0;
-		if (buf && !vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
-		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) && resid == 0) {
-			same = memcmp(buf, data, size) == 0;
-		}
-		if (buf) {
-			kfree_data(buf, size ? size : 1);
-		}
+	int same = !vnode_getattr(vp, &va, ctx) && va.va_data_size == e->size;
+	for (uint64_t at = 0; same && at < e->size; at += PF_CHUNK) {
+		int n = (int)MIN((uint64_t)PF_CHUNK, e->size - at), resid = 0;
+		same = !pandora_fw_read(e->off + at, a, (uint64_t)n) &&
+		    !vn_rdwr(UIO_READ, vp, (caddr_t)b, n, (off_t)at, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
+		    vfs_context_proc(ctx)) && resid == 0 && memcmp(a, b, (size_t)n) == 0;
 	}
 	vnode_close(vp, FREAD, ctx);
 	return same;
 }
 
 static int
-pf_write(const char *path, const uint8_t *data, uint64_t size, int mode, vfs_context_t ctx)
+pf_write(const char *path, const struct pf_ent *e, uint8_t *a, int mode, vfs_context_t ctx)
 {
 	vnode_t vp = NULLVP;
 	int error = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, mode, 0, &vp, ctx);
 	if (error) {
 		return error;
 	}
-	int resid = 0;
-	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)size, 0, UIO_SYSSPACE, IO_SYNC,
-	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-	if (!error && resid) {
-		error = EIO;
+	for (uint64_t at = 0; !error && at < e->size; at += PF_CHUNK) {
+		int n = (int)MIN((uint64_t)PF_CHUNK, e->size - at), resid = 0;
+		error = pandora_fw_read(e->off + at, a, (uint64_t)n);
+		if (!error) {
+			error = vn_rdwr(UIO_WRITE, vp, (caddr_t)a, n, (off_t)at, UIO_SYSSPACE, IO_SYNC,
+			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		}
+		if (!error && resid) {
+			error = EIO;
+		}
 	}
 	int cerr = vnode_close(vp, FWRITE, ctx);
 	return error ? error : cerr;
@@ -108,6 +113,7 @@ pf_thread(void *arg, wait_result_t result)
 {
 	(void)arg;
 	(void)result;
+	uint8_t *a = NULL, *b = NULL;
 	/* The root file system: wait for it to be mounted. */
 	for (int i = 0; i < 600 && rootvnode == NULLVP; i++) {
 		pf_sleep(500);
@@ -138,10 +144,19 @@ pf_thread(void *arg, wait_result_t result)
 	text[list->size] = 0;
 	vfs_context_t ctx = vfs_context_kernel();
 	unsigned written = 0, same = 0, failed = 0;
+	a = kalloc_data(PF_CHUNK, Z_WAITOK);
+	b = kalloc_data(PF_CHUNK, Z_WAITOK);
+	if (!a || !b) {
+		printf("PANDORA FILES: no copy buffers\n");
+		goto out;
+	}
 	for (char *line = text, *next; line && *line; line = next) {
 		next = strchr(line, '\n');
 		if (next) {
 			*next++ = 0;
+		}
+		for (size_t len = strlen(line); len && (line[len - 1] == '\r' || line[len - 1] == ' '); len--) {
+			line[len - 1] = 0;
 		}
 		char *sp1 = strchr(line, ' '), *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
 		if (!sp1 || !sp2) {
@@ -159,26 +174,26 @@ pf_thread(void *arg, wait_result_t result)
 			failed++;
 			continue;
 		}
-		uint8_t *data = kalloc_data(e->size ? e->size : 1, Z_WAITOK);
-		int error = data ? pandora_fw_read(e->off, data, e->size) : ENOMEM;
-		if (!error) {
-			int s = pf_same(path, data, e->size, ctx);
-			if (s == 1) {
-				same++;
-			} else if (!(error = pf_write(path, data, e->size, mode ? mode : 0644, ctx))) {
-				written++;
-			}
+		int error = 0;
+		if (pf_same(path, e, a, b, ctx)) {
+			same++;
+		} else if (!(error = pf_write(path, e, a, mode ? mode : 0644, ctx))) {
+			written++;
+			printf("PANDORA FILES: %s -> %s (%llu bytes)\n", name, path, e->size);
 		}
 		if (error) {
 			failed++;
 			printf("PANDORA FILES: %s -> %s: error %d\n", name, path, error);
 		}
-		if (data) {
-			kfree_data(data, e->size ? e->size : 1);
-		}
 	}
 	printf("PANDORA FILES: %u written, %u already the same, %u failed\n", written, same, failed);
 out:
+	if (a) {
+		kfree_data(a, PF_CHUNK);
+	}
+	if (b) {
+		kfree_data(b, PF_CHUNK);
+	}
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }

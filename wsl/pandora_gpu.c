@@ -125,6 +125,8 @@
  * Level 15 (patch 0181): the rest of Linux a8xx hw_init (GMEM range, UCHE trap, UBWC, the A840
  * non-context registers, CP protection, interrupt and fault masks, GMEM_PROTECT), run inside
  * level 14 before the user interface opens, then read back.
+ * (gpu15 log: all read back as written except RB_CMP_NC_MODE_CNTL bits 1-2; tests pass.)
+ * Patch 0182: the chip id given to user space carries the enabled slice count (0x44050a31).
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -2145,6 +2147,14 @@ static const uint64_t gpu_window[GPU_MAX_CLIENTS][2] = {
 };
 static bool gpu_ready;
 static uint32_t gpu_bo_gen;
+static uint32_t gpu_chip_id = 0x44050a01u;
+
+uint32_t pandora_gpu_chip_id(void);
+uint32_t
+pandora_gpu_chip_id(void)
+{
+	return gpu_chip_id;
+}
 
 /* Clear the leaves of [iova, iova + bytes) and TLBIALL; table pages stay. */
 static void
@@ -2699,6 +2709,11 @@ gpu_level14(bool rest)
 	if (rest) {
 		gpu_level15();
 	}
+	/* a8xx_gpu_get_slice_info: the chip id user space sees carries the enabled slice count in
+	 * bits 4..7 (CX_MISC_SLICE_ENABLE_FINAL, max_slices 3 for A840); Mesa's table has 0x44050a31. */
+	uint32_t slices = gpu_rd(gpu_gmu, 0x03d9e000u + 0x87u * 4 - GMU_PA) & 7u;
+	gpu_chip_id = 0x44050a01u | ((uint32_t)__builtin_popcount(slices) << 4);
+	printf("PANDORA GPU: slice mask %x, chip id %08x\n", slices, gpu_chip_id);
 	gpu_ready = true;
 	gpu_step("user interface: kernel self-test through it");
 	int c = pandora_gpu_open();

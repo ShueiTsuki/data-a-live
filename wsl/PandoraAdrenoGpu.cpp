@@ -37,6 +37,7 @@ int pandora_gpu_bo_meta(int client, uint64_t handle, bool set, char *text, uint3
 int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 uint64_t pandora_gpu_timestamp(void);
+uint32_t pandora_gpu_chip_id(void);
 }
 
 #define PANDORA_GPU_OPEN_TYPE   0x4147u
@@ -262,11 +263,12 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 		return pandora_gpu_ret(err);
 	}
 	case NativeAdrenoMethodGetDeviceInfo: {
-		/* Linux a6xx_catalog (A840: chip 0x44050a01, 18 MiB GMEM), a8xx_hw_init (GMEM range at
+		/* Linux a6xx_catalog (A840: chip 0x44050a01, 18 MiB GMEM; the slice count in bits 4..7 as
+		 * a8xx_gpu_get_slice_info adds it, 0x44050a31 in Mesa's table), a8xx_hw_init (GMEM range at
 		 * 64 MiB), a6xx uche_trap_base, ubwc_config kaanapali (UBWC 6.0, highest bank bit 16;
 		 * swizzle levels 2 and 3; 8-channel macrotiling from UBWC 3.1). */
 		NativeAdrenoAbiDeviceInfo d = {};
-		d.chip_id = 0x44050a01;
+		d.chip_id = pandora_gpu_chip_id();
 		d.gmem_bytes = 18u << 20;
 		d.gmem_base = 64ull << 20;
 		d.uche_trap_base = 0x1fffffffff000ull;
