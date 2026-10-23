@@ -127,6 +127,7 @@
  * level 14 before the user interface opens, then read back.
  * (gpu15 log: all read back as written except RB_CMP_NC_MODE_CNTL bits 1-2; tests pass.)
  * Patch 0182: the chip id given to user space carries the enabled slice count (0x44050a31).
+ * Patch 0183: gpu_step no longer waits 3.5 s for the log flush unless pandora_gpu_slow=1.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -227,12 +228,21 @@ gpu_rd(vm_offset_t b, uint32_t o)
 	return v;
 }
 
-/* Log what comes next and let the log thread write it before the read happens. */
+/* Log what comes next; with boot-arg pandora_gpu_slow=1 also let the log thread write it before
+ * the step runs (the bring-up default until patch 0183: 27 steps x 3.5 s held the user
+ * interface back by over a minute once the bring-up stopped hanging). */
 static void
 gpu_step(const char *what)
 {
+	static int slow = -1;
+	if (slow < 0) {
+		slow = 0;
+		(void)PE_parse_boot_argn("pandora_gpu_slow", &slow, sizeof(slow));
+	}
 	printf("PANDORA GPU: next: %s\n", what);
-	gpu_sleep(3500);
+	if (slow) {
+		gpu_sleep(3500);
+	}
 }
 
 /* ---- cmd-db (same layout as pandora_adsp.c) ------------------------------------------- */
