@@ -120,6 +120,11 @@
  * Patch 0179: the kernel maps carved-pool windows write-combined only while it touches them.
  * (pgpu3 log: unmapping an ml_io_map_wcomb window panicked, those entries are permanent.)
  * Patch 0180: the windows come from ml_io_map_unmappable, which ml_io_unmap can take back.
+ * (pgpu4 log: carved 1 GiB pool, self-test and 8 pgputest runs pass, no IOKit warnings.)
+ *
+ * Level 15 (patch 0181): the rest of Linux a8xx hw_init (GMEM range, UCHE trap, UBWC, the A840
+ * non-context registers, CP protection, interrupt and fault masks, GMEM_PROTECT), run inside
+ * level 14 before the user interface opens, then read back.
  *
  * Addresses: mainline gcc-kaanapali.c / gpucc-kaanapali.c and the phone's device tree
  * (SM8850, "canoe"); GMU registers as in Linux a6xx/a8xx (GPU base + dword offset * 4).
@@ -2468,10 +2473,220 @@ pandora_gpu_timestamp(void)
 	return ((uint64_t)hi2 << 32) | lo;
 }
 
+/* ---- level 15: the rest of a8xx hw_init, the state rendering needs ---------------------------- */
+
+/*
+ * Linux a8xx_gpu.c hw_init after what levels 10-11 already do, in its order: GPU busy counter
+ * mask, GMEM range (64 MiB), UCHE trap and write-through bases, perf counters, UBWC
+ * (a8xx_set_ubwc_config for kaanapali: UBWC 6.0, highest bank bit 16, swizzle levels 2+3),
+ * bicubic weights, UCHE_CLIENT_PF, the A840 non-context list (a6xx_catalog.c a840_nonctxt_regs),
+ * interface hang detection, CP register protection (a840_protect_regs), GMEM save/restore,
+ * per-pipe CP interrupt and fault masks, the global masks, GMEM_PROTECT (after the zap, as
+ * Linux), and hardware clock gating left off (GBIF_CX_CONFIG bit 0 cleared, Linux's
+ * a8xx_set_hwcg(false)). Not done: the GMU power counters and the IFPC power-up list (no IFPC).
+ * Offsets from a6xx.xml (domain A6XX, A8XX variants), each checked against gen8_reg.h.
+ */
+#define CP_APERTURE_PIPE(p)   ((uint32_t)(p) << 12)    /* PIPEID 12..15, slice 0 */
+#define PIPE_NONE 0u
+#define PIPE_BR   1u
+#define PIPE_BV   2u
+
+struct gpu_pipe_reg {
+	uint32_t off, val, pipes;       /* pipes: BIT(PIPE_NONE) | BIT(PIPE_BR) | BIT(PIPE_BV) */
+};
+
+static const struct gpu_pipe_reg a840_nonctxt[] = {
+	{ 0x00814, 0x00000101, 0x1 },   /* CP_SMMU_STREAM_ID_LPAC */
+	{ 0x08702, 0x00000800, 0x6 },   /* GRAS_DBG_ECO_CNTL */
+	{ 0x08600, 0x00200000, 0x6 },   /* GRAS_TSEFE_DBG_ECO_CNTL */
+	{ 0x09e0a, 0x00000001, 0x6 },   /* PC_AUTO_VERTEX_STRIDE */
+	{ 0x09e0d, 0x10010000, 0x6 },   /* PC_VIS_STREAM_CNTL */
+	{ 0x09e64, 0x00000002, 0x6 },   /* PC_CONTEXT_SWITCH_STABILIZE_CNTL_1 */
+	{ 0x09e50, 0x00000003, 0x6 },   /* PC_CHICKEN_BITS_1 */
+	{ 0x09f20, 0x00000200, 0x6 },   /* PC_CHICKEN_BITS_2 */
+	{ 0x09e22, 0x00500000, 0x6 },   /* PC_CHICKEN_BITS_3 */
+	{ 0x09e23, 0x00500050, 0x6 },   /* PC_CHICKEN_BITS_4 */
+	{ 0x08e01, 0x00000020, 0x6 },   /* RB_RBP_CNTL: dead draw merge off */
+	{ 0x08e07, 0x00000068, 0x2 },   /* RB_CCU_CNTL */
+	{ 0x08e06, 0x00002200, 0x2 },   /* RB_CCU_DBG_ECO_CNTL */
+	{ 0x08e09, 0x12000000, 0x2 },   /* RB_GC_GMEM_PROTECT */
+	{ 0x08f01, 0x00000007, 0x2 },   /* RB_RESOLVE_PREFETCH_CNTL */
+	{ 0x08f02, 0x00004000, 0x2 },   /* RB_CMP_DBG_ECO_CNTL */
+	{ 0x00440, 0x00000001, 0x1 },   /* RBBM_NC_MODE_CNTL */
+	{ 0x005ec, 0x00000001, 0x1 },   /* RBBM_SLICE_NC_MODE_CNTL */
+	{ 0x0007d, 0x70809060, 0x1 },   /* RBBM_POWER_UP_RESET_SW_OVERRIDE */
+	{ 0x0007e, 0x30000000, 0x1 },   /* RBBM_POWER_UP_RESET_SW_BV_OVERRIDE */
+	{ 0x00010, 0x00000030, 0x1 },   /* RBBM_WAIT_IDLE_CLOCKS_CNTL */
+	{ 0x00011, 0x00000030, 0x1 },   /* RBBM_WAIT_IDLE_CLOCKS_CNTL2 */
+	{ 0x0002f, 0x0fffffff, 0x1 },   /* RBBM_INTERFACE_HANG_INT_CNTL */
+	{ 0x00008, 0x22122212, 0x1 },   /* RBBM_GBIF_CLIENT_QOS_CNTL */
+	{ 0x0009d, 0x00000040, 0x1 },   /* RBBM_CGC_P2S_CNTL */
+	{ 0x0ae03, 0x05000000, 0x1 },   /* SP_CHICKEN_BITS */
+	{ 0x0ae05, 0x00000008, 0x1 },   /* SP_SS_CHICKEN_BITS_0 */
+	{ 0x0ae09, 0x00c21800, 0x1 },   /* SP_CHICKEN_BITS_2 */
+	{ 0x0ae0a, 0x00300000, 0x1 },   /* SP_CHICKEN_BITS_3 */
+	{ 0x0ae0b, 0x00000002, 0x1 },   /* SP_CHICKEN_BITS_4 */
+	{ 0x0ae0f, 0x0000003f, 0x1 },   /* SP_PERFCTR_SHADER_MASK */
+	{ 0x0ae6c, 0x00004000, 0x1 },   /* SP_HLSQ_DBG_ECO_CNTL */
+	{ 0x0ae73, 0x00020000, 0x1 },   /* SP_HLSQ_DBG_ECO_CNTL_1 */
+	{ 0x0ae74, 0x01000000, 0x1 },   /* SP_HLSQ_DBG_ECO_CNTL_2 */
+	{ 0x0ae76, 0x00000080, 0x1 },   /* SP_HLSQ_DBG_ECO_CNTL_3 */
+	{ 0x0ae6b, 0x00000080, 0x1 },   /* SP_HLSQ_TIMEOUT_THRESHOLD_DP */
+	{ 0x0ae6d, 0x0001ff00, 0x1 },   /* SP_READ_SEL */
+	{ 0x0b600, 0x10100000, 0x1 },   /* TPL1_DBG_ECO_CNTL */
+	{ 0x0b602, 0x04000720, 0x1 },   /* TPL1_DBG_ECO_CNTL1 */
+	{ 0x00e01, 0x80080000, 0x1 },   /* UCHE_MODE_CNTL */
+	{ 0x00f01, 0x00001000, 0x1 },   /* UCHE_CCHE_MODE_CNTL */
+	{ 0x00f02, 0x00000800, 0x1 },   /* UCHE_CCHE_CACHE_WAYS */
+	{ 0x00e12, 0x010240e0, 0x1 },   /* UCHE_GBIF_GX_CONFIG */
+	{ 0x00e10, 0x00000020, 0x1 },   /* UCHE_VARB_IDLE_TIMEOUT */
+	{ 0x0a600, 0x00008000, 0x6 },   /* VFD_DBG_ECO_CNTL */
+	{ 0x0a639, 0x00500050, 0x6 },   /* VFD_CB_BV_THRESHOLD */
+	{ 0x0a63a, 0x00600060, 0x6 },   /* VFD_CB_BR_THRESHOLD */
+	{ 0x0a63b, 0x00200020, 0x6 },   /* VFD_CB_BUSY_REQ_CNT */
+	{ 0x0a63c, 0x00000020, 0x6 },   /* VFD_CB_LP_REQ_CNT */
+	{ 0x09741, 0x00000001, 0x6 },   /* VPC_FLATSHADE_MODE_CNTL */
+};
+
+/* A6XX_PROTECT_RDONLY / _NORDWR (a6xx_gpu.h): length - 1 in bits 18..31, register in 0..17. */
+#define PROT_RO(r, l)  ((((uint32_t)(l) & 0x3fff) << 18) | ((uint32_t)(r) & 0x3ffff))
+#define PROT_NA(r, l)  ((1u << 31) | PROT_RO(r, l))
+static const uint32_t a840_protect[] = {
+	PROT_RO(0x00008, 0x039b), PROT_RO(0x003b4, 0x008b), PROT_NA(0x00440, 0x001f),
+	PROT_RO(0x00580, 0x005f), PROT_NA(0x005e0, 0x011f), PROT_RO(0x0074a, 0x0005),
+	PROT_RO(0x00759, 0x001b), PROT_NA(0x00775, 0x000a), PROT_RO(0x00789, 0x0000),
+	PROT_RO(0x0078c, 0x0013), PROT_NA(0x00800, 0x0029), PROT_NA(0x00837, 0x00af),
+	PROT_RO(0x008e7, 0x00c9), PROT_NA(0x008ec, 0x00c3), PROT_NA(0x009b1, 0x0250),
+	PROT_NA(0x00c07, 0x0008), PROT_RO(0x00ce0, 0x0001), PROT_RO(0x00df0, 0x0000),
+	PROT_NA(0x00df1, 0x0000), PROT_NA(0x00e01, 0x0000), PROT_NA(0x00e03, 0x1fff),
+	PROT_NA(0x03c00, 0x00c5), PROT_RO(0x03cc6, 0x0039), PROT_NA(0x03d00, 0x1fff),
+	PROT_NA(0x08600, 0x01ff), PROT_NA(0x08e00, 0x00ff), PROT_RO(0x08f00, 0x0000),
+	PROT_NA(0x08f01, 0x01be), PROT_NA(0x09600, 0x01ff), PROT_RO(0x0981a, 0x02e5),
+	PROT_NA(0x09e00, 0x01ff), PROT_NA(0x0a600, 0x01ff), PROT_NA(0x0a82e, 0x0000),
+	PROT_NA(0x0ae00, 0x0000), PROT_NA(0x0ae02, 0x0004), PROT_NA(0x0ae08, 0x0006),
+	PROT_NA(0x0ae10, 0x00bf), PROT_RO(0x0aed0, 0x002f), PROT_NA(0x0af00, 0x027f),
+	PROT_NA(0x0b600, 0x1fff), PROT_NA(0x0dc00, 0x1fff), PROT_RO(0x0fc00, 0x1fff),
+	PROT_NA(0x18400, 0x003f), PROT_RO(0x18440, 0x013f), PROT_NA(0x18580, 0x1fff),
+	PROT_NA(0x1b400, 0x1fff), PROT_NA(0x1f400, 0x0477), PROT_RO(0x1f878, 0x0507),
+	PROT_NA(0x1f930, 0x0329), PROT_NA(0x1fd80, 0x1fff), PROT_NA(0x27800, 0x007f),
+	PROT_RO(0x27880, 0x0385), PROT_NA(0x27882, 0x0009), PROT_NA(0x27c06, 0x0000),
+};
+
+static const uint32_t a8xx_bicubic[20] = {
+	0x00000000, 0x3fe05ff4, 0x3fa0ebee, 0x3f5193ed, 0x3f0243f0, 0x00000000, 0x3fd093e8, 0x3f4133dc,
+	0x3ea1dfdb, 0x3e0283e0, 0x0000ac2b, 0x0000f01d, 0x00114412, 0x0021980a, 0x0051ec05, 0x0000380e,
+	0x3ff09001, 0x3fc10bfa, 0x3f9193f7, 0x3f7227f7,
+};
+
+static void
+gw64(uint32_t dw, uint64_t v)
+{
+	gw(dw, (uint32_t)v);
+	gw(dw + 1, (uint32_t)(v >> 32));
+}
+
+static void
+gw_pipe(uint32_t pipe, uint32_t dw, uint32_t v)
+{
+	gw(CP_APERTURE_CNTL_HOST, CP_APERTURE_PIPE(pipe));
+	gw(dw, v);
+}
+
+static uint32_t
+gr_pipe(uint32_t pipe, uint32_t dw)
+{
+	gw(CP_APERTURE_CNTL_HOST, CP_APERTURE_PIPE(pipe));
+	return gr(dw);
+}
+
+/* Under OOB GPU_SET, CP idle, out of secure mode (levels 10-11). */
+static void
+gpu_level15(void)
+{
+	const uint64_t gmem_min = 64ull << 20, trap = 0x1fffffffff000ull;
+	gpu_step("hw_init rest: GMEM range, UCHE trap, UBWC, non-context list, protection, masks");
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	gw(0x19e, 0xffffffff);                  /* RBBM_PERFCTR_GPU_BUSY_MASKED */
+	gw64(0xf08, gmem_min);                  /* UCHE_CCHE_GC_GMEM_RANGE_MIN */
+	gw64(0xae10, gmem_min);                 /* SP_HLSQ_GC_GMEM_RANGE_MIN */
+	gw64(0xe08, trap);                      /* UCHE_TRAP_BASE */
+	gw64(0xe06, trap);                      /* UCHE_WRITE_THRU_BASE */
+	gw64(0xf06, trap);                      /* UCHE_CCHE_TRAP_BASE */
+	gw64(0xf04, trap);                      /* UCHE_CCHE_WRITE_THRU_BASE */
+	gw(0x460, 1);                           /* RBBM_PERFCTR_CNTL */
+	gw(0x500, 1);                           /* RBBM_SLICE_PERFCTR_CNTL */
+	gw(0x8d0, 1);                           /* CP_PERFCTR_CP_SEL(0): CP0 counts cycles */
+
+	/* UBWC 6.0, hbb 16 - 13 = 3 (hi 0, lo 3), swizzle levels 2 and 3 on, version tag 5,
+	 * yuvnotcomptofc, rgb565 predicator, amsbc; uavflagprd_inv 2; ubwc_mode 0. */
+	gw_pipe(PIPE_BV, 0x8700, 0x60);         /* GRAS_NC_MODE_CNTL */
+	gw_pipe(PIPE_BR, 0x8700, 0x60);
+	gw_pipe(PIPE_BR, 0x8e08, 0x46);         /* RB_CCU_NC_MODE_CNTL */
+	gw_pipe(PIPE_BR, 0x8f00, 0x28046);      /* RB_CMP_NC_MODE_CNTL */
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	gw(0xae02, 0x26);                       /* SP_NC_MODE_CNTL */
+	gw(0xb604, 0x06);                       /* TPL1_NC_MODE_CNTL */
+
+	for (unsigned i = 0; i < 20; i++) {
+		gw(0xb606 + i, a8xx_bicubic[i]);   /* TPL1_BICUBIC_WEIGHTS_TABLE(i) */
+	}
+	gw(0xe11, (1u << 7) | 1);               /* UCHE_CLIENT_PF */
+
+	for (uint32_t pipe = PIPE_NONE; pipe <= PIPE_BV; pipe++) {
+		gw(CP_APERTURE_CNTL_HOST, CP_APERTURE_PIPE(pipe));
+		for (unsigned i = 0; i < sizeof(a840_nonctxt) / sizeof(a840_nonctxt[0]); i++) {
+			if (a840_nonctxt[i].pipes & (1u << pipe)) {
+				gw(a840_nonctxt[i].off, a840_nonctxt[i].val);
+			}
+		}
+	}
+	gw(CP_APERTURE_CNTL_HOST, 0);
+
+	gw(0x2f, (1u << 30) | 0xcfffff);        /* RBBM_INTERFACE_HANG_INT_CNTL */
+	gw(0x58f, 1u << 30);                    /* RBBM_SLICE_INTERFACE_HANG_INT_CNTL */
+
+	/* a8xx_set_cp_protect: protection on, fault on violation, last span to the end. */
+	const uint32_t cntl = 0xffff000b, n = sizeof(a840_protect) / sizeof(a840_protect[0]);
+	gw_pipe(PIPE_BR, 0x84e, cntl);          /* CP_PROTECT_CNTL_PIPE */
+	gw_pipe(PIPE_BV, 0x84e, cntl);
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	for (unsigned i = 0; i < n; i++) {
+		gw(0x850 + i, a840_protect[i]);     /* CP_PROTECT_GLOBAL(i) */
+	}
+	gw_pipe(PIPE_BR, 0x8af, a840_protect[n - 1]);  /* CP_PROTECT_PIPE(15) */
+	gw_pipe(PIPE_BV, 0x8af, a840_protect[n - 1]);
+
+	gw_pipe(PIPE_BR, 0x8e50, 1);            /* RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE_ENABLE */
+	static const uint32_t pipes[] = { 1, 2, 4, 5, 6, 7 };
+	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+		gw_pipe(pipes[i], 0x8b8, 0x7e83f7f);   /* CP_INTERRUPT_STATUS_MASK_PIPE */
+		gw_pipe(pipes[i], 0x8b4, 0x77f);       /* CP_HW_FAULT_STATUS_MASK_PIPE */
+	}
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	gw(0x8b6, 0x7f007f);                    /* CP_INTERRUPT_STATUS_MASK_GLOBAL */
+	gw(0x62, 0x33d283c2);                   /* RBBM_INT_0_MASK (A8XX_INT_MASK) */
+
+	gw_pipe(PIPE_BR, 0x8e09, 0x12000000);   /* RB_GC_GMEM_PROTECT, after the zap */
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	gw(0x3c00, gr(0x3c00) & ~1u);           /* GBIF_CX_CONFIG: clock gating stays off */
+
+	/* Read back, one aperture at a time (argument order is unspecified in C). */
+	uint32_t br_gras = gr_pipe(PIPE_BR, 0x8700), br_ccu = gr(0x8e08), br_cmp = gr(0x8f00);
+	uint32_t br_prot = gr(0x84e), br_gmemp = gr(0x8e09);
+	uint32_t bv_prot = gr_pipe(PIPE_BV, 0x84e);
+	gw(CP_APERTURE_CNTL_HOST, 0);
+	printf("PANDORA GPU: hw_init rest: gmem min %08x%08x trap %08x%08x ubwc gras %x ccu %x cmp %x sp %x tpl1 %x\n",
+	    gr(0xf09), gr(0xf08), gr(0xe09), gr(0xe08), br_gras, br_ccu, br_cmp, gr(0xae02), gr(0xb604));
+	printf("PANDORA GPU: hw_init rest: protect cntl br %08x bv %08x global[0] %08x [%u] %08x gmem_protect %08x "
+	    "int masks %08x %08x uche_mode %08x gbif_cx %08x\n", br_prot, bv_prot, gr(0x850), n - 1, gr(0x850 + n - 1),
+	    br_gmemp, gr(0x62), gr(0x8b6), gr(0xe01), gr(0x3c00));
+}
+
 /* Level 14: hold OOB GPU_SET, open the user interface, and use it once from the kernel the way
- * the user client will: a buffer, mapped at the window start, an IB in it, submit, wait, free. */
+ * the user client will: a buffer, mapped at the window start, an IB in it, submit, wait, free.
+ * With level 15 asked for, the rest of hw_init comes first, before any client can open. */
 static bool
-gpu_level14(void)
+gpu_level14(bool rest)
 {
 	bool ok;
 	gmu_wr(GMU_HOST2GMU_INTR_SET, 1u << 30);
@@ -2480,6 +2695,9 @@ gpu_level14(void)
 	if (!ok) {
 		printf("PANDORA GPU: OOB GPU_SET NOT ACKED\n");
 		return false;
+	}
+	if (rest) {
+		gpu_level15();
 	}
 	gpu_ready = true;
 	gpu_step("user interface: kernel self-test through it");
@@ -2528,7 +2746,7 @@ gpu_thread(void *arg, wait_result_t result)
 	(void)result;
 	(void)PE_parse_boot_argn("pandora_gpu", &level, sizeof(level));
 	printf("PANDORA GPU: level %d (1 = read only, 2 = CX power and SMMU clock, "
-	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer, 13 = pool and framed submit, 14 = user interface)\n", level);
+	    "3 = GPLL0 vote and GPU_INIT_REGS, 4 = GMU SMMU context, 5 = GMU cold start, 6 = HFI perf table, 7 = HFI start, 8 = GX on, 9 = GPU SMMU context, 10 = CP, 11 = zap, 12 = indirect buffer, 13 = pool and framed submit, 14 = user interface, 15 = rest of hw_init before it)\n", level);
 	gpu_cmddb();
 	if (gpu_read_cc(true)) {
 		gpu_read_smmu();
@@ -2582,7 +2800,7 @@ gpu_thread(void *arg, wait_result_t result)
 														printf("PANDORA GPU: level 13 (pool, framed submit) %s\n",
 														    s ? "done" : "stopped");
 														if (s && level >= 14) {
-															bool u = gpu_level14();
+															bool u = gpu_level14(level >= 15);
 															printf("PANDORA GPU: level 14 (user interface) %s\n",
 															    u ? "done" : "stopped");
 														}
