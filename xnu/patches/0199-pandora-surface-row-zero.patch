@@ -1,0 +1,93 @@
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index c554b41..4499e56 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -403,10 +403,20 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	}
+ 	if (ret == kIOReturnTimeout && m == NativeAdrenoMethodWaitFence) {
+ 		/* Turnip polls fences with short timeouts: counted, a line per 1000 (0193; bb19 filled the
+-		 * log ring with them while the GPU was stuck). */
+-		static uint32_t timeouts;
+-		if ((++timeouts % 1000) == 1) {
+-			IOLog("PANDORA GPU UC: client %d fence waits timed out %u times\n", client_, timeouts);
++		 * log ring with them while the GPU was stuck). 0199: a wait given more than 2 ms that still
++		 * timed out is another matter (work that did not finish), counted apart and logged more. */
++		NativeAdrenoAbiWaitFence w = { 0, 0 };
++		if (in_len >= sizeof(w)) {
++			memcpy(&w, in, sizeof(w));
++		}
++		static uint32_t polls, waits;
++		if (w.timeout_ns <= 2000000ull) {
++			if ((++polls % 1000) == 1) {
++				IOLog("PANDORA GPU UC: client %d short fence polls timed out %u times\n", client_, polls);
++			}
++		} else if (++waits <= 20 || (waits % 100) == 0) {
++			IOLog("PANDORA GPU UC: client %d fence %llu not reached within %llu ms (%u long waits so far)\n",
++			    client_, w.fence, w.timeout_ns / 1000000ull, waits);
+ 		}
+ 	} else if (ret != kIOReturnSuccess) {
+ 		IOLog("PANDORA GPU UC: client %d method %u in %u out %u -> 0x%x\n", client_, m, in_len, out_len, ret);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a477678..621bf69 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -434,6 +434,14 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ 	return n != NULL ? n->unsigned32BitValue() : def;
+ }
+ 
++/* 0199: a size where 0 means "the kernel picks" (Apple's IOSurface reads it so). */
++static uint32_t
++sweet_dict_u32_nz(OSDictionary *dict, const char *key, uint32_t def)
++{
++	uint32_t v = sweet_dict_u32(dict, key, 0);
++	return v != 0 ? v : def;
++}
++
+ static uint32_t
+ sweet_div_up(uint32_t a, uint32_t b)
+ {
+@@ -465,7 +473,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
++	s->bytesPerRow = sweet_dict_u32_nz(props, "IOSurfaceBytesPerRow",
+ 	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+@@ -494,10 +502,10 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
+-			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
++			p->bytesPerRow = sweet_dict_u32_nz(pd, "IOSurfacePlaneBytesPerRow",
+ 			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+-			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
++			p->size = sweet_dict_u32_nz(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+@@ -505,6 +513,22 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 		}
+ 		s->planeCount = planes->getCount();
++		/* 0199: what QuartzCore asks of its 'b3a8' surfaces and what they get, the first few */
++		static uint32_t b3a8_told;
++		if (s->pixelFormat == 0x62336138 && b3a8_told < 8) {
++			b3a8_told++;
++			for (unsigned int i = 0; i < planes->getCount(); i++) {
++				OSDictionary *pd = OSDynamicCast(OSDictionary, planes->getObject(i));
++				IOLog("SWEET SURF: b3a8 %ux%u plane %u asked row %d size %d offset %d bpe %d -> row %u size %u "
++				    "offset %u (alloc asked %d)\n", s->width, s->height, i,
++				    (int)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow", (uint32_t)-1),
++				    (int)sweet_dict_u32(pd, "IOSurfacePlaneSize", (uint32_t)-1),
++				    (int)sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)-1),
++				    (int)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", (uint32_t)-1),
++				    s->planes[i].bytesPerRow, s->planes[i].size, s->planes[i].offset,
++				    (int)sweet_dict_u32(props, "IOSurfaceAllocSize", (uint32_t)-1));
++			}
++		}
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
