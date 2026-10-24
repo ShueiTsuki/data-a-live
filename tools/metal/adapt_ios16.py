@@ -262,3 +262,58 @@ edit('NativeBridgeMetalFrontend.mm',
  if(capturing())capture(@"commit");
  self.committed=YES;
 """)
+
+# ---- ios-pandora: bytes-no-copy textures follow their bytes (bb27) ------------------------------------------
+# The capture: QuartzCore samples the App Library's two full-screen ASTC images (made by
+# newTextureWithBytesNoCopy) in the frame's second pass, with no blur pass at all: the material is baked into
+# them. They were filled once when made; QuartzCore writes their bytes afterwards (a texture over the bytes
+# would see that), so one stayed zero (the black) and one kept an older picture (the sharp home screen).
+# Now the texture keeps its source: before each commit that uses it, the bytes are compared with what was last
+# uploaded and uploaded again when they differ.
+edit('NativeBridgeMetalFrontend.mm',
+     """// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
+""",
+     """// ios-pandora: a bytes-no-copy texture's source (tools/metal/adapt_ios16.py): the caller's bytes, their rows, what
+// was last uploaded, and the deallocator's owner.
+@interface PandoraNoCopySource : NSObject
+@property(nonatomic) const void *bytes;
+@property(nonatomic) NSUInteger rowBytes,rows,width,height;
+@property(nonatomic,strong) NSMutableData *seen;
+@property(nonatomic,strong) NSData *owner;
+@end
+@implementation PandoraNoCopySource
+@end
+static char gNoCopyKey;
+static std::atomic<uint64_t> gNoCopyRefreshes{0};
+static void refreshNoCopy(id object) {
+ PandoraNoCopySource *s=objc_getAssociatedObject(object,&gNoCopyKey);
+ if(!s)return;
+ const size_t size=s.rowBytes*s.rows;
+ if(!memcmp(s.seen.bytes,s.bytes,size))return;
+ memcpy(s.seen.mutableBytes,s.bytes,size);
+ [(id<MTLTexture>)object replaceRegion:MTLRegionMake2D(0,0,s.width,s.height) mipmapLevel:0 withBytes:s.bytes bytesPerRow:s.rowBytes];
+ if(++gNoCopyRefreshes<=5)NSLog(@"pandora-metal nocopy: uploaded again (%lux%lu)",(unsigned long)s.width,(unsigned long)s.height);
+}
+// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
+   if(deallocator) {
+    static char ownerKey;
+    NSData *owner=[[NSData alloc] initWithBytesNoCopy:bytes length:length deallocator:^(void *b,NSUInteger l){deallocator(b,l);}];
+    objc_setAssociatedObject(texture,&ownerKey,owner,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   }""",
+     """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
+   PandoraNoCopySource *source=[PandoraNoCopySource new];
+   source.bytes=bytes;source.rowBytes=rowBytes;source.rows=rows;source.width=d.width;source.height=d.height;
+   source.seen=[NSMutableData dataWithBytes:bytes length:rowBytes*rows];
+   if(deallocator)source.owner=[[NSData alloc] initWithBytesNoCopy:bytes length:length deallocator:^(void *b,NSUInteger l){deallocator(b,l);}];
+   objc_setAssociatedObject(texture,&gNoCopyKey,source,OBJC_ASSOCIATION_RETAIN_NONATOMIC);""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(capturing())capture(@"commit");
+ self.committed=YES;
+""",
+     """ if(capturing())capture(@"commit");
+ for(id owner in _resourceOwners)refreshNoCopy(owner);   // ios-pandora: bytes-no-copy textures follow their bytes
+ self.committed=YES;
+""")
