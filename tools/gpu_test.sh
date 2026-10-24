@@ -71,8 +71,9 @@ if [ "$ZIP" = release ]; then
 	cat "$T/BUILD.txt"
 	# The Metal plugin and mtltest, when the build published them (and --no-metal is not given).
 	if [ $METAL = 1 ] && curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/SHA256SUMS.metal")" "$R/SHA256SUMS.metal"; then
-		fetch NativeAdrenoMetal
-		for f in NativeAdrenoMetal.Info.plist mtltest; do
+		# With --metal-from the plugin comes from the local build: only mtltest is fetched.
+		[ -z "${METAL_FROM:-}" ] && fetch NativeAdrenoMetal
+		for f in $([ -z "${METAL_FROM:-}" ] && echo NativeAdrenoMetal.Info.plist) mtltest; do
 			curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/$f")" "$R/$f"
 		done
 		# SHA256SUMS.metal names the bundle paths; the release carries the same bytes under flat names.
@@ -82,7 +83,7 @@ if [ "$ZIP" = release ]; then
 else
 	python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
 fi
-(cd "$T" && sha256sum -c SHA256SUMS)
+(cd "$T" && sha256sum -c ${METAL_FROM:+--ignore-missing} SHA256SUMS)
 if [ -n "${METAL_FROM:-}" ]; then
 	# The local build's plugin over the artifact's (mtltest stays the artifact's), checked against its own sums.
 	wsl -d Ubuntu-24.04 -u root -- bash -c "cd $METAL_FROM && sha256sum -c SHA256SUMS >&2 &&
