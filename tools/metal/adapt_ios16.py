@@ -429,14 +429,25 @@ edit('NativeBridgeMetalFrontend.mm',
      """ @synchronized(gInFlight){[gInFlight removeObject:self];}
  if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {   // ios-pandora: the App Library readback
   static std::atomic<int> readbacks{0};
+  id<MTLCommandQueue> queue=(id<MTLCommandQueue>)self.queue;
   for(id<MTLTexture> target in [targets copy]) {
-   if(readbacks.fetch_add(1)>=8)break;
+   if(readbacks.fetch_add(1)>=12)break;
    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
     const NSUInteger w=target.width,h=target.height,format=target.pixelFormat;
     if(format!=MTLPixelFormatBGRA8Unorm && format!=MTLPixelFormatBGRA8Unorm_sRGB && format!=MTLPixelFormatRGBA8Unorm) {
      NSLog(@"pandora-metal astc readback: target %lux%lu format %lu, not read",(unsigned long)w,(unsigned long)h,(unsigned long)format);return;
     }
     std::vector<uint8_t> pixels(w*h*4,0xa5);
+    if(target.storageMode==MTLStorageModePrivate) {
+     // Private: the GPU copies it into a shared buffer first (bb33: getBytes refuses private textures).
+     id<MTLBuffer> staging=[target.device newBufferWithLength:w*h*4 options:MTLResourceStorageModeShared];
+     id<MTLCommandBuffer> copy=[queue commandBuffer];
+     id<MTLBlitCommandEncoder> blit=[copy blitCommandEncoder];
+     [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1)
+                  toBuffer:staging destinationOffset:0 destinationBytesPerRow:w*4 destinationBytesPerImage:w*h*4];
+     [blit endEncoding];[copy commit];[copy waitUntilCompleted];
+     if(staging.contents)memcpy(pixels.data(),staging.contents,w*h*4);
+    } else
     [target getBytes:pixels.data() bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
     const bool bgra=format!=MTLPixelFormatRGBA8Unorm;
     NSLog(@"pandora-metal astc readback: target %lux%lu format %lu storage %lu%s",(unsigned long)w,(unsigned long)h,(unsigned long)format,
