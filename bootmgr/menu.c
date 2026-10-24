@@ -1,14 +1,19 @@
 /*
  * pandora boot menu: lives in boot_b in place of the stock Android kernel, so the phone can
- * start iOS or Android at power-on without a PC.
+ * start iOS or Android at power-on without a PC. Written once; iOS is changed by replacing
+ * only the iOS slot (update_ios.sh).
  *
- * ABL loads this exactly as it loads the stock kernel: vendor_boot, init_boot (Magisk), dtbo
- * and the bootconfig still come from flash, and x0 is ABL's FDT. On a normal power-on one
- * line is drawn near the bottom of the boot logo for a few seconds: volume up starts the
- * PANDORA xnu (as shim/loader does); otherwise the logo is put back and the stock Android
- * kernel embedded behind this code is entered with the same FDT, as the stock boot_b would.
- * Charger, silent and every other boot mode go to Android at once, without the line.
- * Writes nothing to storage.
+ * ABL loads all of boot_b's kernel field as it loads the stock kernel: vendor_boot,
+ * init_boot (Magisk), dtbo and the bootconfig still come from flash, and x0 is ABL's FDT.
+ * The field holds this code, the settings page, the stock Android kernel (2 MiB in) and the
+ * iOS slot: a header page and an arm64 Image, the kernel of what `fastboot boot` starts
+ * (shim/loader with its XNU payload). This code does not look inside that Image.
+ *
+ * On a normal power-on one line is drawn near the bottom of the boot logo for a few seconds.
+ * Volume up: the slot is checked (marker, armed, size, checksum) and its Image is entered
+ * exactly as ABL would enter it (x0 = FDT, MMU off). Otherwise the logo is put back and the
+ * stock Android kernel is entered with the same FDT, as the stock boot_b would. Charger,
+ * silent and every other boot mode go to Android at once. Writes nothing to storage.
  *
  * MMU is off: every access is Device memory (-mstrict-align, byte or aligned reads).
  * Linked at 0 and loaded anywhere: no absolute pointers in data.
@@ -24,31 +29,42 @@ uint32_t safe_rd32(uint64_t pa, uint32_t *faulted);
 #define FB_W        1220u
 #define FB_H        2656u
 #define FB_STRIDE   (1220u * 4)
-/* Kernel RAM must stay inside the clean 0x8c0000000 + 13 GiB range (DT_FINDINGS.md). */
-#define RAM_LO      0x8c0000000ull
-#define RAM_HI      0xc00000000ull
-#define BOOT_LINE_LENGTH 608
-#define PAGE_16K    0x4000ull
 #define SZ_2M       0x200000ull
+#define SLOT_HDR    0x1000ull
 /* Volume up: TLMM GPIO 101, active low (xnu patches 0128/0130; 0x0f100000 + 0x1000 * n,
  * the DT's 0x0f065000 hangs the bus). +0 config (FUNC bits 2-5, OE bit 9), +4 bit 0 input. */
 #define VOLUP_GPIO  0x0f165000ull
 
 /* ---- settings page, filled in by mkboot.py ---- */
 struct bm_config {
-	char magic[8];			/* "PNDBMCF1" */
-	uint32_t armed;			/* 1: volume up may start iOS; the Android watchdog clears it */
+	char magic[8];			/* "PNDBMCF2" */
 	uint32_t wait_ms;		/* how long the line stays up */
-	uint32_t any_mode;		/* test builds: the line in every boot mode */
-	uint32_t reserved;
-	uint8_t extents_sha256[3][32];	/* iosroot, ioslog, adspfw: pinfile `extents --json` */
-	char why[64];			/* set by the watchdog with armed = 0 */
+	uint32_t any_mode;		/* test builds: the line in every boot mode, and the numbers */
+	uint64_t slot_off;		/* iOS slot, from the start of this Image */
+	uint64_t slot_max;		/* its size, header page included */
+	uint64_t save_off;		/* 1 MiB for the screen band, inside image_size */
 };
 
 __attribute__((section(".config"), used, aligned(4096)))
-volatile struct bm_config bm_config = { .magic = { 'P', 'N', 'D', 'B', 'M', 'C', 'F', '1' } };
+volatile struct bm_config bm_config = { .magic = { 'P', 'N', 'D', 'B', 'M', 'C', 'F', '2' } };
 
-extern const unsigned char _payload_start[], _payload_end[], _linux_start[], _linux_end[];
+/* ---- iOS slot header page, written by update_ios.sh (slot.py) ---- */
+struct bm_slot {
+	char magic[8];			/* "PNDSLOT1" */
+	uint32_t armed;			/* 1: may start; written last by update_ios.sh, cleared by the guard */
+	uint32_t reserved;
+	uint64_t size;			/* bytes of the Image after this page, a multiple of 8 */
+	uint64_t sum;			/* bm_sum() of those bytes */
+	uint8_t extents_sha256[3][32];	/* iosroot, ioslog, adspfw: pinfile `extents --json` */
+	char why[64];			/* set by the guard with armed = 0 */
+	char label[64];			/* which build (update_ios.sh), not shown */
+};
+
+_Static_assert(__builtin_offsetof(struct bm_config, slot_off) == 16, "settings layout");
+_Static_assert(__builtin_offsetof(struct bm_slot, sum) == 24, "slot layout");
+_Static_assert(__builtin_offsetof(struct bm_slot, why) == 128, "slot layout");
+
+extern const unsigned char _linux_start[], _linux_end[];
 
 static uint8_t rd8(uint64_t a) { return *(volatile const uint8_t *)(uintptr_t)a; }
 static uint32_t rd32(uint64_t a) { return *(volatile const uint32_t *)(uintptr_t)a; }
@@ -90,7 +106,6 @@ static void wait_ms(uint64_t ms)
 #define WHITE  0xffffffffu
 #define GREY   0xff909090u
 #define YELLOW 0xffffff00u
-#define GREEN  0xff40ff40u
 #define RED    0xffff4040u
 /* The menu line: a band near the bottom of the logo, saved first and put back after. */
 #define BAND_Y (FB_H - 400u)
@@ -282,7 +297,52 @@ static int layout_ok(uint64_t fdt, uint64_t load, uint64_t declared)
 	return ie >= is && !overlaps(is, ie - is, load, declared);
 }
 
-/* ---- volume up ---- */
+/* ---- slot checksum ---- */
+/* Over 8-byte little-endian words: a += w, b += a (mod 2^64); a ^ (b rotated by 32).
+ * slot.py computes the same. Word reads only: fast enough uncached. */
+static uint64_t bm_sum(uint64_t p, uint64_t n)
+{
+	volatile const uint64_t *w = (volatile const uint64_t *)(uintptr_t)p;
+	uint64_t a = 0, b = 0;
+	for (uint64_t i = 0; i < n / 8; i++) {
+		a += w[i];
+		b += a;
+	}
+	return a ^ (b << 32 | b >> 32);
+}
+
+/* ---- the iOS slot ---- */
+static int magic_is(uint64_t a, const char *m)
+{
+	for (int i = 0; i < 8; i++)
+		if (rd8(a + i) != (uint8_t)m[i])
+			return 0;
+	return 1;
+}
+
+/* 0 when the slot may be started (without the checksum), else why not. */
+static const char *slot_state(uint64_t slot, uint64_t max)
+{
+	volatile const struct bm_slot *h = (volatile const struct bm_slot *)(uintptr_t)slot;
+	if (max < SLOT_HDR || !magic_is(slot, "PNDSLOT1"))
+		return "no iOS in the slot";
+	if (h->armed != 1)
+		return 0;		/* not armed: the caller shows h->why */
+	uint64_t n = h->size;
+	if (n == 0 || (n & 7) || n > max - SLOT_HDR || rd32(slot + SLOT_HDR + 56) != 0x644d5241u)
+		return "slot size or image bad";
+	return 0;
+}
+
+static void slot_why(uint64_t slot, char *msg, uint32_t n)
+{
+	volatile const struct bm_slot *h = (volatile const struct bm_slot *)(uintptr_t)slot;
+	for (uint32_t i = 0; i < 40 && h->why[i] >= 0x20 && h->why[i] < 0x7f; i++)
+		msg[n++] = h->why[i];
+	msg[n] = 0;
+}
+
+/* ---- menu ---- */
 static int volup_usable(void)
 {
 	uint32_t faulted = 0, cfg = safe_rd32(VOLUP_GPIO, &faulted);
@@ -295,24 +355,29 @@ static int volup_pressed(void)
 	return !faulted && !(io & 1u);
 }
 
-/* The line, until volume up (1) or the time is up (0). */
-static int menu(uint64_t save)
+/* Shows "iOS off: <why>" for the wait (0), or the countdown until volume up (1) or the
+ * time is up (0). The band is put back unless iOS is chosen. */
+static int menu(uint64_t save, uint64_t slot, uint64_t max)
 {
 	band_copy(save, 0);
-	uint64_t hz = tick_hz(), t0 = ticks(), total = hz * bm_config.wait_ms / 1000;
 	/* Built by hand: no string initialisers (they become memcpy calls). */
-	char msg[64];
-	uint32_t n = scopy(msg, 0, bm_config.armed ? "Volume up  iOS   " : "iOS off: ");
-	if (!bm_config.armed) {
-		for (uint32_t i = 0; i < 40 && bm_config.why[i] >= 0x20 && bm_config.why[i] < 0x7f; i++)
-			msg[n++] = bm_config.why[i];
-		msg[n] = 0;
+	char msg[96];
+	const char *bad = slot_state(slot, max);
+	volatile const struct bm_slot *h = (volatile const struct bm_slot *)(uintptr_t)slot;
+	if (bad || h->armed != 1) {
+		uint32_t n = scopy(msg, 0, "iOS off: ");
+		if (bad)
+			scopy(msg, n, bad);
+		else
+			slot_why(slot, msg, n);
 		band_text(msg, GREY);
 		wait_ms(bm_config.wait_ms);
 		band_copy(save, 1);
 		return 0;
 	}
+	uint32_t n = scopy(msg, 0, "Volume up  iOS   ");
 	msg[n + 1] = 0;
+	uint64_t hz = tick_hz(), t0 = ticks(), total = hz * bm_config.wait_ms / 1000;
 	uint32_t held = 0, shown = ~0u;
 	for (;;) {
 		uint64_t t = ticks() - t0;
@@ -325,145 +390,17 @@ static int menu(uint64_t save)
 			shown = left;
 		}
 		held = volup_pressed() ? held + 1 : 0;
-		if (held >= 3)			/* 30 ms */
-			return 1;
+		if (held >= 3) {		/* 30 ms */
+			if (bm_sum(slot + SLOT_HDR, h->size) == h->sum)
+				return 1;
+			band_text("iOS off: slot damaged", GREY);
+			wait_ms(3000);
+			break;
+		}
 		wait_ms(10);
 	}
 	band_copy(save, 1);
 	return 0;
-}
-
-/* ---- iOS: as shim/loader/loader.c ---- */
-struct payload_seg {
-	uint64_t vmaddr, vmsize, file_off, file_size;
-};
-
-struct payload {
-	char magic[8];
-	uint32_t version, nsegs;
-	uint64_t virt_base, entry_va, adt_off, adt_size, kernel_end;
-	uint64_t phys_base, mem_size;
-	char cmdline[BOOT_LINE_LENGTH];
-	struct payload_seg segs[];
-};
-
-/* pexpert/pexpert/arm64/boot.h, Revision/Version 2 */
-struct boot_video {
-	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
-};
-
-struct boot_args {
-	uint16_t Revision, Version;
-	uint64_t virtBase, physBase, memSize, topOfKernelData;
-	struct boot_video Video;
-	uint32_t machineType;
-	uint64_t deviceTreeP;
-	uint32_t deviceTreeLength;
-	char CommandLine[BOOT_LINE_LENGTH];
-	uint64_t bootFlags, memSizeActual;
-};
-
-_Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload header layout");
-_Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
-_Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
-
-static void copy64(uint64_t dst, uint64_t src, uint64_t n)
-{
-	volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)dst;
-	volatile const uint64_t *s = (volatile const uint64_t *)(uintptr_t)src;
-	for (uint64_t i = 0; i < (n + 7) / 8; i++)
-		d[i] = s[i];
-}
-
-static void zero64(uint64_t dst, uint64_t n)
-{
-	volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)dst;
-	for (uint64_t i = 0; i < n / 8; i++)
-		d[i] = 0;
-}
-
-static int in_ram(uint64_t a, uint64_t n)
-{
-	return a >= RAM_LO && n <= RAM_HI - a;
-}
-
-typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
-
-static const char *boot_ios(void)
-{
-	uint64_t pl = (uintptr_t)_payload_start, pl_end = (uintptr_t)_payload_end;
-	const struct payload *p = (const struct payload *)(uintptr_t)pl;
-	static const char want[] = "SWEETXNU";
-	for (int i = 0; i < 8; i++)
-		if (p->magic[i] != want[i])
-			return "no SWEETXNU payload embedded";
-	if (p->version != 1 || (p->adt_off & 7) || (pl & 7) || p->nsegs == 0 || p->nsegs > 64)
-		return "bad payload header";
-	hexline("PAYLOAD", pl);
-	hexline("PHYS", p->phys_base);
-	hexline("MEMSIZE", p->mem_size);
-	hexline("ENTRY", p->entry_va);
-	if (!in_ram(p->phys_base, p->mem_size))
-		return "kernel RAM outside the clean 0x8c0000000 range";
-	if (pl_end > p->phys_base && pl < p->phys_base + p->mem_size)
-		return "payload overlaps kernel memory";
-
-	uint64_t pa_of_va_base = p->phys_base - p->virt_base;
-	/* Check every destination before writing anything. */
-	for (uint32_t i = 0; i < p->nsegs; i++) {
-		const struct payload_seg *s = &p->segs[i];
-		if (!in_ram(s->vmaddr + pa_of_va_base, s->vmsize) || s->file_size > s->vmsize ||
-		    s->file_off + s->file_size > pl_end - pl)
-			return "unsafe payload segment";
-	}
-	uint64_t adt_pa = p->kernel_end + pa_of_va_base;
-	uint64_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
-	uint64_t top = ba_pa + PAGE_16K;
-	if (!in_ram(adt_pa, top - adt_pa) || top > p->phys_base + p->mem_size ||
-	    p->adt_off + p->adt_size > pl_end - pl)
-		return "ADT/boot_args outside kernel RAM";
-
-	for (uint32_t i = 0; i < p->nsegs; i++) {
-		const struct payload_seg *s = &p->segs[i];
-		uint64_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, pl + s->file_off, s->file_size);
-		uint64_t done = (s->file_size + 7) & ~7ull;
-		if (s->vmsize > done)
-			zero64(dst + done, s->vmsize - done);
-	}
-	hexline("KERN_END", p->kernel_end + pa_of_va_base);
-
-	copy64(adt_pa, pl + p->adt_off, p->adt_size);
-	zero64(ba_pa, PAGE_16K);
-	volatile struct boot_args *ba = (volatile struct boot_args *)(uintptr_t)ba_pa;
-	ba->Revision = 2;
-	ba->Version = 2;
-	ba->virtBase = p->virt_base;
-	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
-	ba->topOfKernelData = top;
-	ba->Video.v_baseAddr = FB;
-	ba->Video.v_display = 1;
-	ba->Video.v_rowBytes = FB_STRIDE;
-	ba->Video.v_width = FB_W;
-	ba->Video.v_height = FB_H;
-	ba->Video.v_depth = 32;
-	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* read with the MMU on: a VA */
-	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
-	hexline("BOOTARGS", ba_pa);
-
-	uint64_t entry_pa = p->entry_va + pa_of_va_base;
-	if (!in_ram(entry_pa, 4))
-		return "entry outside kernel RAM";
-	hexline("JUMP", entry_pa);
-	line("XNU", "jumping (the kernel console takes over)", GREEN);
-	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
-	((xnu_entry_t)(uintptr_t)entry_pa)(ba_pa);
-	return "xnu returned";
 }
 
 /* ---- Android: the stock kernel, unchanged, with ABL's FDT ---- */
@@ -487,7 +424,7 @@ static void start_android(uint64_t fdt, uint64_t load, uint64_t declared, int la
 	if (dst != src) {
 		if (!layout || dst + size > load + declared)
 			halt_with("ANDROID", "kernel not 2 MiB aligned and no room to move it");
-		/* Upwards, overlapping: copy from the end. */
+		/* Upwards, overlapping: copy from the end. (Only the slot behind it is lost.) */
 		volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)dst;
 		volatile const uint64_t *s = (volatile const uint64_t *)(uintptr_t)src;
 		for (uint64_t i = (n + 7) / 8; i-- > 0;)
@@ -499,17 +436,18 @@ static void start_android(uint64_t fdt, uint64_t load, uint64_t declared, int la
 void menu_main(uint64_t fdt, uint64_t el, uint64_t load)
 {
 	uint64_t declared = rd64(load + 16);
-	uint64_t linux_src = (uintptr_t)_linux_start;
+	uint64_t slot = load + bm_config.slot_off, max = bm_config.slot_max;
+	uint64_t save = load + bm_config.save_off;
 	int layout = layout_ok(fdt, load, declared);
-	/* Save area: behind the Android kernel's image_size and the 2 MiB move slack. */
-	uint64_t save = linux_src + rd64(linux_src + 16) + SZ_2M;
-	int room = layout && save + BAND_BYTES <= load + declared;
+	int room = layout && bm_config.save_off + BAND_BYTES <= declared &&
+	    bm_config.slot_off + max <= declared && (slot & 0xfff) == 0;
 	if (bm_config.any_mode) {
 		/* Test builds: what the menu decides from, at the top of the screen (Android
 		 * draws over it later). */
 		uint32_t ls = 0, le = 0, faulted = 0, cfg = safe_rd32(VOLUP_GPIO, &faulted);
 		uint64_t s = chosen_prop(fdt, "linux,initrd-start", &ls);
 		uint64_t e = chosen_prop(fdt, "linux,initrd-end", &le);
+		const char *st = slot_state(slot, max);
 		row = 0;
 		hexline("LOADED", load);
 		hexline("IMGSIZE", declared);
@@ -517,17 +455,17 @@ void menu_main(uint64_t fdt, uint64_t el, uint64_t load)
 		hexline("FDTSIZE", be32(fdt) == 0xd00dfeedu ? be32(fdt + 4) : 0);
 		hexline("INITRD", s && ls == 8 ? (uint64_t)be32(s) << 32 | be32(s + 4) : 0);
 		hexline("INITRDEND", e && le == 8 ? (uint64_t)be32(e) << 32 | be32(e + 4) : 0);
-		hexline("SAVE", save);
+		hexline("SLOT", slot);
+		hexline("SLOTSIZE", rd64(slot + 16));
+		line("SLOTSTATE", st ? st : rd32(slot + 8) == 1 ? "armed" : "off", WHITE);
 		hexline("STATE", el << 32 | (uint64_t)faulted << 28 | (uint64_t)(cfg & 0xfffffff));
 		hexline("CHECKS", (uint64_t)layout << 12 | (uint64_t)room << 8 | (uint64_t)normal_mode(fdt) << 4 |
 		    (uint64_t)volup_usable());
 	}
-	if (room && el == 1 && (bm_config.any_mode || normal_mode(fdt)) && volup_usable() && menu(save)) {
-		fill(0, 0, FB_W, FB_H, BG);
-		row = 0;
-		line("PANDORA", "boot menu v1 - nothing is written to storage", GREEN);
-		hexline("LOADED", load);
-		halt_with("ERROR", boot_ios());
+	if (room && el == 1 && (bm_config.any_mode || normal_mode(fdt)) && volup_usable() &&
+	    menu(save, slot, max)) {
+		/* The slot's Image, entered as ABL enters a kernel. It draws its own screen. */
+		jump_linux(slot + SLOT_HDR, fdt);
 	}
 	if (bm_config.any_mode)
 		wait_ms(bm_config.wait_ms);	/* time to read the lines above */

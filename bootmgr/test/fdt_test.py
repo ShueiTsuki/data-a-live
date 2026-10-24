@@ -2,7 +2,7 @@
 
     python -I test/fdt_test.py [DTB]     (default device/pandora-live.dtb, ABL's FDT from Android)
 
-The functions are cut out of menu.c as they are (from "---- ABL's FDT" to "---- volume up"),
+The functions are cut out of menu.c as they are (from "---- ABL's FDT" to "---- slot checksum"),
 compiled for the PC with gcc in WSL and run against the live FDT and edited copies of it:
 charger and silent boot words, a bad magic, no initrd, the image overlapping the initrd.
 """
@@ -71,7 +71,7 @@ def run(dtb_bytes, tag):
 
 def main():
     src = open(SRC, encoding='utf-8').read()
-    m = re.search(r'/\* ---- ABL\'s FDT.*?(?=/\* ---- volume up)', src, re.S)
+    m = re.search(r'/\* ---- ABL\'s FDT.*?(?=/\* ---- slot checksum)', src, re.S)
     assert m, 'FDT section not found in menu.c'
     c = os.path.join(WORK, 'fdt_test.c')
     open(c, 'w', newline='\n').write(HARNESS.replace('@@FUNCS@@', m.group(0)))

@@ -1,10 +1,9 @@
 /*
- * pandora boot menu entry (from shim/loader/start.S). ABL loads this from boot_b as a Linux
- * arm64 Image and jumps here with the MMU off and x0 = flattened device tree. Behind the
- * code: the menu settings page (.config), the XNU payload (.payload) and, 2 MiB aligned,
- * the stock Android kernel (.linux). mkboot.py raises image_size so that ABL keeps the
- * Android kernel's BSS, the alignment slack and the screen save area free as well.
- * Any unexpected exception resets the phone through PSCI SYSTEM_RESET.
+ * pandora boot menu entry (from shim/loader/start.S). ABL loads boot_b's kernel field as a
+ * Linux arm64 Image and jumps here with the MMU off and x0 = flattened device tree. Behind
+ * the code: the settings page (.config) and, 2 MiB in, the stock Android kernel (.linux);
+ * mkboot.py appends the iOS slot and raises image_size over all of it plus the screen save
+ * area. Any unexpected exception resets the phone through PSCI SYSTEM_RESET.
  */
 .section .text.head, "ax"
 .global _head
@@ -53,7 +52,8 @@ fatal:
 	b	5b
 
 /* void jump_linux(uint64_t entry, uint64_t fdt): arm64 boot protocol, x0 = FDT, x1-x3 = 0,
- * MMU off, interrupts masked. Nothing here enabled a cache, so only the I-cache is cleaned. */
+ * MMU off, interrupts masked; for the Android kernel and the slot's Image alike. Nothing
+ * here enabled a cache, so only the I-cache is cleaned. */
 .global jump_linux
 jump_linux:
 	mov	x4, x0

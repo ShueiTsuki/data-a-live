@@ -13,10 +13,6 @@ SECTIONS {
 	_stack_top = .;
 	. = ALIGN(4096);
 	.config : { KEEP(*(.config)) }
-	. = ALIGN(4096);
-	_payload_start = .;
-	.payload : { *(.payload) }
-	_payload_end = .;
 	. = ALIGN(0x200000);
 	_linux_start = .;
 	.linux : { *(.linux) }
