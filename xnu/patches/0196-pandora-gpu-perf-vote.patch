@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index f97db6d..4b23b9e 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -1345,17 +1345,26 @@ gpu_level8(void)
+ 		printf("PANDORA GPU: GPU window not mapped\n");
+ 		return false;
+ 	}
+-	gpu_step("GMU: interrupts, GX vote (160 MHz, lowest bandwidth), OOB GPU_SET");
++	gpu_step("GMU: interrupts, GX vote (pandora_gpu_perf / pandora_gpu_bw, lowest by default), OOB GPU_SET");
+ 	/* a6xx_gmu_resume after a6xx_hfi_start: CM3 fault interrupt on, everything else masked */
+ 	gmu_wr(GMU_GMU2HOST_INTR_CLR, ~0u);
+ 	gmu_wr(GMU_GMU2HOST_INTR_MASK, ~(1u << 23));
+ 	/* a6xx_gmu_set_initial_freq -> a6xx_hfi_set_freq */
+ 	static uint32_t vote[4];
++	/* 0196: boot-args pandora_gpu_perf (perf index 1..18 into gpu_opps, default 1 = 160 MHz) and
++	 * pandora_gpu_bw (bw index 1..11 into gpu_ddr_kbps, default 1). bb22: frames of ~100 draws took
++	 * 10-15 ms at the lowest level; there is no DCVS yet, the vote holds for the whole boot. */
++	uint32_t perf = 1, bwi = 1;
++	(void)PE_parse_boot_argn("pandora_gpu_perf", &perf, sizeof(perf));
++	(void)PE_parse_boot_argn("pandora_gpu_bw", &bwi, sizeof(bwi));
++	perf = MAX(1u, MIN(perf, (uint32_t)NGPU - 1));
++	bwi = MAX(1u, MIN(bwi, (uint32_t)NBW - 1));
+ 	vote[1] = 1;            /* ack_type: blocking */
+-	vote[2] = 1;            /* perf index: 160 MHz */
+-	vote[3] = 1;            /* bw index: 2136718 KBps */
++	vote[2] = perf;         /* perf index */
++	vote[3] = bwi;          /* bw index */
+ 	bool voted = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, 4);
+-	printf("PANDORA GPU: HFI GX vote %s; pwr_clk_status %08x intr info %08x\n", voted ? "ACKED" : "NOT ACKED",
++	printf("PANDORA GPU: HFI GX vote %u MHz, %u KBps %s; pwr_clk_status %08x intr info %08x\n",
++	    gpu_opps[perf - 1].hz / 1000000, gpu_ddr_kbps[bwi], voted ? "ACKED" : "NOT ACKED",
+ 	    gmu_rd(GMU_PWR_CLK_STATUS), gmu_rd(GMU_GMU2HOST_INTR_INFO));
+ 	if (!voted) {
+ 		return false;
+@@ -3026,7 +3035,7 @@ static void
+ gpu_watch(void)
+ {
+ 	char last[GPU_MAX_CLIENTS][96] = {};
+-	uint32_t last_ring = ~0u, last_fsr = 0, dumped = ~0u;
++	uint32_t last_ring = ~0u, last_fsr = 0, dumped = ~0u, last_issued = 0;
+ 	for (unsigned t = 0; ; t++) {   /* 0193: as long as the system runs (lines only on change) */
+ 		gpu_sleep(5000);
+ 		lck_mtx_lock(&gpu_lock);
+@@ -3052,7 +3061,9 @@ gpu_watch(void)
+ 			    (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(CP_INTERRUPT_STATUS_GLOBAL),
+ 			    gr(CP_RB_RPTR), ring_wptr);
+ 			last_ring = ring;
+-		} else if ((int32_t)(gpu_seqno - ring) > 0 && ring != dumped) {
++		} else if ((int32_t)(last_issued - ring) > 0 && ring != dumped) {
++			/* 0196: work that was already pending at the last tick, no progress since (bb22's
++			 * dump caught a submission issued just before an idle tick). */
+ 			gpu_hang_dump(ring);   /* 5 s and more without progress, work pending */
+ 			dumped = ring;
+ 		}
+@@ -3063,6 +3074,7 @@ gpu_watch(void)
+ 			gpu_wr(gpu_smmu_va, gpu_smmu.cb + 0x58, fsr);
+ 		}
+ 		last_fsr = fsr;   /* bit 10 stays set from boot on (bb2 log); log changes only */
++		last_issued = gpu_seqno;
+ 		lck_mtx_unlock(&gpu_lock);
+ 	}
+ }
