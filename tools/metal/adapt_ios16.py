@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Adapt UniXNU NativeMetal (pinned c6d29ca, written for iPadOS 17 on an Adreno 740) to iOS 16.7 on the
-Adreno 840 (ios-pandora). Exact, asserted text edits in a NativeMetal checkout; run once on a fresh tree.
+Adreno 840 (data-a-live). Exact, asserted text edits in a NativeMetal checkout; run once on a fresh tree.
 
   adapt_ios16.py NATIVEMETAL_DIR
 
@@ -12,7 +12,7 @@ Adreno 840 (ios-pandora). Exact, asserted text edits in a NativeMetal checkout; 
 3. NativeBridgeMetalFrontend.mm: _MTLDevice is 528 bytes on iOS 16.7 (536 on iPadOS 17.7.11, the only
    size accepted); the dynamic subclass adds no instance variables, so both are accepted.
 4. NativeTurnipSmoke.h: Turnip next to the plugin binary, else /usr/lib/libvulkan_freedreno.dylib
-   (ios-pandora installs it there for tools/vktest; no second 17 MB copy inside the bundle).
+   (data-a-live installs it there for tools/vktest; no second 17 MB copy inside the bundle).
 """
 import pathlib
 import sys
@@ -38,9 +38,9 @@ edit('NativeAdrenoMetalPlugin.mm',
      """    if (publish::requested()) return publish::deviceForPort(port);
     static bool attempted;""",
      """    if (publish::requested()) return publish::deviceForPort(port);
-    // ios-pandora (iOS 16, Adreno 840): no stage-1 self-test, it drives the A740's raw ABI. A process named in
+    // data-a-live (iOS 16, Adreno 840): no stage-1 self-test, it drives the A740's raw ABI. A process named in
     // NativeAdrenoMetal.clients gets its own device, every other process (backboardd too) nil and its software renderer.
-    {   // ios-pandora: TU_DEBUG from the boot-arg pandora_tu_debug=a,b,c when given (bb37), else sysmem,nocb; a value
+    {   // data-a-live: TU_DEBUG from the boot-arg pandora_tu_debug=a,b,c when given (bb37), else sysmem,nocb; a value
         // already in the environment wins either way (mtltest picks its own per launch).
         static char chosen[128];
         const char *flags = "sysmem,nocb";
@@ -64,14 +64,14 @@ edit('NativeAdrenoMetalPlugin.mm',
      """static void reportDisplayState(Gpu &gpu) {
     ++gReports;""",
      """static void reportDisplayState(Gpu &gpu) {
-    if (gReports >= 0) return;   // ios-pandora: the addresses below are iPadOS 17.7.11 QuartzCore's, not iOS 16's
+    if (gReports >= 0) return;   // data-a-live: the addresses below are iPadOS 17.7.11 QuartzCore's, not iOS 16's
     ++gReports;""")
 edit('NativeAdrenoMetalPlugin.mm',
      """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     return device;""",
      """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     else if (!strcmp(getprogname(), "backboardd")) {
-        // ios-pandora: the render server as a client (no publish mode here): what it reads for the deep
+        // data-a-live: the render server as a client (no publish mode here): what it reads for the deep
         // framebuffer, and the bridge's telemetry (refused surfaces, last problems) every 30 s.
         CFTypeRef deep = CFPreferencesCopyAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFPreferencesCurrentApplication);
         NSLog(@"pandora-metal: backboardd has a device; CAEnableDeepFramebuffer %@", (__bridge id)deep);
@@ -96,13 +96,13 @@ edit('NativeBridgeMetalFrontend.mm',
      """static NSError *nbError(NSString *why) {
  return""",
      """static NSError *nbError(NSString *why) {
- NSLog(@"pandora-metal refused: %@", why);   // ios-pandora: every refusal in the log (backboardd: specialize, bb7)
+ NSLog(@"pandora-metal refused: %@", why);   // data-a-live: every refusal in the log (backboardd: specialize, bb7)
  return""")
 edit('NativeBridgeMetalFrontend.mm',
      """  case 84:case 88:return 32;
   default:return 0;""",
      """  case 84:case 88:return 32;
-  // ios-pandora: 3-wide vectors, lanes packed as metal2vulkan's canon/fc.rs reads them (the first
+  // data-a-live: 3-wide vectors, lanes packed as metal2vulkan's canon/fc.rs reads them (the first
   // lanes*width bytes; Metal's storage is at least that). iOS 16 backboardd specializes a uchar3 (bb8).
   case 5:case 31:case 35:return 12;
   case 18:case 39:case 43:return 6;
@@ -113,7 +113,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ (void)bytes;(void)length;(void)d;(void)deallocator;
  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
  return nil;""",
-     """ // ios-pandora: a one-level 2D texture in rows of texels or blocks (bb25: QuartzCore in backboardd asks for the App
+     """ // data-a-live: a one-level 2D texture in rows of texels or blocks (bb25: QuartzCore in backboardd asks for the App
  // Library's full-screen ASTC 4x4 image, shader-read only, 282 x 609 blocks of 16 bytes). Made as an ordinary texture
  // and filled from the bytes once; the caller's deallocator runs when the texture goes. A read-only texture sees no
  // later writes to the bytes, which a texture over them would.
@@ -141,7 +141,7 @@ edit('NativeBridgeMetalFrontend.mm',
   }
  }
  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
- // ios-pandora: what is asked for and still refused: the descriptor, the memory and the callers (image + offset), the
+ // data-a-live: what is asked for and still refused: the descriptor, the memory and the callers (image + offset), the
  // first 20 calls and then one in 100.
  static std::atomic<uint32_t> asked{0};
  const uint32_t nth=++asked;
@@ -165,16 +165,16 @@ edit('NativeBridgeMetalFrontend.mm',
  return nil;""")
 edit('NativeBridgeMetalFrontend.mm',
      """ if(!base || class_getInstanceSize(base)!=536){""",
-     """ // ios-pandora: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
+     """ // data-a-live: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
  if(!base || (class_getInstanceSize(base)!=536 && class_getInstanceSize(base)!=528)){""")
 edit('NativeTurnipSmoke.h',
      """    snprintf(slash + 1, size - size_t(slash + 1 - path), "libvulkan_freedreno.dylib");
     return true;""",
      """    snprintf(slash + 1, size - size_t(slash + 1 - path), "libvulkan_freedreno.dylib");
-    if (access(path, R_OK) != 0) snprintf(path, size, "%s", "/usr/lib/libvulkan_freedreno.dylib");   // ios-pandora
+    if (access(path, R_OK) != 0) snprintf(path, size, "%s", "/usr/lib/libvulkan_freedreno.dylib");   // data-a-live
     return true;""")
 
-# ---- ios-pandora: frame capture for the App Library (bb26) -------------------------------------------------
+# ---- data-a-live: frame capture for the App Library (bb26) -------------------------------------------------
 # Its full-screen blur draws empty (the zoomed home screen snapshot behind shows through, the rest is black),
 # with no refusal on record. Right after newTextureWithBytesNoCopy makes the App Library's image, the next
 # 800 events backboardd encodes are logged as "pandora-metal cap": render passes (attachments, level, load and
@@ -185,7 +185,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
 """,
      """#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
-// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
+// data-a-live: the App Library capture (tools/metal/adapt_ios16.py).
 static std::atomic<int> gCapture{0};
 static char gCapNamesKey;
 static inline bool capturing() {return gCapture.load(std::memory_order_relaxed)>0;}
@@ -286,7 +286,7 @@ edit('NativeBridgeMetalFrontend.mm',
  self.committed=YES;
 """)
 
-# ---- ios-pandora: what the App Library's ASTC bytes look like (bb28) ------------------------------------------
+# ---- data-a-live: what the App Library's ASTC bytes look like (bb28) ------------------------------------------
 # Re-uploading at commit (38391ce) never fired for the App Library (its bytes do not change after the texture is
 # made) and froze backboardd in the app switcher, so it is gone. The image still shows a sharp picture in one part
 # and black elsewhere. For a block-compressed texture the next lines describe the bytes as rows of blocks: an 8x8
@@ -294,7 +294,7 @@ edit('NativeBridgeMetalFrontend.mm',
 # other blocks (o), so the picture's layout can be compared with the screen, and the callers.
 edit('NativeBridgeMetalFrontend.mm',
      """   static std::atomic<int> captures{0};""",
-     """   if(bb==16) {   // ios-pandora: the block layout of the bytes, 8x8 grid
+     """   if(bb==16) {   // data-a-live: the block layout of the bytes, 8x8 grid
     static std::atomic<int> described{0};
     if(described.fetch_add(1)<6) {
      const uint8_t *blocks=(const uint8_t *)bytes;
@@ -322,7 +322,7 @@ edit('NativeBridgeMetalFrontend.mm',
    }
    static std::atomic<int> captures{0};""")
 
-# ---- ios-pandora: no-copy memory is cleaned like surfaces (bb30) ---------------------------------------------
+# ---- data-a-live: no-copy memory is cleaned like surfaces (bb30) ---------------------------------------------
 # The kernel maps imported user memory for the GPU uncached and leaves the CPU's caches to the importer
 # (NativeAdrenoABI.h; pandora_gpu.c flushes every import only with pandora_gpu_flushall=1). NativeMetal cleans
 # the IOSurfaces a command buffer uses, but not memory from newBufferWithBytesNoCopy or textures over it, so
@@ -330,7 +330,7 @@ edit('NativeBridgeMetalFrontend.mm',
 # Now those ranges are cleaned and invalidated at commit and at completion too, as the surfaces are.
 edit('NativeBridgeMetalFrontend.mm',
      """static NBTexture *textureOnBuffer(NBBuffer *buffer,""",
-     """// ios-pandora: no-copy buffers a command uses, directly or under a texture (tools/metal/adapt_ios16.py).
+     """// data-a-live: no-copy buffers a command uses, directly or under a texture (tools/metal/adapt_ios16.py).
 static std::atomic<uint64_t> gWrappedFlushes{0},gWrappedFlushBytes{0};
 static void flushWrapped(NSSet *owners) {
  if(!owners.count)return;
@@ -353,16 +353,16 @@ edit('NativeBridgeMetalFrontend.mm',
      """ flushSurfaces(_surfaces);
  // Actual GPU completion""",
      """ flushSurfaces(_surfaces);
- flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+ flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too
  // Actual GPU completion""")
 edit('NativeBridgeMetalFrontend.mm',
      """  flushSurfaces(_surfaces);
   // Completion owns this reference""",
      """  flushSurfaces(_surfaces);
-  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+  flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too
   // Completion owns this reference""")
 
-# ---- ios-pandora: refused IOSurface textures in the log (bb30) -----------------------------------------------
+# ---- data-a-live: refused IOSurface textures in the log (bb30) -----------------------------------------------
 # A texture over an IOSurface that the frontend cannot make is only counted (bb30: 148 of 173 refused, the last
 # a 1125x2436 two-plane RGB10A8_2P_XR10 surface). Its layer is then not drawn, which could be the App Library's
 # missing background. The first refusals now say what they were and who asked.
@@ -382,7 +382,7 @@ edit('NativeBridgeMetalFrontend.mm',
  }
 }""")
 
-# ---- ios-pandora: App Library probe, boot-arg pandora_astc_probe=1 (bb31) -----------------------------------
+# ---- data-a-live: App Library probe, boot-arg pandora_astc_probe=1 (bb31) -----------------------------------
 # While a finger holds the App Library its background is right (QuartzCore blurs live); at rest it is drawn from
 # the two pre-blurred ASTC images and comes out transparent. With the boot-arg the left half of each block row of a
 # large ASTC image is replaced by opaque red single-colour (void-extent) blocks before the upload: red on the left
@@ -458,7 +458,7 @@ edit('NativeBridgeMetalFrontend.mm',
    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
    if(deallocator) {""")
 
-# ---- ios-pandora: App Library readback, same boot-arg (bb32) --------------------------------------------------
+# ---- data-a-live: App Library readback, same boot-arg (bb32) --------------------------------------------------
 # bb32: with the left halves of both ASTC images red, no red reached the screen at all; the user saw the App
 # Library as always. So after the upload something is lost. With pandora_astc_probe=1 the render target a large
 # ASTC texture is drawn into is now read back when that command buffer completes (off the completion thread) and
@@ -467,7 +467,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """#include <sys/sysctl.h>
 """,
      """#include <sys/sysctl.h>
-static int pandoraAstcProbeLevel() {   // ios-pandora: boot-arg pandora_astc_probe=N (tools/metal/adapt_ios16.py)
+static int pandoraAstcProbeLevel() {   // data-a-live: boot-arg pandora_astc_probe=N (tools/metal/adapt_ios16.py)
  static const int level=[]{char args[1024]={};size_t size=sizeof args-1;
   if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0)return 0;
   const char *at=strstr(args,"pandora_astc_probe=");return at?atoi(at+19):0;}();
@@ -475,7 +475,7 @@ static int pandoraAstcProbeLevel() {   // ios-pandora: boot-arg pandora_astc_pro
 }
 static bool pandoraAstcProbe() {return pandoraAstcProbeLevel()>=1;}
 static char gProbePassTargetKey,gProbeReadbackKey,gProbeSamplerKey,gProbeBindingsKey,gProbePipeKey;
-// ios-pandora: an encoder's bindings as the probe's draw log prints them (tools/metal/adapt_ios16.py).
+// data-a-live: an encoder's bindings as the probe's draw log prints them (tools/metal/adapt_ios16.py).
 static NSMutableDictionary *probeBindings(id encoder) {
  NSMutableDictionary *seen=objc_getAssociatedObject(encoder,&gProbeBindingsKey);
  if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(encoder,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
@@ -500,7 +500,7 @@ static void probeLog(NSString *draw,NSString *key,id value) {
 edit('NativeBridgeMetalFrontend.mm',
      """ return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];""",
      """ id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
- if(made && pandoraAstcProbe() && d.colorAttachments[0].texture)   // ios-pandora: the pass's target, for the readback
+ if(made && pandoraAstcProbe() && d.colorAttachments[0].texture)   // data-a-live: the pass's target, for the readback
   objc_setAssociatedObject(made,&gProbePassTargetKey,d.colorAttachments[0].texture,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
  return made;""")
 edit('NativeBridgeMetalFrontend.mm',
@@ -509,7 +509,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && pandoraAstcProbe() && ((texture.pixelFormat==MTLPixelFormatASTC_4x4_LDR && texture.width>=512) ||
                                        objc_getAssociatedObject(texture,&gProbeReadbackKey))) {
-  id target=objc_getAssociatedObject(self,&gProbePassTargetKey);   // ios-pandora: read it back at completion
+  id target=objc_getAssociatedObject(self,&gProbePassTargetKey);   // data-a-live: read it back at completion
   if(target) {
    NSMutableSet *targets=objc_getAssociatedObject(_commandBuffer,&gProbeReadbackKey);
    if(!targets){targets=[NSMutableSet set];objc_setAssociatedObject(_commandBuffer,&gProbeReadbackKey,targets,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
@@ -521,7 +521,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ @synchronized(gInFlight){[gInFlight removeObject:self];}
  NSArray *completedHandlers;""",
      """ @synchronized(gInFlight){[gInFlight removeObject:self];}
- if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {   // ios-pandora: the App Library readback
+ if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {   // data-a-live: the App Library readback
   static std::atomic<int> readbacks{0};
   id<MTLCommandQueue> queue=(id<MTLCommandQueue>)self.queue;
   for(id<MTLTexture> target in [targets copy]) {
@@ -564,10 +564,10 @@ edit('NativeBridgeMetalFrontend.mm',
  }
  NSArray *completedHandlers;""")
 
-# ---- ios-pandora: sampler states in the log with the probe (bb35) --------------------------------------------
+# ---- data-a-live: sampler states in the log with the probe (bb35) --------------------------------------------
 edit('NativeBridgeMetalFrontend.mm',
      """ NmbSampler *handle=nmb_sampler_new(gDevice,&s);""",
-     """ if(pandoraAstcProbe()) {   // ios-pandora: what QuartzCore samples with (tools/metal/adapt_ios16.py)
+     """ if(pandoraAstcProbe()) {   // data-a-live: what QuartzCore samples with (tools/metal/adapt_ios16.py)
   static std::atomic<int> told{0};
   if(told.fetch_add(1)<40)NSLog(@"pandora-metal sampler: min %lu mag %lu mip %lu address %lu/%lu/%lu border %lu normalized %d lod %.1f-%.1f compare %lu",
    (unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,
@@ -575,7 +575,7 @@ edit('NativeBridgeMetalFrontend.mm',
  }
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);""")
 
-# ---- ios-pandora: what the App Library draw binds, probe level 3 (bb36) ---------------------------------------
+# ---- data-a-live: what the App Library draw binds, probe level 3 (bb36) ---------------------------------------
 # The samplers and fragment bytes bound when a probed texture is bound, for the first draws: with the samplers'
 # descriptors (kept on each sampler as it is made) and the first 64 bytes of each fragment bytes binding.
 edit('NativeBridgeMetalFrontend.mm',
@@ -587,14 +587,14 @@ edit('NativeBridgeMetalFrontend.mm',
  return (id<MTLSamplerState>)sampler;""")
 edit('NativeBridgeMetalFrontend.mm',
      """ [self check:nmb_encoder_set_sampler(_handle,stage,""",
-     """ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log
+     """ if(pandoraAstcProbe()) {   // data-a-live: remembered for the probe's draw log
   NSString *what=sampler?objc_getAssociatedObject(sampler,&gProbeSamplerKey):nil;
   probeBindings(self)[[NSString stringWithFormat:@"%ssampler%lu",probeStage(stage),(unsigned long)index]]=what?:(sampler?@"?":@"none");
  }
  [self check:nmb_encoder_set_sampler(_handle,stage,""")
 edit('NativeBridgeMetalFrontend.mm',
      """ [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""",
-     """ if(pandoraAstcProbe() && bytes)   // ios-pandora: remembered for the probe's draw log
+     """ if(pandoraAstcProbe() && bytes)   // data-a-live: remembered for the probe's draw log
   probeBindings(self)[[NSString stringWithFormat:@"%sbytes%lu",probeStage(stage),(unsigned long)index]]=probeHex(bytes,length,768);
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""")
 edit('NativeBridgeMetalFrontend.mm',
@@ -607,7 +607,7 @@ edit('NativeBridgeMetalFrontend.mm',
    (unsigned long)texture.height,(unsigned long)texture.pixelFormat,probeStage(stage),(unsigned long)index];
  }""")
 
-# ---- ios-pandora: the App Library draw's whole state, for a replay (bb36) -------------------------------------
+# ---- data-a-live: the App Library draw's whole state, for a replay (bb36) -------------------------------------
 # With the probe, every binding an encoder makes is remembered (pipeline with its functions' constants and blend
 # state, buffers with their first bytes, bytes, samplers, textures); the first draw after a probed texture is bound
 # prints it all with the draw's own arguments and, for an indexed draw, its indices. mtltest replays it from this.
@@ -616,7 +616,7 @@ edit('NativeBridgeMetalFrontend.mm',
   (unsigned long)d.colorAttachments[0].pixelFormat,(int)d.colorAttachments[0].blendingEnabled],OBJC_ASSOCIATION_RETAIN_NONATOMIC);""",
      """ objc_setAssociatedObject(state,&gCapNamesKey,[NSString stringWithFormat:@"%@ / %@ c0 f%lu blend %d",d.vertexFunction.name,d.fragmentFunction.name,
   (unsigned long)d.colorAttachments[0].pixelFormat,(int)d.colorAttachments[0].blendingEnabled],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
- if(pandoraAstcProbe()) {   // ios-pandora: the whole pipeline, for the probe's draw log
+ if(pandoraAstcProbe()) {   // data-a-live: the whole pipeline, for the probe's draw log
   NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
   NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
@@ -643,7 +643,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer""",
      """ if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
- if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+ if(pandoraAstcProbe()) {   // data-a-live: remembered for the probe's draw log, with the first bytes from the offset
   const uint8_t *contents=buffer?(const uint8_t *)buffer.contents:nullptr;
   probeBindings(self)[[NSString stringWithFormat:@"%sbuffer%lu",probeStage(stage),(unsigned long)index]]=!buffer?@"none":
    [NSString stringWithFormat:@"len %lu off %lu %@",(unsigned long)buffer.length,(unsigned long)offset,
@@ -660,7 +660,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(capturing())capture([NSString stringWithFormat:@"drawidx p%lu n%lu i%lu",(unsigned long)t,(unsigned long)n,(unsigned long)i]);
 """,
      """ if(capturing())capture([NSString stringWithFormat:@"drawidx p%lu n%lu i%lu",(unsigned long)t,(unsigned long)n,(unsigned long)i]);
- if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
@@ -678,7 +678,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(capturing())capture([NSString stringWithFormat:@"draw p%lu v%lu+%lu i%lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i]);
 """,
      """ if(capturing())capture([NSString stringWithFormat:@"draw p%lu v%lu+%lu i%lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i]);
- if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
@@ -690,7 +690,7 @@ edit('NativeBridgeMetalFrontend.mm',
  }
 """)
 
-# ---- ios-pandora: the probed draw's viewport, scissor and pass (bb38) -----------------------------------------
+# ---- data-a-live: the probed draw's viewport, scissor and pass (bb38) -----------------------------------------
 edit('NativeBridgeMetalFrontend.mm',
      """ if(capturing())capture([NSString stringWithFormat:@"viewport %.1f %.1f %.1fx%.1f",v.originX,v.originY,v.width,v.height]);
 """,
@@ -707,7 +707,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """  objc_setAssociatedObject(made,&gProbePassTargetKey,d.colorAttachments[0].texture,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 """,
      """  objc_setAssociatedObject(made,&gProbePassTargetKey,d.colorAttachments[0].texture,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
- if(made && pandoraAstcProbe()) {   // ios-pandora: the pass, for the probe's draw log
+ if(made && pandoraAstcProbe()) {   // data-a-live: the pass, for the probe's draw log
   NSMutableString *pass=[NSMutableString stringWithFormat:@"rt %lux%lu",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
   for(unsigned i=0;i<8;i++) {
    MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];if(!c.texture)continue;
@@ -720,7 +720,7 @@ edit('NativeBridgeMetalFrontend.mm',
  }
 """)
 
-# ---- ios-pandora: what the CPU wrote vs what the GPU reads, for the probed draw (bb39) ------------------------
+# ---- data-a-live: what the CPU wrote vs what the GPU reads, for the probed draw (bb39) ------------------------
 # bb38 replayed on the PC (metal2vulkan on lavapipe, /opt/work/replay): QuartzCore's shader translates right, but the
 # 64 bytes at vertex buffer 2 + 208 (its mvp matrix) as captured at setVertexBuffer are no matrix, every triangle has
 # no area and nothing is drawn; a real matrix there draws the image. QuartzCore may write the matrix after binding.
@@ -746,11 +746,11 @@ static NSString *probeBufferKind(id buffer) {
  return s;
 }""")
 edit('NativeBridgeMetalFrontend.mm',
-     """ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+     """ if(pandoraAstcProbe()) {   // data-a-live: remembered for the probe's draw log, with the first bytes from the offset
 """,
-     """ if(pandoraAstcProbe())   // ios-pandora: the buffer itself, for the probe's CPU/GPU comparison
+     """ if(pandoraAstcProbe())   // data-a-live: the buffer itself, for the probe's CPU/GPU comparison
   probeBindings(self)[[NSString stringWithFormat:@"~%sbuffer%lu",probeStage(stage),(unsigned long)index]]=buffer?@[buffer,@(offset)]:@[];
- if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+ if(pandoraAstcProbe()) {   // data-a-live: remembered for the probe's draw log, with the first bytes from the offset
 """)
 edit('NativeBridgeMetalFrontend.mm',
      """   NSDictionary *seen=probeBindings(self);
@@ -772,11 +772,11 @@ edit('NativeBridgeMetalFrontend.mm',
   }""")
 edit('NativeBridgeMetalFrontend.mm',
      """  flushSurfaces(_surfaces);
-  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+  flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too
   // Completion owns this reference""",
      """  flushSurfaces(_surfaces);
-  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
-  for(NSArray *w in objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: the probe's buffers at commit
+  flushWrapped(_resourceOwners);   // data-a-live: no-copy memory too
+  for(NSArray *w in objc_getAssociatedObject(self,&gProbeWatchKey)) {   // data-a-live: the probe's buffers at commit
    id<MTLBuffer> buffer=w[0];const NSUInteger offset=[w[1] unsignedLongValue];const uint8_t *c=(const uint8_t *)buffer.contents;
    // bb39: QuartzCore writes these buffers after binding them; what the GPU reads is what they hold at commit, so the
    // replay takes its bytes from here (1 KiB from the offset, in pieces).
@@ -787,7 +787,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """ @synchronized(gInFlight){[gInFlight removeObject:self];}
  if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {""",
      """ @synchronized(gInFlight){[gInFlight removeObject:self];}
- if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views
+ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // data-a-live: after completion, CPU and GPU views
   id<MTLCommandQueue> queue=(id<MTLCommandQueue>)self.queue;
   for(NSArray *w in watch) {
    id<MTLBuffer> buffer=w[0];const NSUInteger offset=[w[1] unsignedLongValue];NSString *label=w[2];
@@ -807,7 +807,7 @@ edit('NativeBridgeMetalFrontend.mm',
  if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {""")
 edit('NativeBridgeMetalFrontend.mm',
      """   if(probe && bb==16 && d.width>=512) {""",
-     """   if(probe && bb==16 && d.width>=512)   // ios-pandora: QuartzCore's own descriptor of the image (bb39)
+     """   if(probe && bb==16 && d.width>=512)   // data-a-live: QuartzCore's own descriptor of the image (bb39)
     NSLog(@"pandora-metal astc descriptor: usage %lu storage %lu cpu cache %lu hazard %lu resource options %lu swizzle %u/%u/%u/%u "
           "type %lu mips %lu samples %lu allow gpu opt %d | bytes %p length %lu",(unsigned long)d.usage,(unsigned long)d.storageMode,
           (unsigned long)d.cpuCacheMode,(unsigned long)d.hazardTrackingMode,(unsigned long)d.resourceOptions,(unsigned)d.swizzle.red,
@@ -816,7 +816,7 @@ edit('NativeBridgeMetalFrontend.mm',
           bytes,(unsigned long)length);
    if(probe && bb==16 && d.width>=512) {""")
 
-# ---- ios-pandora: did the App Library draw make any fragment? (bb40) -------------------------------------------
+# ---- data-a-live: did the App Library draw make any fragment? (bb40) -------------------------------------------
 # QuartzCore's fragment function forces the sampled alpha to 1, yet the App Library's target holds transparent black
 # where the image goes: the draw makes no fragment, or one of its inputs scales the colour to nothing. With the probe,
 # every render pass without its own visibility buffer gets one, and from the probed draw on each draw of that encoder
@@ -829,7 +829,7 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeBridgeMetalFrontend.mm',
      """ if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]])""",
-     """ NBBuffer *probeVisibility=nil;   // ios-pandora: a visibility buffer of the probe's own for this pass
+     """ NBBuffer *probeVisibility=nil;   // data-a-live: a visibility buffer of the probe's own for this pass
  if(pandoraAstcProbe() && !d.visibilityResultBuffer && gDeviceObject) {
   probeVisibility=(NBBuffer *)[(id<MTLDevice>)gDeviceObject newBufferWithLength:64*8 options:MTLResourceStorageModeShared];
   if(probeVisibility) {
@@ -841,10 +841,10 @@ edit('NativeBridgeMetalFrontend.mm',
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]])""")
 edit('NativeBridgeMetalFrontend.mm',
-     """ if(made && pandoraAstcProbe()) {   // ios-pandora: the pass, for the probe's draw log
+     """ if(made && pandoraAstcProbe()) {   // data-a-live: the pass, for the probe's draw log
 """,
      """ if(made && probeVisibility)objc_setAssociatedObject(made,&gProbeVisKey,probeVisibility,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
- if(made && pandoraAstcProbe()) {   // ios-pandora: the pass, for the probe's draw log
+ if(made && pandoraAstcProbe()) {   // data-a-live: the pass, for the probe's draw log
 """)
 # depth/stencil states keep their descriptor's description; the encoder remembers the bound one and the raster state
 edit('NativeBridgeMetalFrontend.mm',
@@ -868,12 +868,12 @@ edit('NativeBridgeMetalFrontend.mm',
  [self check:nmb_render_set_raster(self.handle,""")
 # counting: the probed draw takes slot 0, every later draw of the encoder the next slot
 edit('NativeBridgeMetalFrontend.mm',
-     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
    const uint8_t *ic=""",
-     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: count this draw's samples
+     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // data-a-live: count this draw's samples
   NSMutableArray *labels=objc_getAssociatedObject(self,&gProbeVisLabelsKey);
   if(probeBindings(self)[@"armed"] && !labels) {
    labels=[NSMutableArray array];objc_setAssociatedObject(self,&gProbeVisLabelsKey,labels,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -886,25 +886,25 @@ edit('NativeBridgeMetalFrontend.mm',
    [(id<MTLRenderCommandEncoder>)self setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(labels.count-1)*8];
   }
  }
- if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
    const uint8_t *ic=""")
 edit('NativeBridgeMetalFrontend.mm',
-     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
    NSLog(@"pandora-metal replay d%d""",
-     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: count this draw's samples
+     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // data-a-live: count this draw's samples
   NSMutableArray *labels=objc_getAssociatedObject(self,&gProbeVisLabelsKey);
   if(labels && labels.count<64) {
    [labels addObject:[NSString stringWithFormat:@"%@pipe %@",probeBindings(self)[@"armed"]?@"PROBED ":@"",probeBindings(self)[@"pipeid"]?:@"?"]];
    [(id<MTLRenderCommandEncoder>)self setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(labels.count-1)*8];
   }
  }
- if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state
   static std::atomic<int> told{0};
   const int nth=told.fetch_add(1);
   if(nth<8) {
@@ -916,16 +916,16 @@ edit('NativeBridgeMetalFrontend.mm',
    for(NSString *key in seen)if([key hasPrefix:@"~"] && [seen[key] count]==2) {""")
 # at completion: the counts
 edit('NativeBridgeMetalFrontend.mm',
-     """ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views""",
+     """ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // data-a-live: after completion, CPU and GPU views""",
      """ static std::atomic<int> visTold{0};
- for(NSArray *read in objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: samples counted per draw
+ for(NSArray *read in objc_getAssociatedObject(self,&gProbeVisKey)) {   // data-a-live: samples counted per draw
   if(visTold.fetch_add(1)>=8)break;
   const uint64_t *counts=(const uint64_t *)[(id<MTLBuffer>)read[0] contents];NSArray *labels=read[1];
   for(NSUInteger i=0;i<labels.count && counts;i++)
    probeLog([NSString stringWithFormat:@"visibility %d slot %lu",visTold.load(),(unsigned long)i],
             [NSString stringWithFormat:@"%llu samples",(unsigned long long)counts[i]],labels[i]);
  }
- if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views""")
+ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // data-a-live: after completion, CPU and GPU views""")
 edit('NativeBridgeMetalFrontend.mm',
      """ if(pandoraAstcProbe())probeBindings(self)[@"pipe"]=objc_getAssociatedObject(state,&gProbePipeKey)?:@"?";
 """,
@@ -934,7 +934,7 @@ edit('NativeBridgeMetalFrontend.mm',
 """)
 
 
-# ---- ios-pandora: the draws after the probed one too (bb41) --------------------------------------------------
+# ---- data-a-live: the draws after the probed one too (bb41) --------------------------------------------------
 # bb40: the App Library's ASTC draws make every fragment (1125x1046 samples each), and the next draws of the same
 # pass (two of b2a8f, blending off, then b7854) cover the same area: they leave it transparent. Every draw after the
 # probed one in its encoder now goes into the replay log with its whole state and its buffers at commit, so the pass
@@ -951,11 +951,11 @@ edit_all('NativeBridgeMetalFrontend.mm',
          """[probeBindings(self) removeObjectForKey:@"armed"];""",
          """[probeBindings(self) removeObjectForKey:@"armed"];probeBindings(self)[@"following"]=@YES;""", 2)
 edit_all('NativeBridgeMetalFrontend.mm',
-         """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state""",
-         """ if(pandoraAstcProbe() && (probeBindings(self)[@"armed"] || probeBindings(self)[@"following"])) {   // ios-pandora: the probed draw's whole state, and the draws after it""", 2)
+         """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // data-a-live: the probed draw's whole state""",
+         """ if(pandoraAstcProbe() && (probeBindings(self)[@"armed"] || probeBindings(self)[@"following"])) {   // data-a-live: the probed draw's whole state, and the draws after it""", 2)
 edit_all('NativeBridgeMetalFrontend.mm', """  if(nth<8) {""", """  if(nth<48) {""", 2)
 
-# ---- ios-pandora: buffer offsets moved after binding (bb42) --------------------------------------------------
+# ---- data-a-live: buffer offsets moved after binding (bb42) --------------------------------------------------
 # bb41 replayed on the PC: the draw after the App Library's ASTC draws (b2a8f) fills its quad with its vertex colour,
 # blending off, as Apple's own IR says; which quad and colour depends on where its vertices are. QuartzCore moves the
 # bound vertex buffer with setVertexBufferOffset between draws, which the replay log did not see. The probe's bindings
@@ -964,7 +964,7 @@ edit('NativeBridgeMetalFrontend.mm',
      """- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
 """,
      """- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
- if(pandoraAstcProbe()) {   // ios-pandora: the binding moves; the probe's draw log and watch follow it
+ if(pandoraAstcProbe()) {   // data-a-live: the binding moves; the probe's draw log and watch follow it
   NSMutableDictionary *seen=probeBindings(self);
   NSString *key=[NSString stringWithFormat:@"~%sbuffer%lu",probeStage(stage),(unsigned long)index];
   NSArray *bound=seen[key];
@@ -973,7 +973,7 @@ edit('NativeBridgeMetalFrontend.mm',
  }
 """)
 
-# ---- ios-pandora: 'b3a8' surfaces whose planes report no row bytes (bb43) -------------------------------------
+# ---- data-a-live: 'b3a8' surfaces whose planes report no row bytes (bb43) -------------------------------------
 # bb43: QuartzCore's own App Library draws render right on the phone (mtltest part 9). What stays empty is a layer
 # drawn from a full-screen two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10): the frontend refused it every
 # time (step 3) because IOSurfaceGetBytesPerRowOfPlane answers 0 for it here. Its allocation is exactly two linear
@@ -981,7 +981,7 @@ edit('NativeBridgeMetalFrontend.mm',
 # 13875456 -> 13877248, 1065x282 -> 1519616, as logged. Those planes are now computed when the surface gives none.
 edit('NativeBridgeMetalFrontend.mm',
      """static NBTexture *textureOnSurface(NBBuffer *buffer,""",
-     """// ios-pandora: a 'b3a8' surface's planes when it reports none (bb43): {offset0, row0, offset1, row1}, or false.
+     """// data-a-live: a 'b3a8' surface's planes when it reports none (bb43): {offset0, row0, offset1, row1}, or false.
 static bool pandoraB3a8Planes(IOSurfaceRef surface,size_t allocation,size_t planes[4]) {
  if(!surface || IOSurfaceGetPixelFormat(surface)!=0x62336138 || IOSurfaceGetPlaneCount(surface)!=2)return false;
  if(IOSurfaceGetBytesPerRowOfPlane(surface,0) && IOSurfaceGetBytesPerRowOfPlane(surface,1))return false;
@@ -1001,7 +1001,7 @@ edit('NativeBridgeMetalFrontend.mm',
   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));""",
      """ const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
  uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
- size_t computed[4];   // ios-pandora: a 'b3a8' surface without plane rows (bb43)
+ size_t computed[4];   // data-a-live: a 'b3a8' surface without plane rows (bb43)
  if(!chromaRow && pandoraB3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
  NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);""")
@@ -1011,6 +1011,6 @@ edit('NativeBridgeMetalFrontend.mm',
 """,
      """ uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
- size_t computed[4];   // ios-pandora: a 'b3a8' surface without plane rows (bb43)
+ size_t computed[4];   // data-a-live: a 'b3a8' surface without plane rows (bb43)
  if(!row && plane<2 && pandoraB3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
 """)

@@ -16,7 +16,7 @@ import sys
 p = pathlib.Path(sys.argv[1])
 s = p.read_bytes().decode()
 for old, new in (
-        ('    NativeAdrenoAbiMaxBuffers = 16,', '    NativeAdrenoAbiMaxBuffers = 128,   /* ios-pandora: 16 upstream (tools/turnip/abi_128.py) */'),
+        ('    NativeAdrenoAbiMaxBuffers = 16,', '    NativeAdrenoAbiMaxBuffers = 128,   /* data-a-live: 16 upstream (tools/turnip/abi_128.py) */'),
         ('static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");',
          'static_assert(sizeof(NativeAdrenoAbiSubmit) == 3104, "ABI submit layout");'),
 ):

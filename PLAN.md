@@ -98,7 +98,7 @@
 - **CPU 不支持 16K 页**（MMFR0 TGran16 = 0；UniXNU 作者也确认）。决定改走 4K 页：iOS 16 那一代内核（xnu-8796）用 BCM2837 的 4K 配置为底，加 ios-sweet/ios-fuxi 驱动补丁，移植 UniXNU 的 3 个 4K 补丁（native-4k-bootstrap-capacity / native-4k-user-abi / native-4k-signature-hash-cache，约 400 行）。
 
 ## 第 2 步进展（2026-10-22，模拟器）
-- 云端（GitHub Actions，私有仓库 ShueiTsuki/ios-pandora）编出 PANDORA 4K 内核；补丁 0082–0101 来自 ios-fuxi，0102–0110 是我们的：
+- 云端（GitHub Actions，私有仓库 ShueiTsuki/data-a-live，当时名为 ios-pandora）编出 PANDORA 4K 内核；补丁 0082–0101 来自 ios-fuxi，0102–0110 是我们的：
   0102 机型配置（4K）、0103–0105 UniXNU 4K 补丁（0103 手动合并）、0106 4K 编译修正、0107 iOS 地址布局（不用 macOS 大内存布局，否则 4K 启动页表够不着内核）、
   0108 不碰小米 13 的显示寄存器、0109 iOS 的内存分配器区域大小、0110 PANDORA 自己的机型/CPU 名。
 - tools/mkadt_pandora.py：17 Pro 的硬件说明生成器（手机模式填真实值，--qemu 为模拟器版）。
@@ -233,12 +233,15 @@
    - 另外要用 `porting.toml` 写结构化的移植记录，设备页由它生成。
    - 这份指南主要针对官方设备仓库。社区移植保留自己的来源，要先登记进组件目录，才能在格式 2 里用。页面没写截止时间。
    - 我们是独立的社区移植。先读全文和仓库规范，再决定 data-a-live 要不要也改成格式 2、要不要交移植记录。
+   - 结论（2026-10-25 读了 UniXNU 的 records.md 和 devices 索引）：格式 2 和由 `porting.toml` 生成的设备页只针对官方设备仓库（UniXNU-<设备名>）；社区移植的页面仍是手写的，迁移不要求我们改动。以后如果想交结构化的移植记录，再按 records.md 的分区（配置、启动、CPU、存储、显示、输入、GPU 等）写。
 2. 改名：UniXNU 的 pandora 设备页还把旧名 ios-pandora 列成一个仓库，和 data-a-live 并列，状态也还是旧进度（"GPU 内核驱动可执行命令缓冲"）。
    - 要改成只列 Data A Live，并更新状态。和用户那边待提的 UniXNU 文档 PR 一起改。
-   - 本仓库里旧名还剩：
-     - PLAN.md 一处；
-     - `tools/metal/adapt_ios16.py` 里补丁注释的 "ios-pandora" 标记。这些标记会写进 NativeMetal 的代码，改之前要先确认"已打过补丁"的检查不受影响；
-     - 本地文件夹名 ios_pandora。脚本里的路径都用它，改文件夹名要连路径一起改。
+   - 2026-10-25 已做：
+     - 文档分支 `docs/pandora-gpu`（ShueiTsuki/UniXNU）接到 UniXNU 最新 main 上，两行合成一行 Data A Live，状态更新到资源库正常、CPU 调频。等用户开 PR；
+     - PLAN.md 的旧名改了；
+     - `tools/metal/adapt_ios16.py` 和 `tools/turnip/abi_128.py` 的注释标记改成 "data-a-live"。在全新的 NativeMetal 源码上跑新旧两版，打出的代码除标记名外完全一样；
+     - README 和 LICENSE 里的 "formerly ios-pandora" 是有意保留的说明。
+   - 还剩本地文件夹名 ios_pandora：WSL 脚本里的路径都用它，改名要连路径一起改，而且不能在别的会话正用这个文件夹时改。
 
 ## 开机画面（2026-10-25 加入，以后做）
 现在开机时内核把日志文字画满屏幕，直到锁屏出现（0156/0157）。改成像 iPhone 一样：屏幕不画文字（日志照样写进日志文件），只显示一个开机 Logo 保持到锁屏；加开机参数在排查开机卡住时打开文字。Logo 两种做法：自己的 Logo 编进内核，一开机就显示，可公开；苹果 Logo 只能放在本机的固件包里，内核读到存储后才能画（开机先黑一两秒）。不影响开机速度（不画文字反而省一点时间）。
