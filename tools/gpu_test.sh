@@ -35,6 +35,7 @@ while [ $# -gt 0 ]; do
 	--pool) POOL=$2; shift 2 ;;            # MiB carved for the GPU (0: none)
 	--hz) HZ=$2; shift 2 ;;                # display copies per second (sweetfb_hz; ios_test.sh default 30)
 	--no-vktest) SWAP=; shift ;;          # vktest not run (launchd restarts it all boot, mtltest with it)
+	--metal-from) METAL_FROM=$2; shift 2 ;;  # a local plugin build (tools/metal/build_plugin_linux.sh OUT, WSL path)
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -82,6 +83,13 @@ else
 	python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
 fi
 (cd "$T" && sha256sum -c SHA256SUMS)
+if [ -n "${METAL_FROM:-}" ]; then
+	# The local build's plugin over the artifact's (mtltest stays the artifact's), checked against its own sums.
+	wsl -d Ubuntu-24.04 -u root -- bash -c "cd $METAL_FROM && sha256sum -c SHA256SUMS >&2 &&
+		cp NativeAdrenoMetal.bundle/NativeAdrenoMetal $(wslp "$T")/NativeAdrenoMetal &&
+		cp NativeAdrenoMetal.bundle/Info.plist $(wslp "$T")/NativeAdrenoMetal.Info.plist" || exit 1
+	echo "plugin from $METAL_FROM: $(sha256sum "$T/NativeAdrenoMetal" | cut -c1-16)"
+fi
 HAVE_METAL=0; [ -f "$T/NativeAdrenoMetal" ] && HAVE_METAL=1
 
 echo "== 2. trust cache"
