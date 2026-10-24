@@ -451,7 +451,19 @@ static int pandoraAstcProbeLevel() {   // ios-pandora: boot-arg pandora_astc_pro
  return level;
 }
 static bool pandoraAstcProbe() {return pandoraAstcProbeLevel()>=1;}
-static char gProbePassTargetKey,gProbeReadbackKey,gProbeSamplerKey,gProbeBindingsKey;
+static char gProbePassTargetKey,gProbeReadbackKey,gProbeSamplerKey,gProbeBindingsKey,gProbePipeKey;
+// ios-pandora: an encoder's bindings as the probe's draw log prints them (tools/metal/adapt_ios16.py).
+static NSMutableDictionary *probeBindings(id encoder) {
+ NSMutableDictionary *seen=objc_getAssociatedObject(encoder,&gProbeBindingsKey);
+ if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(encoder,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+ return seen;
+}
+static NSString *probeHex(const void *bytes,NSUInteger length,NSUInteger most) {
+ NSMutableString *hex=[NSMutableString stringWithFormat:@"%lu:",(unsigned long)length];
+ for(NSUInteger k=0;bytes && k<length && k<most;k++)[hex appendFormat:@"%s%02x",k%4?"":" ",((const uint8_t *)bytes)[k]];
+ return hex;
+}
+static const char *probeStage(uint32_t stage) {return stage==1?"v":stage==2?"f":"c";}
 """)
 edit('NativeBridgeMetalFrontend.mm',
      """ return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];""",
@@ -543,22 +555,15 @@ edit('NativeBridgeMetalFrontend.mm',
  return (id<MTLSamplerState>)sampler;""")
 edit('NativeBridgeMetalFrontend.mm',
      """ [self check:nmb_encoder_set_sampler(_handle,stage,""",
-     """ if(pandoraAstcProbe() && stage==2) {   // ios-pandora: remembered for the probe's draw log
-  NSMutableDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
-  if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+     """ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log
   NSString *what=sampler?objc_getAssociatedObject(sampler,&gProbeSamplerKey):nil;
-  seen[[NSString stringWithFormat:@"s%lu",(unsigned long)index]]=what?:(sampler?@"?":@"none");
+  probeBindings(self)[[NSString stringWithFormat:@"%ssampler%lu",probeStage(stage),(unsigned long)index]]=what?:(sampler?@"?":@"none");
  }
  [self check:nmb_encoder_set_sampler(_handle,stage,""")
 edit('NativeBridgeMetalFrontend.mm',
      """ [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""",
-     """ if(pandoraAstcProbe() && stage==2 && bytes) {   // ios-pandora: remembered for the probe's draw log
-  NSMutableDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
-  if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
-  NSMutableString *hex=[NSMutableString stringWithFormat:@"%lu:",(unsigned long)length];
-  for(NSUInteger k=0;k<length && k<64;k++)[hex appendFormat:@"%s%02x",k%4?"":" ",((const uint8_t *)bytes)[k]];
-  seen[[NSString stringWithFormat:@"b%lu",(unsigned long)index]]=hex;
- }
+     """ if(pandoraAstcProbe() && bytes)   // ios-pandora: remembered for the probe's draw log
+  probeBindings(self)[[NSString stringWithFormat:@"%sbytes%lu",probeStage(stage),(unsigned long)index]]=probeHex(bytes,length,256);
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""")
 edit('NativeBridgeMetalFrontend.mm',
      """   [targets addObject:target];
@@ -566,12 +571,88 @@ edit('NativeBridgeMetalFrontend.mm',
  }""",
      """   [targets addObject:target];
   }
-  static std::atomic<int> drawsTold{0};
-  if(drawsTold.fetch_add(1)<12) {
-   NSDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
-   NSMutableString *line=[NSMutableString string];
-   for(NSString *k in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])[line appendFormat:@" [%@ %@]",k,seen[k]];
-   NSLog(@"pandora-metal probe draw: texture %lux%lu format %lu at index %lu stage %u;%@",(unsigned long)texture.width,
-         (unsigned long)texture.height,(unsigned long)texture.pixelFormat,(unsigned long)index,stage,line);
-  }
+  probeBindings(self)[@"armed"]=[NSString stringWithFormat:@"%lux%lu f%lu at %s%lu",(unsigned long)texture.width,
+   (unsigned long)texture.height,(unsigned long)texture.pixelFormat,probeStage(stage),(unsigned long)index];
  }""")
+
+# ---- ios-pandora: the App Library draw's whole state, for a replay (bb36) -------------------------------------
+# With the probe, every binding an encoder makes is remembered (pipeline with its functions' constants and blend
+# state, buffers with their first bytes, bytes, samplers, textures); the first draw after a probed texture is bound
+# prints it all with the draw's own arguments and, for an indexed draw, its indices. mtltest replays it from this.
+edit('NativeBridgeMetalFrontend.mm',
+     """ objc_setAssociatedObject(state,&gCapNamesKey,[NSString stringWithFormat:@"%@ / %@ c0 f%lu blend %d",d.vertexFunction.name,d.fragmentFunction.name,
+  (unsigned long)d.colorAttachments[0].pixelFormat,(int)d.colorAttachments[0].blendingEnabled],OBJC_ASSOCIATION_RETAIN_NONATOMIC);""",
+     """ objc_setAssociatedObject(state,&gCapNamesKey,[NSString stringWithFormat:@"%@ / %@ c0 f%lu blend %d",d.vertexFunction.name,d.fragmentFunction.name,
+  (unsigned long)d.colorAttachments[0].pixelFormat,(int)d.colorAttachments[0].blendingEnabled],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ if(pandoraAstcProbe()) {   // ios-pandora: the whole pipeline, for the probe's draw log
+  NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+  NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
+  NSMutableString *full=[NSMutableString stringWithFormat:@"v %@ {%s} f %@ {%s} c0 %lu mask %lu blend %d %lu/%lu/%lu %lu/%lu/%lu samples %lu",
+   d.vertexFunction.name,vf?vf.constantsText.c_str():"",d.fragmentFunction.name,ff?ff.constantsText.c_str():"",(unsigned long)a.pixelFormat,
+   (unsigned long)a.writeMask,(int)a.blendingEnabled,(unsigned long)a.sourceRGBBlendFactor,(unsigned long)a.destinationRGBBlendFactor,
+   (unsigned long)a.rgbBlendOperation,(unsigned long)a.sourceAlphaBlendFactor,(unsigned long)a.destinationAlphaBlendFactor,
+   (unsigned long)a.alphaBlendOperation,(unsigned long)d.rasterSampleCount];
+  if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
+   MTLVertexAttributeDescriptor *at=v.attributes[i];if(at.format==MTLVertexFormatInvalid)continue;
+   [full appendFormat:@" a%u=%lu:%lu:%lu:%lu",i,(unsigned long)at.format,(unsigned long)at.offset,(unsigned long)at.bufferIndex,
+    (unsigned long)v.layouts[at.bufferIndex<31?at.bufferIndex:0].stride];
+  }
+  objc_setAssociatedObject(state,&gProbePipeKey,full,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ }""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(capturing())capture([NSString stringWithFormat:@"pipe %@ %@",capId(state),objc_getAssociatedObject(state,&gCapNamesKey)]);
+""",
+     """ if(capturing())capture([NSString stringWithFormat:@"pipe %@ %@",capId(state),objc_getAssociatedObject(state,&gCapNamesKey)]);
+ if(pandoraAstcProbe())probeBindings(self)[@"pipe"]=objc_getAssociatedObject(state,&gProbePipeKey)?:@"?";
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ [self check:nmb_encoder_set_buffer""",
+     """ if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+  const uint8_t *contents=buffer?(const uint8_t *)buffer.contents:nullptr;
+  probeBindings(self)[[NSString stringWithFormat:@"%sbuffer%lu",probeStage(stage),(unsigned long)index]]=!buffer?@"none":
+   [NSString stringWithFormat:@"len %lu off %lu %@",(unsigned long)buffer.length,(unsigned long)offset,
+    contents && offset<buffer.length?probeHex(contents+offset,buffer.length-offset,256):@"(no contents)"];
+ }
+ [self check:nmb_encoder_set_buffer""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(capturing())capture([NSString stringWithFormat:@"tex %s%lu %@",stage==1?"v":stage==2?"f":"c",(unsigned long)index,capTexture(texture)]);
+""",
+     """ if(capturing())capture([NSString stringWithFormat:@"tex %s%lu %@",stage==1?"v":stage==2?"f":"c",(unsigned long)index,capTexture(texture)]);
+ if(pandoraAstcProbe())probeBindings(self)[[NSString stringWithFormat:@"%stex%lu",probeStage(stage),(unsigned long)index]]=capTexture(texture);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(capturing())capture([NSString stringWithFormat:@"drawidx p%lu n%lu i%lu",(unsigned long)t,(unsigned long)n,(unsigned long)i]);
+""",
+     """ if(capturing())capture([NSString stringWithFormat:@"drawidx p%lu n%lu i%lu",(unsigned long)t,(unsigned long)n,(unsigned long)i]);
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   const uint8_t *ic=b?(const uint8_t *)b.contents:nullptr;const NSUInteger isz=k==MTLIndexTypeUInt16?2:4;
+   NSLog(@"pandora-metal replay %d: drawIndexed prim %lu count %lu type %lu offset %lu instances %lu baseVertex %ld indices %@",nth,
+    (unsigned long)t,(unsigned long)n,(unsigned long)k,(unsigned long)o,(unsigned long)i,(long)v,
+    ic && o<b.length?probeHex(ic+o,MIN(n*isz,b.length-o),96):@"(no contents)");
+   NSDictionary *seen=probeBindings(self);
+   for(NSString *key in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])NSLog(@"pandora-metal replay %d: %@ = %@",nth,key,seen[key]);
+  }
+  [probeBindings(self) removeObjectForKey:@"armed"];
+ }
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(capturing())capture([NSString stringWithFormat:@"draw p%lu v%lu+%lu i%lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i]);
+""",
+     """ if(capturing())capture([NSString stringWithFormat:@"draw p%lu v%lu+%lu i%lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i]);
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   NSLog(@"pandora-metal replay d%d: draw prim %lu start %lu count %lu instances %lu",nth,(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i);
+   NSDictionary *seen=probeBindings(self);
+   for(NSString *key in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])NSLog(@"pandora-metal replay d%d: %@ = %@",nth,key,seen[key]);
+  }
+  [probeBindings(self) removeObjectForKey:@"armed"];
+ }
+""")

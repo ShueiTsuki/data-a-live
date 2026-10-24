@@ -14,6 +14,9 @@
 #import <objc/message.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include "mtltest_metallib.h"   /* mtltest.metallib as bytes (xxd -i), made by build_plugin.sh */
@@ -46,6 +49,343 @@ check(const char *what, id object, NSError *error)
 	    error ? " " : "", error ? error.localizedDescription.UTF8String : "");
 	failures += object == nil;
 	return object == nil;
+}
+
+/* ---- part 7: the sweep (bb36) ----
+ * Every pairing of format x size x upload path x sampler draws a texture of four quadrant colours (red, green / blue,
+ * white; for block-compressed formats the quadrants follow whole blocks) into a 64x64 RGBA8 target; 16 points away
+ * from the quadrant edges are compared with what the format holds, and transparent pixels are counted. Then 16 1x1
+ * textures of distinct colours at fragment indices 0-15, each read back through its index. Once per boot (launchd
+ * restarts mtltest with vktest): the boot session's UUID is kept in /var/tmp/mtltest.sweep. */
+enum { SWEEP_W = 64 };
+static const float kQuadrant[4][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 }, { 1, 1, 1, 1 } };
+
+static unsigned
+quadrantOf(NSUInteger x, NSUInteger y, NSUInteger w, NSUInteger h, NSUInteger bw, NSUInteger bh)
+{
+	const NSUInteger bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh;
+	return (x / bw >= bx / 2 ? 1 : 0) + (y / bh >= by / 2 ? 2 : 0);
+}
+
+static uint16_t
+half1(float v)
+{
+	return v > 0.5f ? 0x3c00 : 0;
+}
+
+/* The texel bytes of `format` for colour c; false for a format the sweep does not make. Block formats: one LDR
+ * void-extent block. `channels` says which of r, g, b, a the format keeps (others read as 0, 0, 0, 1). */
+static bool
+encode(MTLPixelFormat format, const float c[4], uint8_t *out, NSUInteger *bytes, NSUInteger *bw, NSUInteger *bh,
+    unsigned *channels)
+{
+	const uint8_t r = c[0] > 0.5f ? 255 : 0, g = c[1] > 0.5f ? 255 : 0, b = c[2] > 0.5f ? 255 : 0, a = c[3] > 0.5f ? 255 : 0;
+	*bw = *bh = 1;
+	*channels = 15;
+	switch (format) {
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB:
+		out[0] = b, out[1] = g, out[2] = r, out[3] = a, *bytes = 4;
+		return true;
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB:
+		out[0] = r, out[1] = g, out[2] = b, out[3] = a, *bytes = 4;
+		return true;
+	case MTLPixelFormatR8Unorm:
+		out[0] = r, *bytes = 1, *channels = 1;
+		return true;
+	case MTLPixelFormatRG8Unorm:
+		out[0] = r, out[1] = g, *bytes = 2, *channels = 3;
+		return true;
+	case MTLPixelFormatRGBA16Float: {
+		const uint16_t h[4] = { half1(c[0]), half1(c[1]), half1(c[2]), half1(c[3]) };
+		memcpy(out, h, 8), *bytes = 8;
+		return true;
+	}
+	case MTLPixelFormatRGB10A2Unorm: {
+		const uint32_t v = (r ? 1023u : 0) | (g ? 1023u : 0) << 10 | (b ? 1023u : 0) << 20 | (a ? 3u : 0) << 30;
+		memcpy(out, &v, 4), *bytes = 4;
+		return true;
+	}
+	case MTLPixelFormatASTC_4x4_LDR:
+	case MTLPixelFormatASTC_4x4_sRGB:
+	case MTLPixelFormatASTC_8x8_LDR: {
+		const uint8_t head[8] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+		const uint16_t v[4] = { r ? 0xffff : 0, g ? 0xffff : 0, b ? 0xffff : 0, a ? 0xffff : 0 };
+		memcpy(out, head, 8), memcpy(out + 8, v, 8), *bytes = 16;
+		*bw = *bh = format == MTLPixelFormatASTC_8x8_LDR ? 8 : 4;
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+static bool
+sweepOncePerBoot(void)
+{
+	char uuid[64] = { 0 }, seen[64] = { 0 };
+	size_t size = sizeof(uuid) - 1;
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &size, NULL, 0) != 0) {
+		return true;
+	}
+	int fd = open("/var/tmp/mtltest.sweep", O_RDONLY);
+	if (fd >= 0) {
+		(void)read(fd, seen, sizeof(seen) - 1);
+		close(fd);
+		if (!strcmp(seen, uuid)) {
+			return false;
+		}
+	}
+	fd = open("/var/tmp/mtltest.sweep", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		(void)write(fd, uuid, strlen(uuid));
+		close(fd);
+	}
+	return true;
+}
+
+static void
+sweep(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+	if (!sweepOncePerBoot()) {
+		say("MTLTEST: part 7: sweep already ran this boot");
+		return;
+	}
+	NSError *err = nil;
+	MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+	rpd.vertexFunction = [lib newFunctionWithName:@"quad_vs"];
+	rpd.fragmentFunction = [lib newFunctionWithName:@"sweep_fs"];
+	rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+	MTLTextureDescriptor *rt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	    width:SWEEP_W height:SWEEP_W mipmapped:NO];
+	rt.usage = MTLTextureUsageRenderTarget;
+	rt.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> target = [dev newTextureWithDescriptor:rt];
+	id<MTLBuffer> out = [dev newBufferWithLength:SWEEP_W * SWEEP_W * 4 options:MTLResourceStorageModeShared];
+	if (check("part 7: sweep pipeline", rps, err) || check("part 7: target", target, nil)) {
+		return;
+	}
+	/* samplers: 0 nearest, 1 linear, 2 linear in pixel coordinates with clamp-to-zero, 3 nearest with repeat */
+	id<MTLSamplerState> samplers[4];
+	const char *samplerName[4] = { "nearest", "linear", "pixel", "repeat" };
+	for (unsigned s = 0; s < 4; s++) {
+		MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+		sd.minFilter = sd.magFilter = (s == 1 || s == 2) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+		sd.sAddressMode = sd.tAddressMode = s == 2 ? MTLSamplerAddressModeClampToZero :
+		    s == 3 ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
+		sd.normalizedCoordinates = s != 2;
+		samplers[s] = [dev newSamplerStateWithDescriptor:sd];
+		if (check("part 7: sampler", samplers[s], nil)) {
+			return;
+		}
+	}
+	const MTLPixelFormat formats[] = { MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatRGBA8Unorm,
+		MTLPixelFormatRGBA16Float, MTLPixelFormatR8Unorm, MTLPixelFormatRG8Unorm, MTLPixelFormatRGB10A2Unorm,
+		MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB, MTLPixelFormatASTC_8x8_LDR };
+	const NSUInteger sizes[][2] = { { 64, 64 }, { 333, 77 }, { 1125, 2436 }, { 2048, 2048 } };
+	const char *uploadName[4] = { "replace", "blit-private", "nocopy", "iosurface" };
+	unsigned cases = 0, good = 0, told = 0;
+	for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+		for (unsigned z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
+			for (unsigned u = 0; u < 4; u++) @autoreleasepool {
+				const MTLPixelFormat format = formats[f];
+				const NSUInteger w = sizes[z][0], h = sizes[z][1];
+				uint8_t texel[4][16];
+				NSUInteger tb = 0, bw = 1, bh = 1;
+				unsigned channels = 15;
+				for (unsigned q = 0; q < 4; q++) {
+					encode(format, kQuadrant[q], texel[q], &tb, &bw, &bh, &channels);
+				}
+				if (u == 3 && format != MTLPixelFormatBGRA8Unorm) {
+					continue;   /* IOSurface: BGRA only */
+				}
+				const NSUInteger cols = (w + bw - 1) / bw, rows = (h + bh - 1) / bh, row = cols * tb, length = row * rows;
+				MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h
+				    mipmapped:NO];
+				td.usage = MTLTextureUsageShaderRead;
+				id<MTLTexture> tex = nil;
+				IOSurfaceRef surface = NULL;
+				void *mem = NULL;
+				NSUInteger memLength = (length + 16383) & ~(NSUInteger)16383;
+				uint8_t *bytes = malloc(length);
+				for (NSUInteger y = 0; y < rows; y++) {
+					for (NSUInteger x = 0; x < cols; x++) {
+						memcpy(bytes + y * row + x * tb, texel[quadrantOf(x * bw, y * bh, w, h, bw, bh)], tb);
+					}
+				}
+				if (u == 0) {
+					tex = [dev newTextureWithDescriptor:td];
+					[tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bytes bytesPerRow:row];
+				} else if (u == 1) {
+					td.storageMode = MTLStorageModePrivate;
+					tex = [dev newTextureWithDescriptor:td];
+					id<MTLBuffer> up = [dev newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+					id<MTLCommandBuffer> cb = [queue commandBuffer];
+					id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+					[bl copyFromBuffer:up sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:length
+					    sourceSize:MTLSizeMake(w, h, 1) toTexture:tex destinationSlice:0 destinationLevel:0
+					    destinationOrigin:MTLOriginMake(0, 0, 0)];
+					[bl endEncoding];
+					[cb commit];
+					[cb waitUntilCompleted];
+				} else if (u == 2) {
+					SEL sel = NSSelectorFromString(@"newTextureWithBytesNoCopy:length:descriptor:deallocator:");
+					if ([(id)dev respondsToSelector:sel] && posix_memalign(&mem, 16384, memLength) == 0) {
+						memset(mem, 0, memLength);
+						memcpy(mem, bytes, length);
+						id (*make)(id, SEL, void *, NSUInteger, MTLTextureDescriptor *, void (^)(void *, NSUInteger)) =
+						    (id (*)(id, SEL, void *, NSUInteger, MTLTextureDescriptor *, void (^)(void *, NSUInteger)))objc_msgSend;
+						tex = make(dev, sel, mem, memLength, td, ^(void *p, NSUInteger l) { (void)l; free(p); });
+						if (!tex) {
+							free(mem);
+						}
+					}
+				} else {
+					const int pf = 'BGRA', bpe = 4;
+					NSDictionary *props = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h),
+						(id)kIOSurfaceBytesPerElement: @(bpe), (id)kIOSurfacePixelFormat: @(pf) };
+					surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+					if (surface) {
+						IOSurfaceLock(surface, 0, NULL);
+						uint8_t *base = IOSurfaceGetBaseAddress(surface);
+						const size_t stride = IOSurfaceGetBytesPerRow(surface);
+						for (NSUInteger y = 0; y < h; y++) {
+							memcpy(base + y * stride, bytes + y * row, row);
+						}
+						IOSurfaceUnlock(surface, 0, NULL);
+						tex = [dev newTextureWithDescriptor:td iosurface:surface plane:0];
+					}
+				}
+				free(bytes);
+				cases++;
+				if (!tex) {
+					say("MTLTEST: part 7: %lu %lux%lu %s: no texture", (unsigned long)format, (unsigned long)w, (unsigned long)h,
+					    uploadName[u]);
+					if (surface) {
+						CFRelease(surface);
+					}
+					continue;
+				}
+				char result[160] = "";
+				bool allGood = true;
+				for (unsigned s = 0; s < 4; s++) {
+					const float scale[2] = { s == 2 ? (float)w : 1.0f, s == 2 ? (float)h : 1.0f };
+					MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+					pass.colorAttachments[0].texture = target;
+					pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+					pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+					pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+					id<MTLCommandBuffer> cb = [queue commandBuffer];
+					id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+					[enc setRenderPipelineState:rps];
+					[enc setFragmentTexture:tex atIndex:0];
+					[enc setFragmentSamplerState:samplers[s] atIndex:0];
+					[enc setFragmentBytes:scale length:sizeof(scale) atIndex:0];
+					[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+					[enc endEncoding];
+					id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+					[bl copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+					    sourceSize:MTLSizeMake(SWEEP_W, SWEEP_W, 1) toBuffer:out destinationOffset:0
+					    destinationBytesPerRow:SWEEP_W * 4 destinationBytesPerImage:SWEEP_W * SWEEP_W * 4];
+					[bl endEncoding];
+					[cb commit];
+					[cb waitUntilCompleted];
+					const uint8_t *px = (const uint8_t *)out.contents;
+					unsigned bad = 0, clear = 0;
+					for (unsigned i = 0; i < SWEEP_W * SWEEP_W; i++) {
+						clear += px[i * 4 + 3] == 0;
+					}
+					static const unsigned points[4] = { 8, 24, 40, 56 };
+					for (unsigned pj = 0; pj < 4; pj++) {
+						for (unsigned pi = 0; pi < 4; pi++) {
+							const unsigned i = points[pi], j = points[pj];
+							const NSUInteger tx = (NSUInteger)((i + 0.5) / SWEEP_W * w), ty = (NSUInteger)((j + 0.5) / SWEEP_W * h);
+							const float *c = kQuadrant[quadrantOf(tx, ty, w, h, bw, bh)];
+							const uint8_t *p = px + (j * SWEEP_W + i) * 4;
+							for (unsigned k = 0; k < 4; k++) {
+								const int want = (channels >> k & 1) ? (c[k] > 0.5f ? 255 : 0) : (k == 3 ? 255 : 0);
+								if (abs((int)p[k] - want) > 3) {
+									bad++;
+									break;
+								}
+							}
+						}
+					}
+					const bool ok = bad == 0 && clear == 0 && cb.status == MTLCommandBufferStatusCompleted;
+					allGood &= ok;
+					if (!ok) {
+						const size_t used = strlen(result);
+						snprintf(result + used, sizeof(result) - used, " %s: %u of 16 wrong, %u clear, status %ld, centre %02x%02x%02x%02x;",
+						    samplerName[s], bad, clear, (long)cb.status, px[(32 * SWEEP_W + 16) * 4], px[(32 * SWEEP_W + 16) * 4 + 1],
+						    px[(32 * SWEEP_W + 16) * 4 + 2], px[(32 * SWEEP_W + 16) * 4 + 3]);
+					}
+				}
+				good += allGood;
+				if (!allGood && told++ < 150) {
+					say("MTLTEST: part 7: %lu %lux%lu %s FAIL:%s", (unsigned long)format, (unsigned long)w, (unsigned long)h,
+					    uploadName[u], result);
+				}
+				failures += !allGood;
+				tex = nil;
+				if (surface) {
+					CFRelease(surface);
+				}
+			}
+		}
+	}
+	say("MTLTEST: part 7: sweep %u of %u textures right with all 4 samplers", good, cases);
+
+	/* fragment texture indices 0-15 */
+	rpd.fragmentFunction = [lib newFunctionWithName:@"index_fs"];
+	err = nil;
+	id<MTLRenderPipelineState> ips = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+	if (check("part 7: index pipeline", ips, err)) {
+		return;
+	}
+	id<MTLTexture> one[16];
+	for (unsigned k = 0; k < 16; k++) {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1
+		    height:1 mipmapped:NO];
+		d.usage = MTLTextureUsageShaderRead;
+		one[k] = [dev newTextureWithDescriptor:d];
+		const uint8_t c[4] = { (uint8_t)(k * 16 + 8), (uint8_t)(255 - k * 16), (uint8_t)(k * 8), 255 };
+		[one[k] replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:c bytesPerRow:4];
+	}
+	char wrong[256] = "";
+	unsigned right = 0;
+	for (uint32_t which = 0; which < 16; which++) {
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = target;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+		[enc setRenderPipelineState:ips];
+		for (unsigned k = 0; k < 16; k++) {
+			[enc setFragmentTexture:one[k] atIndex:k];
+		}
+		[enc setFragmentBytes:&which length:sizeof(which) atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[enc endEncoding];
+		id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+		[bl copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1)
+		    toBuffer:out destinationOffset:0 destinationBytesPerRow:4 destinationBytesPerImage:4];
+		[bl endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		const uint8_t *p = (const uint8_t *)out.contents;
+		if (p[0] == (uint8_t)(which * 16 + 8) && p[1] == (uint8_t)(255 - which * 16) && p[2] == (uint8_t)(which * 8)) {
+			right++;
+		} else {
+			const size_t used = strlen(wrong);
+			snprintf(wrong + used, sizeof(wrong) - used, " %u->%02x%02x%02x", which, p[0], p[1], p[2]);
+		}
+	}
+	say("MTLTEST: part 7: texture indices %u of 16 right%s%s", right, right == 16 ? "" : " FAIL:", wrong);
+	failures += right != 16;
 }
 
 static void
@@ -399,6 +739,7 @@ run(void)
 				failures += redPixels != 4096 || cb.status != MTLCommandBufferStatusCompleted;
 			}
 		}
+		sweep(dev, queue, lib);
 }
 
 int
