@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 ShueiTsuki and ios-pandora contributors
+Copyright (c) 2026 ShueiTsuki and Data A Live contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

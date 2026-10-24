@@ -1,8 +1,8 @@
-# ios-pandora
+# Data A Live
 
 在小米 17 Pro（代号 pandora，骁龙 8 Elite Gen 5 / SM8850）上原生运行 iPhone X 的 iOS 16.7，内核是自己编译的苹果开源内核 xnu-8796。
 
-> Running iPhone X's iOS 16.7 natively on the Xiaomi 17 Pro (pandora, SM8850) with a self-built xnu-8796 kernel. Experimental research project; documentation is in Chinese.
+> Running iPhone X's iOS 16.7 natively on the Xiaomi 17 Pro (pandora, SM8850) with a self-built xnu-8796 kernel. Experimental research project; documentation is in Chinese. Formerly `ios-pandora`.
 
 **这是实验性的研究项目，不是能日常使用的系统。** 仓库里只有补丁、驱动和工具，没有苹果的系统文件，也没有手机固件。
 

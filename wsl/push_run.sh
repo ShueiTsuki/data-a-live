@@ -8,5 +8,5 @@ git commit -q -m "$1
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 timeout 120 git push -q origin main && git log --oneline -1
-gh workflow run xnu.yml -R ShueiTsuki/ios-pandora -f machine_config=PANDORA
-sleep 10; gh run list -R ShueiTsuki/ios-pandora -L 1 --json databaseId,status --jq '.[0]|"\(.databaseId) \(.status)"'
+gh workflow run xnu.yml -R ShueiTsuki/data-a-live -f machine_config=PANDORA
+sleep 10; gh run list -R ShueiTsuki/data-a-live -L 1 --json databaseId,status --jq '.[0]|"\(.databaseId) \(.status)"'

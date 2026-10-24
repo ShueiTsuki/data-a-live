@@ -8,6 +8,6 @@ git commit -q -m "Add ios-sweet XNU patch series and manual-only macOS build wor
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git push -q origin main
 git log --oneline -1
-gh workflow run xnu.yml -R ShueiTsuki/ios-pandora
+gh workflow run xnu.yml -R ShueiTsuki/data-a-live
 sleep 8
-gh run list -R ShueiTsuki/ios-pandora -L 1
+gh run list -R ShueiTsuki/data-a-live -L 1

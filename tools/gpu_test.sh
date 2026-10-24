@@ -47,7 +47,7 @@ echo "== 1. Turnip artifact"
 rm -rf "$T" && mkdir -p "$T"
 if [ "$ZIP" = release ]; then
 	# The rolling turnip-ci pre-release (turnip.yml): public, no sign-in needed.
-	R=https://github.com/ShueiTsuki/ios-pandora/releases/download/turnip-ci
+	R=https://github.com/ShueiTsuki/data-a-live/releases/download/turnip-ci
 	for f in libvulkan_freedreno.dylib vktest SHA256SUMS BUILD.txt; do
 		curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
 	done

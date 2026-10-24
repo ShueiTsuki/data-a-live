@@ -5,19 +5,19 @@
 set -u
 ID=$1; N=$2; WHAT=${3:-kernel}; D=/opt/work/run$N
 while :; do
-	st=$(gh run view $ID -R ShueiTsuki/ios-pandora --json status,conclusion --jq '.status+" "+.conclusion' 2>/dev/null)
+	st=$(gh run view $ID -R ShueiTsuki/data-a-live --json status,conclusion --jq '.status+" "+.conclusion' 2>/dev/null)
 	case $st in completed*) break ;; esac
 	sleep 10
 done
-echo "conclusion: ${st#completed }  duration_ms: $(gh api repos/ShueiTsuki/ios-pandora/actions/runs/$ID/timing --jq .run_duration_ms)"
+echo "conclusion: ${st#completed }  duration_ms: $(gh api repos/ShueiTsuki/data-a-live/actions/runs/$ID/timing --jq .run_duration_ms)"
 rm -rf $D && mkdir -p $D && cd $D
 if [ "$WHAT" = all ]; then
-	gh run download $ID -R ShueiTsuki/ios-pandora -D . > /dev/null 2>&1
+	gh run download $ID -R ShueiTsuki/data-a-live -D . > /dev/null 2>&1
 else
-	gh run download $ID -R ShueiTsuki/ios-pandora -n xnu-kernel -D xnu-kernel > /dev/null 2>&1
+	gh run download $ID -R ShueiTsuki/data-a-live -n xnu-kernel -D xnu-kernel > /dev/null 2>&1
 fi
 if [ "${st#completed }" != success ] || [ "$WHAT" = all ]; then
-	gh run view $ID -R ShueiTsuki/ios-pandora --log > run$N.full.log 2>&1
+	gh run view $ID -R ShueiTsuki/data-a-live --log > run$N.full.log 2>&1
 	grep -E ' error: |Undefined symbols|ld: error' run$N.full.log | grep -v -E 'patch does not apply|already exists|Skipping patch' | sed 's/.*Z //' | head -20
 fi
 ls xnu-kernel 2>/dev/null; cat xnu-kernel/SHA256SUMS 2>/dev/null
