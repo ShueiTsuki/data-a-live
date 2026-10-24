@@ -814,3 +814,120 @@ edit('NativeBridgeMetalFrontend.mm',
           (unsigned long)d.mipmapLevelCount,(unsigned long)d.sampleCount,(int)d.allowGPUOptimizedContents,
           bytes,(unsigned long)length);
    if(probe && bb==16 && d.width>=512) {""")
+
+# ---- ios-pandora: did the App Library draw make any fragment? (bb40) -------------------------------------------
+# QuartzCore's fragment function forces the sampled alpha to 1, yet the App Library's target holds transparent black
+# where the image goes: the draw makes no fragment, or one of its inputs scales the colour to nothing. With the probe,
+# every render pass without its own visibility buffer gets one, and from the probed draw on each draw of that encoder
+# counts its samples into its own slot (Metal's counting visibility results), logged at completion with the pipeline
+# of each slot. The raster state (cull, winding, fill), the depth/stencil state and the index buffer at commit join
+# the replay log.
+edit('NativeBridgeMetalFrontend.mm',
+     """static char gProbeWatchKey;""",
+     """static char gProbeWatchKey,gProbeVisKey,gProbeVisLabelsKey,gProbeDepthKey;""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(d.visibilityResultBuffer) {
+  if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]])""",
+     """ NBBuffer *probeVisibility=nil;   // ios-pandora: a visibility buffer of the probe's own for this pass
+ if(pandoraAstcProbe() && !d.visibilityResultBuffer && gDeviceObject) {
+  probeVisibility=(NBBuffer *)[(id<MTLDevice>)gDeviceObject newBufferWithLength:64*8 options:MTLResourceStorageModeShared];
+  if(probeVisibility) {
+   memset(probeVisibility.contents,0,64*8);
+   [_resourceOwners addObject:probeVisibility];
+   pass.visibility=probeVisibility.handle;
+  }
+ }
+ if(d.visibilityResultBuffer) {
+  if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]])""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(made && pandoraAstcProbe()) {   // ios-pandora: the pass, for the probe's draw log
+""",
+     """ if(made && probeVisibility)objc_setAssociatedObject(made,&gProbeVisKey,probeVisibility,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ if(made && pandoraAstcProbe()) {   // ios-pandora: the pass, for the probe's draw log
+""")
+# depth/stencil states keep their descriptor's description; the encoder remembers the bound one and the raster state
+edit('NativeBridgeMetalFrontend.mm',
+     """ NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;return (id<MTLDepthStencilState>)state;""",
+     """ NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;
+ if(pandoraAstcProbe())objc_setAssociatedObject(state,&gProbeDepthKey,[NSString stringWithFormat:@"depth compare %lu write %d stencil front %lu/%lu/%lu/%lu back %lu/%lu/%lu/%lu",
+  (unsigned long)d.depthCompareFunction,(int)d.depthWriteEnabled,(unsigned long)d.frontFaceStencil.stencilCompareFunction,
+  (unsigned long)d.frontFaceStencil.stencilFailureOperation,(unsigned long)d.frontFaceStencil.depthFailureOperation,
+  (unsigned long)d.frontFaceStencil.depthStencilPassOperation,(unsigned long)d.backFaceStencil.stencilCompareFunction,
+  (unsigned long)d.backFaceStencil.stencilFailureOperation,(unsigned long)d.backFaceStencil.depthFailureOperation,
+  (unsigned long)d.backFaceStencil.depthStencilPassOperation],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ return (id<MTLDepthStencilState>)state;""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ [self check:nmb_render_set_depth_stencil(self.handle,""",
+     """ if(pandoraAstcProbe())probeBindings(self)[@"depthstencil"]=state?(objc_getAssociatedObject(state,&gProbeDepthKey)?:@"?"):@"none";
+ [self check:nmb_render_set_depth_stencil(self.handle,""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ [self check:nmb_render_set_raster(self.handle,""",
+     """ if(pandoraAstcProbe())probeBindings(self)[@"raster"]=[NSString stringWithFormat:@"cull %llu winding %llu fill %llu",
+  cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue];
+ [self check:nmb_render_set_raster(self.handle,""")
+# counting: the probed draw takes slot 0, every later draw of the encoder the next slot
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   const uint8_t *ic=""",
+     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: count this draw's samples
+  NSMutableArray *labels=objc_getAssociatedObject(self,&gProbeVisLabelsKey);
+  if(probeBindings(self)[@"armed"] && !labels) {
+   labels=[NSMutableArray array];objc_setAssociatedObject(self,&gProbeVisLabelsKey,labels,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   NSMutableArray *reads=objc_getAssociatedObject(self.commandBuffer,&gProbeVisKey);
+   if(!reads){reads=[NSMutableArray array];objc_setAssociatedObject(self.commandBuffer,&gProbeVisKey,reads,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+   [reads addObject:@[objc_getAssociatedObject(self,&gProbeVisKey),labels]];
+  }
+  if(labels && labels.count<64) {
+   [labels addObject:[NSString stringWithFormat:@"%@pipe %@",probeBindings(self)[@"armed"]?@"PROBED ":@"",probeBindings(self)[@"pipeid"]?:@"?"]];
+   [(id<MTLRenderCommandEncoder>)self setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(labels.count-1)*8];
+  }
+ }
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   const uint8_t *ic=""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   NSLog(@"pandora-metal replay d%d""",
+     """ if(pandoraAstcProbe() && objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: count this draw's samples
+  NSMutableArray *labels=objc_getAssociatedObject(self,&gProbeVisLabelsKey);
+  if(labels && labels.count<64) {
+   [labels addObject:[NSString stringWithFormat:@"%@pipe %@",probeBindings(self)[@"armed"]?@"PROBED ":@"",probeBindings(self)[@"pipeid"]?:@"?"]];
+   [(id<MTLRenderCommandEncoder>)self setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(labels.count-1)*8];
+  }
+ }
+ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state
+  static std::atomic<int> told{0};
+  const int nth=told.fetch_add(1);
+  if(nth<8) {
+   NSLog(@"pandora-metal replay d%d""")
+# the index buffer at commit, with the other watched buffers
+edit('NativeBridgeMetalFrontend.mm',
+     """   for(NSString *key in seen)if([key hasPrefix:@"~"] && [seen[key] count]==2) {""",
+     """   if(b)[watch addObject:@[b,@(o),[NSString stringWithFormat:@"%d index+%lu",nth,(unsigned long)o]]];
+   for(NSString *key in seen)if([key hasPrefix:@"~"] && [seen[key] count]==2) {""")
+# at completion: the counts
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views""",
+     """ static std::atomic<int> visTold{0};
+ for(NSArray *read in objc_getAssociatedObject(self,&gProbeVisKey)) {   // ios-pandora: samples counted per draw
+  if(visTold.fetch_add(1)>=8)break;
+  const uint64_t *counts=(const uint64_t *)[(id<MTLBuffer>)read[0] contents];NSArray *labels=read[1];
+  for(NSUInteger i=0;i<labels.count && counts;i++)
+   probeLog([NSString stringWithFormat:@"visibility %d slot %lu",visTold.load(),(unsigned long)i],
+            [NSString stringWithFormat:@"%llu samples",(unsigned long long)counts[i]],labels[i]);
+ }
+ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(pandoraAstcProbe())probeBindings(self)[@"pipe"]=objc_getAssociatedObject(state,&gProbePipeKey)?:@"?";
+""",
+     """ if(pandoraAstcProbe())probeBindings(self)[@"pipe"]=objc_getAssociatedObject(state,&gProbePipeKey)?:@"?";
+ if(pandoraAstcProbe())probeBindings(self)[@"pipeid"]=capId(state);
+""")
