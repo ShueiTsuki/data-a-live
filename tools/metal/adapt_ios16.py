@@ -90,10 +90,36 @@ edit('NativeBridgeMetalFrontend.mm',
      """ (void)bytes;(void)length;(void)d;(void)deallocator;
  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
  return nil;""",
-     """ (void)deallocator;
+     """ // ios-pandora: a one-level 2D texture in rows of texels or blocks (bb25: QuartzCore in backboardd asks for the App
+ // Library's full-screen ASTC 4x4 image, shader-read only, 282 x 609 blocks of 16 bytes). Made as an ordinary texture
+ // and filled from the bytes once; the caller's deallocator runs when the texture goes. A read-only texture sees no
+ // later writes to the bytes, which a texture over them would.
+ static const uint8_t astc[16][2]={{4,2},{4,4},{5,4},{5,5},{6,5},{6,6},{8,4},{8,5},{8,6},{8,8},{10,5},{10,6},{10,8},{10,10},{12,10},{12,12}};
+ const NSUInteger format=d.pixelFormat;
+ NSUInteger bw=1,bh=1,bb=0;
+ if(format>=185 && format<=200){bw=astc[format-185][0];bh=astc[format-185][1];bb=16;}
+ else if(format>=203 && format<=218){bw=astc[format-203][0];bh=astc[format-203][1];bb=16;}
+ else switch(format){case 1:case 10:bb=1;break;case 30:bb=2;break;case 70:case 71:case 80:case 81:bb=4;break;case 115:bb=8;break;default:break;}
+ const NSUInteger rowBytes=(d.width+bw-1)/bw*bb,rows=(d.height+bh-1)/bh;
+ if(bytes && bb && d.textureType==MTLTextureType2D && d.mipmapLevelCount==1 && d.arrayLength==1 && d.depth==1 &&
+    d.sampleCount==1 && length>=rowBytes*rows) {
+  id<MTLTexture> texture=[(id<MTLDevice>)self newTextureWithDescriptor:d];
+  if(texture) {
+   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
+   if(deallocator) {
+    static char ownerKey;
+    NSData *owner=[[NSData alloc] initWithBytesNoCopy:bytes length:length deallocator:^(void *b,NSUInteger l){deallocator(b,l);}];
+    objc_setAssociatedObject(texture,&ownerKey,owner,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   }
+   static std::atomic<uint32_t> made{0};
+   if(++made<=5)NSLog(@"pandora-metal nocopy: made fmt %lu %lux%lu, %lu bytes per row, copied once",(unsigned long)format,
+                      (unsigned long)d.width,(unsigned long)d.height,(unsigned long)rowBytes);
+   return texture;
+  }
+ }
  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
- // ios-pandora: what is asked for (the App Library renders black, bb22): the descriptor, the memory and the
- // callers (image + offset), the first 20 calls and then one in 100.
+ // ios-pandora: what is asked for and still refused: the descriptor, the memory and the callers (image + offset), the
+ // first 20 calls and then one in 100.
  static std::atomic<uint32_t> asked{0};
  const uint32_t nth=++asked;
  if(nth<=20 || nth%100==0) {
