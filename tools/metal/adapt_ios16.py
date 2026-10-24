@@ -87,6 +87,34 @@ edit('NativeBridgeMetalFrontend.mm',
   case 83:case 87:return 24;
   default:return 0;""")
 edit('NativeBridgeMetalFrontend.mm',
+     """ (void)bytes;(void)length;(void)d;(void)deallocator;
+ NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
+ return nil;""",
+     """ (void)deallocator;
+ NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
+ // ios-pandora: what is asked for (the App Library renders black, bb22): the descriptor, the memory and the
+ // callers (image + offset), the first 20 calls and then one in 100.
+ static std::atomic<uint32_t> asked{0};
+ const uint32_t nth=++asked;
+ if(nth<=20 || nth%100==0) {
+  void *frames[10];const int n=backtrace(frames,10);
+  std::string callers;char item[96];
+  for(int i=1;i<n;i++) {
+   Dl_info info{};
+   if(!dladdr(frames[i],&info) || !info.dli_fname)continue;
+   const char *slash=strrchr(info.dli_fname,'/');
+   snprintf(item,sizeof item," %s+%lx",slash?slash+1:info.dli_fname,(unsigned long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));
+   callers+=item;
+  }
+  NSLog(@"pandora-metal nocopy #%u: fmt %lu type %lu %lux%lux%lu mips %lu array %lu usage %lx storage %lu opts %lx"
+        " bytes %p (page +%lx) length %lu (per row if one plane: %lu) |%s",nth,(unsigned long)d.pixelFormat,
+        (unsigned long)d.textureType,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,
+        (unsigned long)d.mipmapLevelCount,(unsigned long)d.arrayLength,(unsigned long)d.usage,(unsigned long)d.storageMode,
+        (unsigned long)d.resourceOptions,bytes,(unsigned long)((uintptr_t)bytes&0x3fff),(unsigned long)length,
+        (unsigned long)(d.height?length/d.height:0),callers.c_str());
+ }
+ return nil;""")
+edit('NativeBridgeMetalFrontend.mm',
      """ if(!base || class_getInstanceSize(base)!=536){""",
      """ // ios-pandora: 528 bytes on iOS 16.7 (ios-fuxi docs-lanes/metal.md), 536 on iPadOS 17.7.11.
  if(!base || (class_getInstanceSize(base)!=536 && class_getInstanceSize(base)!=528)){""")

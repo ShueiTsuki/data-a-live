@@ -3079,6 +3079,110 @@ gpu_watch(void)
 	}
 }
 
+/*
+ * Patch 0197: GPU frequency scaling. Linux a8xx_gpu_busy and msm_devfreq with the simple_ondemand
+ * governor: the GMU's CX power counter 0 counts XO (19.2 MHz) ticks while the GPU is busy
+ * (a8xx hw_init: GPU_GMU_AO_GPU_CX_BUSY_MASK 0xff000000, POWER_COUNTER_SELECT_XOCLK_0 countable 5,
+ * POWER_COUNTER_ENABLE). Every 50 ms: above 90 % busy, the top allowed level; else the lowest
+ * level whose frequency covers what was used at 85 % (simple_ondemand's 90 / 5 defaults). The
+ * vote is a6xx_hfi_set_freq's HFI_H2F_MSG_GX_BW_PERF_VOTE, as at level 8; bandwidth goes with the
+ * level (perf index scaled onto the bandwidth table; the phone DT's per-level bus-freq is not
+ * kept). Off with pandora_gpu_perf (a fixed level, 0196); pandora_gpu_perf_max caps it (default 18).
+ * A line every 10 s: busy share, the levels used, changes. No temperature limit yet.
+ */
+#define GMU_AO_GPU_CX_BUSY_MASK       0x23b0eu
+#define GMU_POWER_COUNTER_ENABLE_A8   0x1fc10u
+#define GMU_POWER_COUNTER_SELECT_XO0  0x1fc40u
+#define GMU_POWER_COUNTER_XO0_L       0x1fca0u
+#define GMU_POWER_COUNTER_XO0_H       0x1fca1u
+
+static uint64_t
+gpu_busy_ticks(void)
+{
+	uint32_t hi = gmu_rd(GMU_POWER_COUNTER_XO0_H), lo = gmu_rd(GMU_POWER_COUNTER_XO0_L);
+	uint32_t hi2 = gmu_rd(GMU_POWER_COUNTER_XO0_H);
+	if (hi2 != hi) {
+		lo = gmu_rd(GMU_POWER_COUNTER_XO0_L);
+	}
+	return ((uint64_t)hi2 << 32) | lo;
+}
+
+static bool
+gpu_vote(uint32_t perf)
+{
+	static uint32_t vote[4];
+	const uint32_t bwi = MAX(1u, MIN((uint32_t)NBW - 1, (perf * ((uint32_t)NBW - 1) + NGPU - 2) / ((uint32_t)NGPU - 1)));
+	vote[1] = 1;            /* ack_type: blocking */
+	vote[2] = perf;
+	vote[3] = bwi;
+	return hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, 4);
+}
+
+static void
+gpu_dcvs_thread(void *arg, wait_result_t result)
+{
+	(void)arg;
+	(void)result;
+	uint32_t top = NGPU - 1, cur = 1;
+	(void)PE_parse_boot_argn("pandora_gpu_perf_max", &top, sizeof(top));
+	top = MAX(1u, MIN(top, (uint32_t)NGPU - 1));
+	gmu_wr(GMU_AO_GPU_CX_BUSY_MASK, 0xff000000u);
+	gmu_wr(GMU_POWER_COUNTER_SELECT_XO0, (gmu_rd(GMU_POWER_COUNTER_SELECT_XO0) & ~0xffu) | (1u << 5));
+	gmu_wr(GMU_POWER_COUNTER_ENABLE_A8, 1);
+	printf("PANDORA GPU DCVS: on, levels 1..%u (%u..%u MHz), every 50 ms\n", top, gpu_opps[0].hz / 1000000,
+	    gpu_opps[top - 1].hz / 1000000);
+	uint64_t last_busy = gpu_busy_ticks(), last_t = mach_absolute_time();
+	uint64_t win_busy = 0, win_ns = 0, at_level[NGPU] = {};
+	uint32_t changes = 0, failed = 0, ticks = 0;
+	for (;;) {
+		gpu_sleep(50);
+		const uint64_t busy = gpu_busy_ticks(), t = mach_absolute_time();
+		uint64_t ns;
+		absolutetime_to_nanoseconds(t - last_t, &ns);
+		/* XO ticks to ns: 19.2 MHz, 52.083 ns per tick */
+		const uint64_t busy_ns = (busy - last_busy) * 625 / 12;
+		last_busy = busy;
+		last_t = t;
+		const uint64_t pct = ns ? MIN(100ull, busy_ns * 100 / ns) : 0;
+		win_busy += busy_ns;
+		win_ns += ns;
+		at_level[cur] += ns;
+		uint32_t want;
+		if (pct > 90) {
+			want = top;
+		} else {
+			/* the frequency that would have been 85 % busy */
+			const uint64_t need = (uint64_t)gpu_opps[cur - 1].hz * pct / 85;
+			for (want = 1; want < top && gpu_opps[want - 1].hz < need; want++) {
+			}
+		}
+		if (want != cur) {
+			if (gpu_vote(want)) {
+				cur = want;
+				changes++;
+			} else {
+				failed++;
+			}
+		}
+		if (++ticks % 200 == 0) {   /* 10 s */
+			char used[160];
+			int n = 0;
+			used[0] = 0;
+			for (uint32_t l = 1; l < NGPU && n >= 0 && n < (int)sizeof(used); l++) {
+				if (win_ns && at_level[l] * 100 / win_ns >= 1) {
+					n += snprintf(used + n, sizeof(used) - n, " %u:%llu%%", gpu_opps[l - 1].hz / 1000000,
+					    at_level[l] * 100 / win_ns);
+				}
+				at_level[l] = 0;
+			}
+			printf("PANDORA GPU DCVS: busy %llu%%, MHz:time%s, %u changes, %u failed, now %u MHz\n",
+			    win_ns ? win_busy * 100 / win_ns : 0, used, changes, failed, gpu_opps[cur - 1].hz / 1000000);
+			win_busy = win_ns = 0;
+			changes = failed = 0;
+		}
+	}
+}
+
 static void
 gpu_thread(void *arg, wait_result_t result)
 {
@@ -3146,6 +3250,13 @@ gpu_thread(void *arg, wait_result_t result)
 															    u ? "done" : "stopped");
 															int metal = 0;
 															(void)PE_parse_boot_argn("pandora_gpu_metal", &metal, sizeof(metal));
+															uint32_t fixed = 0;
+															if (u && !PE_parse_boot_argn("pandora_gpu_perf", &fixed, sizeof(fixed))) {
+																thread_t dcvs;   /* 0197 */
+																if (kernel_thread_start(gpu_dcvs_thread, NULL, &dcvs) == KERN_SUCCESS) {
+																	thread_deallocate(dcvs);
+																}
+															}
 															if (u && metal) {
 																gpu_watch();
 															}
