@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 05aca95..2bcb2ca 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1755,7 +1755,8 @@ sweet_log_put(const char *c, int size)
+ #endif
+     }
+ #if defined(FUXI)
+-    __asm__ volatile("dc cvac, %0; dsb sy" :: "r"(&sweet_log_total) : "memory");
++    __asm__ volatile("dc cvac, %0" :: "r"(&sweet_log_total) : "memory");
++    __asm__ volatile("dsb sy" ::: "memory");
+ #endif
+ }
+ 
+@@ -1767,7 +1768,8 @@ static void
+ sweet_log_stamp(void)
+ {
+ 	uint64_t cnt, frq;
+-	__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r"(cnt));
++	__asm__ volatile ("isb" ::: "memory");   /* 0209: one per asm, ';' is a comment here */
++	__asm__ volatile ("mrs %0, cntvct_el0" : "=r"(cnt));
+ 	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+ 	if (sweet_log_t0 == 0) {
+ 		sweet_log_t0 = cnt;
