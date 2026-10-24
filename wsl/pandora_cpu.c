@@ -43,6 +43,10 @@
  * domain 1, and the cap at the limit only moved the governor's own record of domain 1's level to 0 every 2 s,
  * while the firmware stayed at 8-26; the next window then asked for the floor, a drop to 1.75 GHz): no cap at the
  * limits; every 2 s the firmware's current level is taken when it differs from the record.
+ *
+ * Patch 0205 (adds logging only): the SoC temperatures every 2 s with the governor lines; every 10 s what the
+ * performance-controller callouts saw (osfmk/arm/pandora_perfctl.c: time per class on each CPU, the busiest threads
+ * and processes, the frames and how many were late); every level of each domain in the probe.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -61,6 +65,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void IOSleep(unsigned int milliseconds);
 extern processor_t thread_bind(processor_t processor);   /* kern/sched_prim.h, not exported to BSD */
 extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_cpu_idle.c */
+extern void pandora_perfctl_start(void);                    /* osfmk/arm/pandora_perfctl.c */
+extern void pandora_perfctl_log(void);
 
 #define PDP_MBOX_TX_PA          0x19980000ull   /* qcom,pdp0 "tx" registers */
 #define PDP_MBOX_TX_CMD(ch)     (0x100u + (ch) * 8u + 4u)
@@ -186,7 +192,7 @@ cpu_scmi_probe(void)
 		/* levels: (perf value, power, latency) and from version 4 also (indicative kHz, level index) */
 		const uint32_t entry = (version >> 16) >= 4 ? 5 : 3;
 		uint32_t index = 0;
-		for (int guard = 0; guard < 16; guard++) {
+		for (int guard = 0; guard < 64; guard++) {   /* 0205: 16 stopped at level 15 (one level per answer) */
 			in[0] = d;
 			in[1] = index;
 			r = scmi_call(SCMI_PROTO_PERF, 0x4, in, 2, out, 32, &n);
@@ -416,13 +422,84 @@ cpu_check_levels(void)
 	    "3 limits, -1 none)\n", cpu_dom[0].method, d1->method);
 }
 
+/* ---- temperatures (patch 0205) ----
+ * The SoC's temperature sensors (qcom,tsens-v2; Linux drivers/thermal/qcom/tsens-v2.c): sensor S's last reading
+ * at TM + 0xa0 + 4 * S, bits 0-11 signed tenths of a degree, bit 21 valid. Which sensor is where comes from the
+ * device tree's thermal zones: tsens1 cpu-0-N-M (cores 0-5, two each), tsens3 cpu-1-N-M (cores 6-7, two each),
+ * tsens5 gpuss-0..10 and ddr (sensor 11). Android throttles the big cores from about 105 C (thermal HAL trip). */
+static const struct {
+	uint64_t tm;
+	uint32_t first, count;
+	const char *what;
+} cpu_tsens[] = {
+	{ 0xc22a000ull, 0, 12, "little" },
+	{ 0xc22c000ull, 0, 4, "big" },
+	{ 0xc22e000ull, 0, 11, "gpu" },
+	{ 0xc22e000ull, 11, 1, "ddr" },
+};
+static vm_offset_t cpu_tsens_va[4];
+
+/* The hottest valid sensor of group G in tenths of a degree (its index in *WHICH), or INT32_MIN. */
+static int32_t
+cpu_temp_max(uint32_t g, uint32_t *which)
+{
+	int32_t best = INT32_MIN;
+	if (!cpu_tsens_va[g]) {
+		return best;
+	}
+	for (uint32_t s = cpu_tsens[g].first; s < cpu_tsens[g].first + cpu_tsens[g].count; s++) {
+		const uint32_t v = rd32(cpu_tsens_va[g], 0xa0 + s * 4);
+		if (!(v & (1u << 21))) {
+			continue;
+		}
+		const int32_t t = (int32_t)(v << 20) >> 20;
+		if (t > best) {
+			best = t;
+			*which = s;
+		}
+	}
+	return best;
+}
+
+static void
+cpu_temps(bool all)
+{
+	char line[160];
+	int len = 0;
+	for (uint32_t g = 0; g < sizeof(cpu_tsens) / sizeof(cpu_tsens[0]); g++) {
+		if (!cpu_tsens_va[g]) {
+			cpu_tsens_va[g] = ml_io_map(cpu_tsens[g].tm, 0x1000);
+		}
+		if (all && cpu_tsens_va[g]) {   /* every sensor once, raw, to check the readings make sense */
+			printf("PANDORA CPU: temperature %s (0x%llx):", cpu_tsens[g].what, cpu_tsens[g].tm);
+			for (uint32_t s = cpu_tsens[g].first; s < cpu_tsens[g].first + cpu_tsens[g].count; s++) {
+				printf(" %08x", rd32(cpu_tsens_va[g], 0xa0 + s * 4));
+			}
+			printf("\n");
+		}
+		uint32_t which = 0;
+		const int32_t t = cpu_temp_max(g, &which);
+		if (t == INT32_MIN) {
+			len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s none", g ? ", " : "", cpu_tsens[g].what);
+		} else {
+			len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s %d.%d C (sensor %u)", g ? ", " : "",
+			    cpu_tsens[g].what, t / 10, (t < 0 ? -t : t) % 10, which);
+		}
+		if (len >= (int)sizeof(line)) {
+			len = (int)sizeof(line) - 1;
+		}
+	}
+	printf("PANDORA CPU: temperature: %s\n", line);
+}
+
 static void
 cpu_governor(void)
 {
-	uint64_t now, last_log, two;
+	uint64_t now, last_log, two, last_pctl, ten;
 	uint64_t idle[8] = { 0 }, stamp;
 	int fix;
 	nanoseconds_to_absolutetime(2000 * NSEC_PER_MSEC, &two);
+	nanoseconds_to_absolutetime(10000 * NSEC_PER_MSEC, &ten);
 	for (uint32_t d = 0; d < 2; d++) {
 		struct cpu_domain *dm = &cpu_dom[d];
 		const uint32_t top = cpu_get(d, 0x3, 4);   /* sustained level */
@@ -448,7 +525,9 @@ cpu_governor(void)
 	for (int c = 0; c < 8; c++) {
 		idle[c] = pandora_cpu_idle_mach(c);
 	}
-	stamp = last_log = mach_absolute_time();
+	stamp = last_log = last_pctl = mach_absolute_time();
+	cpu_temps(true);
+	pandora_perfctl_log();   /* the first call only starts the interval */
 	for (uint64_t round = 0;; round++) {
 		IOSleep(16);
 		now = mach_absolute_time();
@@ -515,6 +594,7 @@ cpu_governor(void)
 				printf("PANDORA CPU: governor: busy per cpu %llu %llu %llu %llu %llu %llu | %llu %llu %%\n",
 				    cpu_busy_sum[0] / w / 10, cpu_busy_sum[1] / w / 10, cpu_busy_sum[2] / w / 10, cpu_busy_sum[3] / w / 10,
 				    cpu_busy_sum[4] / w / 10, cpu_busy_sum[5] / w / 10, cpu_busy_sum[6] / w / 10, cpu_busy_sum[7] / w / 10);
+				cpu_temps(false);
 			}
 			for (int c = 0; c < 8; c++) {
 				cpu_busy_sum[c] = 0;
@@ -534,6 +614,10 @@ cpu_governor(void)
 				dm->busy_sum = dm->khz_sum = dm->windows = 0;
 				dm->changes = 0;
 			}
+		}
+		if (now - last_pctl >= ten) {
+			last_pctl = now;
+			pandora_perfctl_log();
 		}
 	}
 }
@@ -561,6 +645,7 @@ cpu_thread(__unused void *arg, __unused wait_result_t wr)
 	int mode = 1;
 	(void)PE_parse_boot_argn("pandora_cpu", &mode, sizeof(mode));
 	if (mode >= 2 && cpu_mbox && cpu_shmem) {
+		pandora_perfctl_start();
 		cpu_check_levels();
 		cpu_clocks("after the check");
 		cpu_governor();   /* does not return */

@@ -1,0 +1,485 @@
+diff --git a/bsd/dev/pandora_cpu.c b/bsd/dev/pandora_cpu.c
+index 77ba0ba..b04a760 100644
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -43,6 +43,10 @@
+  * domain 1, and the cap at the limit only moved the governor's own record of domain 1's level to 0 every 2 s,
+  * while the firmware stayed at 8-26; the next window then asked for the floor, a drop to 1.75 GHz): no cap at the
+  * limits; every 2 s the firmware's current level is taken when it differs from the record.
++ *
++ * Patch 0205 (adds logging only): the SoC temperatures every 2 s with the governor lines; every 10 s what the
++ * performance-controller callouts saw (osfmk/arm/pandora_perfctl.c: time per class on each CPU, the busiest threads
++ * and processes, the frames and how many were late); every level of each domain in the probe.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -61,6 +65,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void IOSleep(unsigned int milliseconds);
+ extern processor_t thread_bind(processor_t processor);   /* kern/sched_prim.h, not exported to BSD */
+ extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_cpu_idle.c */
++extern void pandora_perfctl_start(void);                    /* osfmk/arm/pandora_perfctl.c */
++extern void pandora_perfctl_log(void);
+ 
+ #define PDP_MBOX_TX_PA          0x19980000ull   /* qcom,pdp0 "tx" registers */
+ #define PDP_MBOX_TX_CMD(ch)     (0x100u + (ch) * 8u + 4u)
+@@ -186,7 +192,7 @@ cpu_scmi_probe(void)
+ 		/* levels: (perf value, power, latency) and from version 4 also (indicative kHz, level index) */
+ 		const uint32_t entry = (version >> 16) >= 4 ? 5 : 3;
+ 		uint32_t index = 0;
+-		for (int guard = 0; guard < 16; guard++) {
++		for (int guard = 0; guard < 64; guard++) {   /* 0205: 16 stopped at level 15 (one level per answer) */
+ 			in[0] = d;
+ 			in[1] = index;
+ 			r = scmi_call(SCMI_PROTO_PERF, 0x4, in, 2, out, 32, &n);
+@@ -416,13 +422,84 @@ cpu_check_levels(void)
+ 	    "3 limits, -1 none)\n", cpu_dom[0].method, d1->method);
+ }
+ 
++/* ---- temperatures (patch 0205) ----
++ * The SoC's temperature sensors (qcom,tsens-v2; Linux drivers/thermal/qcom/tsens-v2.c): sensor S's last reading
++ * at TM + 0xa0 + 4 * S, bits 0-11 signed tenths of a degree, bit 21 valid. Which sensor is where comes from the
++ * device tree's thermal zones: tsens1 cpu-0-N-M (cores 0-5, two each), tsens3 cpu-1-N-M (cores 6-7, two each),
++ * tsens5 gpuss-0..10 and ddr (sensor 11). Android throttles the big cores from about 105 C (thermal HAL trip). */
++static const struct {
++	uint64_t tm;
++	uint32_t first, count;
++	const char *what;
++} cpu_tsens[] = {
++	{ 0xc22a000ull, 0, 12, "little" },
++	{ 0xc22c000ull, 0, 4, "big" },
++	{ 0xc22e000ull, 0, 11, "gpu" },
++	{ 0xc22e000ull, 11, 1, "ddr" },
++};
++static vm_offset_t cpu_tsens_va[4];
++
++/* The hottest valid sensor of group G in tenths of a degree (its index in *WHICH), or INT32_MIN. */
++static int32_t
++cpu_temp_max(uint32_t g, uint32_t *which)
++{
++	int32_t best = INT32_MIN;
++	if (!cpu_tsens_va[g]) {
++		return best;
++	}
++	for (uint32_t s = cpu_tsens[g].first; s < cpu_tsens[g].first + cpu_tsens[g].count; s++) {
++		const uint32_t v = rd32(cpu_tsens_va[g], 0xa0 + s * 4);
++		if (!(v & (1u << 21))) {
++			continue;
++		}
++		const int32_t t = (int32_t)(v << 20) >> 20;
++		if (t > best) {
++			best = t;
++			*which = s;
++		}
++	}
++	return best;
++}
++
++static void
++cpu_temps(bool all)
++{
++	char line[160];
++	int len = 0;
++	for (uint32_t g = 0; g < sizeof(cpu_tsens) / sizeof(cpu_tsens[0]); g++) {
++		if (!cpu_tsens_va[g]) {
++			cpu_tsens_va[g] = ml_io_map(cpu_tsens[g].tm, 0x1000);
++		}
++		if (all && cpu_tsens_va[g]) {   /* every sensor once, raw, to check the readings make sense */
++			printf("PANDORA CPU: temperature %s (0x%llx):", cpu_tsens[g].what, cpu_tsens[g].tm);
++			for (uint32_t s = cpu_tsens[g].first; s < cpu_tsens[g].first + cpu_tsens[g].count; s++) {
++				printf(" %08x", rd32(cpu_tsens_va[g], 0xa0 + s * 4));
++			}
++			printf("\n");
++		}
++		uint32_t which = 0;
++		const int32_t t = cpu_temp_max(g, &which);
++		if (t == INT32_MIN) {
++			len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s none", g ? ", " : "", cpu_tsens[g].what);
++		} else {
++			len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s %d.%d C (sensor %u)", g ? ", " : "",
++			    cpu_tsens[g].what, t / 10, (t < 0 ? -t : t) % 10, which);
++		}
++		if (len >= (int)sizeof(line)) {
++			len = (int)sizeof(line) - 1;
++		}
++	}
++	printf("PANDORA CPU: temperature: %s\n", line);
++}
++
+ static void
+ cpu_governor(void)
+ {
+-	uint64_t now, last_log, two;
++	uint64_t now, last_log, two, last_pctl, ten;
+ 	uint64_t idle[8] = { 0 }, stamp;
+ 	int fix;
+ 	nanoseconds_to_absolutetime(2000 * NSEC_PER_MSEC, &two);
++	nanoseconds_to_absolutetime(10000 * NSEC_PER_MSEC, &ten);
+ 	for (uint32_t d = 0; d < 2; d++) {
+ 		struct cpu_domain *dm = &cpu_dom[d];
+ 		const uint32_t top = cpu_get(d, 0x3, 4);   /* sustained level */
+@@ -448,7 +525,9 @@ cpu_governor(void)
+ 	for (int c = 0; c < 8; c++) {
+ 		idle[c] = pandora_cpu_idle_mach(c);
+ 	}
+-	stamp = last_log = mach_absolute_time();
++	stamp = last_log = last_pctl = mach_absolute_time();
++	cpu_temps(true);
++	pandora_perfctl_log();   /* the first call only starts the interval */
+ 	for (uint64_t round = 0;; round++) {
+ 		IOSleep(16);
+ 		now = mach_absolute_time();
+@@ -515,6 +594,7 @@ cpu_governor(void)
+ 				printf("PANDORA CPU: governor: busy per cpu %llu %llu %llu %llu %llu %llu | %llu %llu %%\n",
+ 				    cpu_busy_sum[0] / w / 10, cpu_busy_sum[1] / w / 10, cpu_busy_sum[2] / w / 10, cpu_busy_sum[3] / w / 10,
+ 				    cpu_busy_sum[4] / w / 10, cpu_busy_sum[5] / w / 10, cpu_busy_sum[6] / w / 10, cpu_busy_sum[7] / w / 10);
++				cpu_temps(false);
+ 			}
+ 			for (int c = 0; c < 8; c++) {
+ 				cpu_busy_sum[c] = 0;
+@@ -535,6 +615,10 @@ cpu_governor(void)
+ 				dm->changes = 0;
+ 			}
+ 		}
++		if (now - last_pctl >= ten) {
++			last_pctl = now;
++			pandora_perfctl_log();
++		}
+ 	}
+ }
+ 
+@@ -561,6 +645,7 @@ cpu_thread(__unused void *arg, __unused wait_result_t wr)
+ 	int mode = 1;
+ 	(void)PE_parse_boot_argn("pandora_cpu", &mode, sizeof(mode));
+ 	if (mode >= 2 && cpu_mbox && cpu_shmem) {
++		pandora_perfctl_start();
+ 		cpu_check_levels();
+ 		cpu_clocks("after the check");
+ 		cpu_governor();   /* does not return */
+diff --git a/osfmk/arm/pandora_perfctl.c b/osfmk/arm/pandora_perfctl.c
+new file mode 100644
+index 0000000..12864db
+--- /dev/null
++++ b/osfmk/arm/pandora_perfctl.c
+@@ -0,0 +1,310 @@
++/*
++ * PANDORA performance-controller signals (patch 0205), boot-arg pandora_perfctl (default 1; 0 = off). Read only:
++ * it counts and logs, nothing is changed.
++ *
++ * On an iPhone, Apple's performance controller (CLPC) sets the clocks and which cores each thread group may use.
++ * xnu tells it what runs through sched_perfcontrol_register_callbacks (osfmk/arm/machine_routines_common.c):
++ * every context switch with each thread's class (idle, kernel, realtime, background, utility, non-UI, UI,
++ * above UI: thread_get_perfcontrol_class, from its QoS and priority), and every work interval userland reports
++ * (CoreAnimation's frames: start, finish, deadline). There is no CLPC in this kernelcache, so the slot is empty;
++ * this file takes it to see those signals before a governor is built on them (bsd/dev/pandora_cpu.c logs them):
++ *   - per CPU, how long each class ran;
++ *   - per thread, how long it ran, with its process name: the busiest threads and processes;
++ *   - per process, its work intervals: how many, how many finished after their deadline, the time used against
++ *     the time allowed.
++ * Time is charged at each switch to the thread going off core, for the span since the CPU's previous switch.
++ */
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/processor.h>
++#include <kern/cpu_number.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <machine/machine_routines.h>
++#include <os/atomic_private.h>
++#include <pexpert/pexpert.h>
++#include <string.h>
++
++extern char *proc_name_address(void *p);   /* bsd/kern/kern_proc.c */
++
++#define PCTL_CPUS       8
++#define PCTL_THREADS    2048               /* power of two */
++#define PCTL_PROCS      32
++#define PCTL_NAME       17
++
++struct pctl_thread {
++	uint64_t        id;                     /* thread id, 0 = free */
++	uint64_t        time;                   /* mach time on core */
++	uint64_t        shown;                  /* time at the last log (the logger's) */
++	uint32_t        cls;                    /* last perfcontrol class seen */
++	char            name[PCTL_NAME];
++};
++struct pctl_frames {
++	uint32_t        key;                    /* hash of the process name, 0 = free */
++	char            name[PCTL_NAME];
++	uint64_t        count, late, used, allowed;
++	uint64_t        shown_count, shown_late, shown_used, shown_allowed;
++};
++
++static uint64_t pctl_last[PCTL_CPUS];
++static uint64_t pctl_class[PCTL_CPUS][PERFCONTROL_CLASS_MAX];
++static uint64_t pctl_class_shown[PCTL_CPUS][PERFCONTROL_CLASS_MAX];
++static struct pctl_thread pctl_threads[PCTL_THREADS];
++static struct pctl_frames pctl_frames[PCTL_PROCS];
++static uint64_t pctl_dropped, pctl_switches, pctl_notifies, pctl_ctls;
++
++static const char *
++pctl_proc_name(thread_t th)
++{
++	task_t t = th ? get_threadtask(th) : TASK_NULL;
++	void *p = t ? get_bsdtask_info(t) : NULL;
++	return p ? proc_name_address(p) : "?";
++}
++
++static uint32_t
++pctl_hash_name(const char *s)
++{
++	uint32_t h = 2166136261u;
++	for (int i = 0; i < PCTL_NAME - 1 && s[i]; i++) {
++		h = (h ^ (uint8_t)s[i]) * 16777619u;
++	}
++	return h ? h : 1;
++}
++
++/* The slot of thread ID, inserted (with its process name from TH) when new; NULL when the table is full. */
++static struct pctl_thread *
++pctl_thread_slot(uint64_t id, thread_t th)
++{
++	uint32_t i = (uint32_t)((id * 0x9e3779b97f4a7c15ull) >> 53) & (PCTL_THREADS - 1);
++	for (int probe = 0; probe < 32; probe++, i = (i + 1) & (PCTL_THREADS - 1)) {
++		struct pctl_thread *s = &pctl_threads[i];
++		uint64_t cur = os_atomic_load(&s->id, relaxed);
++		if (cur == id) {
++			return s;
++		}
++		if (cur == 0 && os_atomic_cmpxchg(&s->id, 0ull, id, relaxed)) {
++			strlcpy(s->name, pctl_proc_name(th), sizeof(s->name));
++			return s;
++		}
++		if (os_atomic_load(&s->id, relaxed) == id) {
++			return s;
++		}
++	}
++	os_atomic_inc(&pctl_dropped, relaxed);
++	return NULL;
++}
++
++static void
++pctl_csw(perfcontrol_event event, uint32_t cpu, uint64_t timestamp, __unused uint32_t flags,
++    struct perfcontrol_thread_data *offcore, __unused struct perfcontrol_thread_data *oncore,
++    __unused struct perfcontrol_cpu_counters *counters, __unused void *unused)
++{
++	(void)event;
++	if (cpu >= PCTL_CPUS || offcore == NULL) {
++		return;
++	}
++	const uint64_t last = pctl_last[cpu];
++	pctl_last[cpu] = timestamp;
++	os_atomic_inc(&pctl_switches, relaxed);
++	if (last == 0 || timestamp <= last) {
++		return;
++	}
++	const uint64_t span = timestamp - last;
++	const uint32_t cls = offcore->perfctl_class < PERFCONTROL_CLASS_MAX ? offcore->perfctl_class : 0;
++	pctl_class[cpu][cls] += span;   /* this CPU's own counters, written only here */
++	if (cls == PERFCONTROL_CLASS_IDLE || offcore->perfctl_state == NULL) {
++		return;
++	}
++	thread_t th = __container_of((struct perfcontrol_state *)offcore->perfctl_state, struct thread, machine.perfctrl_state);
++	struct pctl_thread *s = pctl_thread_slot(offcore->thread_id, th);
++	if (s != NULL) {
++		os_atomic_add(&s->time, span, relaxed);
++		s->cls = cls;
++	}
++}
++
++static void
++pctl_frame(uint64_t start, uint64_t finish, uint64_t deadline)
++{
++	if (start == 0 || finish <= start || deadline <= start) {
++		return;
++	}
++	const char *name = pctl_proc_name(current_thread());
++	const uint32_t key = pctl_hash_name(name);
++	for (uint32_t i = 0; i < PCTL_PROCS; i++) {
++		struct pctl_frames *f = &pctl_frames[(key + i) % PCTL_PROCS];
++		uint32_t cur = os_atomic_load(&f->key, relaxed);
++		if (cur == 0 && os_atomic_cmpxchg(&f->key, 0u, key, relaxed)) {
++			strlcpy(f->name, name, sizeof(f->name));
++			cur = key;
++		} else if (cur == 0) {
++			cur = os_atomic_load(&f->key, relaxed);
++		}
++		if (cur == key) {
++			os_atomic_inc(&f->count, relaxed);
++			if (finish > deadline) {
++				os_atomic_inc(&f->late, relaxed);
++			}
++			os_atomic_add(&f->used, finish - start, relaxed);
++			os_atomic_add(&f->allowed, deadline - start, relaxed);
++			return;
++		}
++	}
++}
++
++static void
++pctl_work_interval_notify(__unused perfcontrol_state_t state, perfcontrol_work_interval_t wi)
++{
++	os_atomic_inc(&pctl_notifies, relaxed);
++	pctl_frame(wi->start, wi->finish, wi->deadline);
++}
++
++static void
++pctl_work_interval_ctl(__unused perfcontrol_state_t state, perfcontrol_work_interval_instance_t wi)
++{
++	os_atomic_inc(&pctl_ctls, relaxed);
++	if (wi->ctl == WORK_INTERVAL_FINISH) {
++		pctl_frame(wi->start, wi->finish, wi->deadline);
++	}
++}
++
++static struct sched_perfcontrol_callbacks pctl_callbacks = {
++	.version = SCHED_PERFCONTROL_CALLBACKS_VERSION_8,   /* up to work_interval_ctl; 9 would hand us shared-resource flags */
++	.work_interval_notify = pctl_work_interval_notify,
++	.csw = pctl_csw,
++	.work_interval_ctl = pctl_work_interval_ctl,
++};
++
++void pandora_perfctl_start(void);
++void
++pandora_perfctl_start(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("pandora_perfctl", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	sched_perfcontrol_register_callbacks(&pctl_callbacks, 0);
++	printf("PANDORA PCTL: registered as the performance controller (counting only)\n");
++}
++
++static const char *const pctl_class_names[PERFCONTROL_CLASS_MAX] = {
++	"?", "idle", "kernel", "rt", "bg", "utility", "nonui", "ui", "aboveui",
++};
++
++/* What ran since the last call: per CPU by class, the busiest threads and processes, the frames. */
++void pandora_perfctl_log(void);
++void
++pandora_perfctl_log(void)
++{
++	static struct {
++		char name[PCTL_NAME];
++		uint64_t time;
++	} procs[64];
++	struct {
++		uint32_t slot;
++		uint64_t time;
++	} top[8] = {};
++	static uint64_t last_log;
++	const uint64_t now_abs = mach_absolute_time();
++	uint64_t span = last_log ? now_abs - last_log : 0;   /* busyness below is in % of one CPU over this span */
++	last_log = now_abs;
++	if (span == 0) {
++		return;   /* the first call starts the interval */
++	}
++
++	for (uint32_t c = 0; c < PCTL_CPUS; c++) {
++		uint64_t d[PERFCONTROL_CLASS_MAX], sum = 0;
++		for (uint32_t k = 0; k < PERFCONTROL_CLASS_MAX; k++) {
++			const uint64_t now = pctl_class[c][k];
++			d[k] = now - pctl_class_shown[c][k];
++			pctl_class_shown[c][k] = now;
++			sum += d[k];
++		}
++		if (sum == 0) {
++			printf("PANDORA PCTL: cpu %u: no switches\n", c);
++			continue;
++		}
++		printf("PANDORA PCTL: cpu %u %%: idle %llu kernel %llu rt %llu bg %llu utility %llu nonui %llu ui %llu aboveui %llu\n", c,
++		    d[1] * 100 / sum, d[2] * 100 / sum, d[3] * 100 / sum, d[4] * 100 / sum, d[5] * 100 / sum, d[6] * 100 / sum,
++		    d[7] * 100 / sum, d[8] * 100 / sum);
++	}
++
++	uint32_t nprocs = 0;
++	bzero(procs, sizeof(procs));
++	for (uint32_t i = 0; i < PCTL_THREADS; i++) {
++		struct pctl_thread *s = &pctl_threads[i];
++		if (os_atomic_load(&s->id, relaxed) == 0) {
++			continue;
++		}
++		const uint64_t now = os_atomic_load(&s->time, relaxed), d = now - s->shown;
++		s->shown = now;
++		if (d == 0) {
++			continue;
++		}
++		for (int k = 0; k < 8; k++) {
++			if (d > top[k].time) {
++				memmove(&top[k + 1], &top[k], (size_t)(7 - k) * sizeof(top[0]));
++				top[k].slot = i;
++				top[k].time = d;
++				break;
++			}
++		}
++		uint32_t p = 0;
++		while (p < nprocs && strncmp(procs[p].name, s->name, PCTL_NAME) != 0) {
++			p++;
++		}
++		if (p == nprocs && nprocs < 64) {
++			strlcpy(procs[p].name, s->name, PCTL_NAME);
++			nprocs++;
++		}
++		if (p < nprocs) {
++			procs[p].time += d;
++		}
++	}
++	if (span == 0) {
++		span = 1;
++	}
++	for (int k = 0; k < 8 && top[k].time; k++) {
++		struct pctl_thread *s = &pctl_threads[top[k].slot];
++		printf("PANDORA PCTL: busy thread %d: %s thread %llu (%s) %llu.%llu%% of one CPU\n", k + 1, s->name, s->id,
++		    pctl_class_names[s->cls < PERFCONTROL_CLASS_MAX ? s->cls : 0], top[k].time * 100 / span,
++		    top[k].time * 1000 / span % 10);
++	}
++	for (int k = 0; k < 8; k++) {
++		uint32_t best = nprocs;
++		for (uint32_t p = 0; p < nprocs; p++) {
++			if (procs[p].time && (best == nprocs || procs[p].time > procs[best].time)) {
++				best = p;
++			}
++		}
++		if (best == nprocs) {
++			break;
++		}
++		printf("PANDORA PCTL: busy process %d: %s %llu.%llu%% of one CPU\n", k + 1, procs[best].name,
++		    procs[best].time * 100 / span, procs[best].time * 1000 / span % 10);
++		procs[best].time = 0;
++	}
++	for (uint32_t i = 0; i < PCTL_PROCS; i++) {
++		struct pctl_frames *f = &pctl_frames[i];
++		if (os_atomic_load(&f->key, relaxed) == 0) {
++			continue;
++		}
++		const uint64_t n = f->count - f->shown_count, late = f->late - f->shown_late;
++		const uint64_t used = f->used - f->shown_used, allowed = f->allowed - f->shown_allowed;
++		f->shown_count = f->count;
++		f->shown_late = f->late;
++		f->shown_used = f->used;
++		f->shown_allowed = f->allowed;
++		if (n == 0) {
++			continue;
++		}
++		uint64_t used_us, allowed_us;
++		absolutetime_to_nanoseconds(used / n, &used_us);
++		absolutetime_to_nanoseconds(allowed / n, &allowed_us);
++		printf("PANDORA PCTL: frames %s: %llu, %llu late, on average %llu us used of %llu us allowed\n", f->name, n, late,
++		    used_us / 1000, allowed_us / 1000);
++	}
++	printf("PANDORA PCTL: %llu switches, %llu work interval notes, %llu instance calls, %llu threads not counted (table full)\n",
++	    pctl_switches, pctl_notifies, pctl_ctls, pctl_dropped);
++}
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 118ef9d..37002b4 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -5,6 +5,7 @@ OPTIONS/debug			optional debug
+ osfmk/vm/vm_apple_protect.c	 standard
+ osfmk/arm/fuxi_adreno_host.c	standard
+ osfmk/arm/pandora_cpu_idle.c	standard
++osfmk/arm/pandora_perfctl.c	standard
+ osfmk/vm/vm_fourk_pager.c	 standard
+ 
+ osfmk/arm64/hi_res_clock_map.c 	optional hi_res_clock
