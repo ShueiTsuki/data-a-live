@@ -381,9 +381,37 @@ edit('NativeBridgeMetalFrontend.mm',
     static const uint8_t red[16]={0xfc,0xfd,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff};
     const NSUInteger blocks=rowBytes/16;
     for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<blocks/2;x++)memcpy(&copy[y*rowBytes+x*16],red,16);
-    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:copy.data() bytesPerRow:rowBytes];
-    NSLog(@"pandora-metal astc probe: %lux%lu, left %lu of %lu block columns red",(unsigned long)d.width,(unsigned long)d.height,
-          (unsigned long)(blocks/2),(unsigned long)blocks);
+    // bb34: no red reached any render target. The first image is uploaded by replaceRegion, the second through a
+    // shared buffer and a blit; each is then copied back by the GPU and compared block by block with what went up.
+    static std::atomic<int> nth{0};
+    const int which=nth.fetch_add(1);
+    static id<MTLCommandQueue> queue=[(id<MTLDevice>)self newCommandQueue];
+    const NSUInteger size=rowBytes*rows;
+    if(which%2==0)
+     [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:copy.data() bytesPerRow:rowBytes];
+    else {
+     id<MTLBuffer> up=[(id<MTLDevice>)self newBufferWithBytes:copy.data() length:size options:MTLResourceStorageModeShared];
+     id<MTLCommandBuffer> c=[queue commandBuffer];id<MTLBlitCommandEncoder> b=[c blitCommandEncoder];
+     [b copyFromBuffer:up sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:size sourceSize:MTLSizeMake(d.width,d.height,1)
+             toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+     [b endEncoding];[c commit];[c waitUntilCompleted];
+    }
+    id<MTLBuffer> back=[(id<MTLDevice>)self newBufferWithLength:size options:MTLResourceStorageModeShared];
+    memset(back.contents,0xa5,size);
+    id<MTLCommandBuffer> c=[queue commandBuffer];id<MTLBlitCommandEncoder> b=[c blitCommandEncoder];
+    [b copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(d.width,d.height,1)
+              toBuffer:back destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:size];
+    [b endEncoding];[c commit];[c waitUntilCompleted];
+    unsigned same[2]={},zero[2]={},untouched[2]={},other[2]={};
+    const uint8_t *got=(const uint8_t *)back.contents;
+    for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<blocks;x++) {
+     const uint8_t *g=got+y*rowBytes+x*16,*w=&copy[y*rowBytes+x*16];const int half=x<blocks/2?0:1;
+     bool z=true,u=true;for(int k=0;k<16;k++){if(g[k])z=false;if(g[k]!=0xa5)u=false;}
+     if(!memcmp(g,w,16))same[half]++;else if(z)zero[half]++;else if(u)untouched[half]++;else other[half]++;
+    }
+    NSLog(@"pandora-metal astc probe #%d %lux%lu by %s, left %lu of %lu block columns red; read back left same/zero/untouched/other "
+          "%u/%u/%u/%u right %u/%u/%u/%u (status %ld)",which,(unsigned long)d.width,(unsigned long)d.height,which%2==0?"replaceRegion":"blit",
+          (unsigned long)(blocks/2),(unsigned long)blocks,same[0],zero[0],untouched[0],other[0],same[1],zero[1],untouched[1],other[1],(long)c.status);
    } else
    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
    if(deallocator) {""")
