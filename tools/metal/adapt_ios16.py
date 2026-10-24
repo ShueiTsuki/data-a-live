@@ -954,3 +954,21 @@ edit_all('NativeBridgeMetalFrontend.mm',
          """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state""",
          """ if(pandoraAstcProbe() && (probeBindings(self)[@"armed"] || probeBindings(self)[@"following"])) {   // ios-pandora: the probed draw's whole state, and the draws after it""", 2)
 edit_all('NativeBridgeMetalFrontend.mm', """  if(nth<8) {""", """  if(nth<48) {""", 2)
+
+# ---- ios-pandora: buffer offsets moved after binding (bb42) --------------------------------------------------
+# bb41 replayed on the PC: the draw after the App Library's ASTC draws (b2a8f) fills its quad with its vertex colour,
+# blending off, as Apple's own IR says; which quad and colour depends on where its vertices are. QuartzCore moves the
+# bound vertex buffer with setVertexBufferOffset between draws, which the replay log did not see. The probe's bindings
+# and its commit-time watch now follow such moves.
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+""",
+     """- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+ if(pandoraAstcProbe()) {   // ios-pandora: the binding moves; the probe's draw log and watch follow it
+  NSMutableDictionary *seen=probeBindings(self);
+  NSString *key=[NSString stringWithFormat:@"~%sbuffer%lu",probeStage(stage),(unsigned long)index];
+  NSArray *bound=seen[key];
+  if(bound.count==2)seen[key]=@[bound[0],@(offset)];
+  seen[[NSString stringWithFormat:@"%sbufferoffset%lu",probeStage(stage),(unsigned long)index]]=@(offset);
+ }
+""")
