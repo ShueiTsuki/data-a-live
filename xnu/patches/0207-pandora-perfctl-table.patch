@@ -1,0 +1,89 @@
+diff --git a/osfmk/arm/pandora_perfctl.c b/osfmk/arm/pandora_perfctl.c
+index 12864db..775e348 100644
+--- a/osfmk/arm/pandora_perfctl.c
++++ b/osfmk/arm/pandora_perfctl.c
+@@ -13,6 +13,11 @@
+  *   - per process, its work intervals: how many, how many finished after their deadline, the time used against
+  *     the time allowed.
+  * Time is charged at each switch to the thread going off core, for the span since the CPU's previous switch.
++ *
++ * Patch 0207 (freq5: the 2048-entry thread table was full after a few minutes, 2.7 M switches not
++ * counted, because ended threads kept their entries; a process's threads kept the name "launchd" they
++ * had before exec; with more than 64 names a busy process could miss the list): 4096 entries, an entry
++ * free again after a minute without time, the name taken again at every switch, 256 process names.
+  */
+ #include <kern/thread.h>
+ #include <kern/task.h>
+@@ -28,7 +33,7 @@
+ extern char *proc_name_address(void *p);   /* bsd/kern/kern_proc.c */
+ 
+ #define PCTL_CPUS       8
+-#define PCTL_THREADS    2048               /* power of two */
++#define PCTL_THREADS    4096               /* power of two */
+ #define PCTL_PROCS      32
+ #define PCTL_NAME       17
+ 
+@@ -37,6 +42,7 @@ struct pctl_thread {
+ 	uint64_t        time;                   /* mach time on core */
+ 	uint64_t        shown;                  /* time at the last log (the logger's) */
+ 	uint32_t        cls;                    /* last perfcontrol class seen */
++	uint32_t        idle_logs;              /* logs in a row without time (the logger's) */
+ 	char            name[PCTL_NAME];
+ };
+ struct pctl_frames {
+@@ -75,11 +81,12 @@ pctl_hash_name(const char *s)
+ static struct pctl_thread *
+ pctl_thread_slot(uint64_t id, thread_t th)
+ {
+-	uint32_t i = (uint32_t)((id * 0x9e3779b97f4a7c15ull) >> 53) & (PCTL_THREADS - 1);
++	uint32_t i = (uint32_t)((id * 0x9e3779b97f4a7c15ull) >> 52) & (PCTL_THREADS - 1);
+ 	for (int probe = 0; probe < 32; probe++, i = (i + 1) & (PCTL_THREADS - 1)) {
+ 		struct pctl_thread *s = &pctl_threads[i];
+ 		uint64_t cur = os_atomic_load(&s->id, relaxed);
+ 		if (cur == id) {
++			strlcpy(s->name, pctl_proc_name(th), sizeof(s->name));   /* again: exec renames */
+ 			return s;
+ 		}
+ 		if (cur == 0 && os_atomic_cmpxchg(&s->id, 0ull, id, relaxed)) {
+@@ -87,6 +94,7 @@ pctl_thread_slot(uint64_t id, thread_t th)
+ 			return s;
+ 		}
+ 		if (os_atomic_load(&s->id, relaxed) == id) {
++			strlcpy(s->name, pctl_proc_name(th), sizeof(s->name));
+ 			return s;
+ 		}
+ 	}
+@@ -200,7 +208,7 @@ pandora_perfctl_log(void)
+ 	static struct {
+ 		char name[PCTL_NAME];
+ 		uint64_t time;
+-	} procs[64];
++	} procs[256];
+ 	struct {
+ 		uint32_t slot;
+ 		uint64_t time;
+@@ -240,8 +248,15 @@ pandora_perfctl_log(void)
+ 		const uint64_t now = os_atomic_load(&s->time, relaxed), d = now - s->shown;
+ 		s->shown = now;
+ 		if (d == 0) {
++			if (++s->idle_logs >= 6) {   /* a minute without time: most likely ended; the entry is free again */
++				s->idle_logs = 0;
++				s->shown = 0;
++				os_atomic_store(&s->time, 0ull, relaxed);
++				os_atomic_store(&s->id, 0ull, release);
++			}
+ 			continue;
+ 		}
++		s->idle_logs = 0;
+ 		for (int k = 0; k < 8; k++) {
+ 			if (d > top[k].time) {
+ 				memmove(&top[k + 1], &top[k], (size_t)(7 - k) * sizeof(top[0]));
+@@ -254,7 +269,7 @@ pandora_perfctl_log(void)
+ 		while (p < nprocs && strncmp(procs[p].name, s->name, PCTL_NAME) != 0) {
+ 			p++;
+ 		}
+-		if (p == nprocs && nprocs < 64) {
++		if (p == nprocs && nprocs < 256) {
+ 			strlcpy(procs[p].name, s->name, PCTL_NAME);
+ 			nprocs++;
+ 		}

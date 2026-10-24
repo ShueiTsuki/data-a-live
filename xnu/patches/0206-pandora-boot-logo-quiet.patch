@@ -1,0 +1,29 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index df5fb9f..3d71172 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -764,12 +764,24 @@ fbcon_newline(void)
+ #endif
+ }
+ 
++#if defined(PANDORA)
++extern int sweet_console_muted;         /* osfmk/console/serial_console.c */
++#endif
++
+ static void
+ fbcon_init(void)
+ {
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+ 	fbcon_col = fbcon_row = 0;
++#if defined(PANDORA)
++	/* 0206: without -v the loader's boot logo stays; the text only goes to the log. */
++	int verbose = 0;
++	if (!PE_parse_boot_argn("-v", &verbose, sizeof(verbose))) {
++		sweet_console_muted = 1;
++		return;
++	}
++#endif
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
