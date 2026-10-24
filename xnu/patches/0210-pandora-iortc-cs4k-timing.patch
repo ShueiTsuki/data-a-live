@@ -1,0 +1,65 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index e242375..8e0137d 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5715,6 +5715,7 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 	uint8_t *buffer = NULL;
+ 	vm_size_t bufsize = 1024 * 1024;        /* a multiple of 16384 */
+ 	uint64_t limit, chunk;
++	uint64_t t_read = 0, t_hash = 0, t_mark;   /* 0210: where boot time goes */
+ 	int error = EBADEXEC;
+ 	kern_return_t kr;
+ 
+@@ -5761,9 +5762,12 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 			error = EOVERFLOW;
+ 			goto out;
+ 		}
++		t_mark = mach_absolute_time();
+ 		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)chunk_length, position,
+ 		    UIO_SYSSPACE, 0, vfs_context_ucred(vfs_context_current()),
+ 		    &resid, current_proc());
++		t_read += mach_absolute_time() - t_mark;
++		t_mark = mach_absolute_time();
+ 		if (error || resid) {
+ 			error = error ? error : EIO;
+ 			goto out;
+@@ -5800,6 +5804,7 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 				memcpy((void *)(storage + index * md->cs_size), digest, md->cs_size);
+ 			}
+ 		}
++		t_hash += mach_absolute_time() - t_mark;
+ 	}
+ 	kr = vm_map_protect(kernel_map, storage, storage + allocation, VM_PROT_READ, TRUE);
+ 	if (kr != KERN_SUCCESS) {
+@@ -5811,6 +5816,16 @@ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
+ 	blob->csb_native4k_hash_count = count;
+ 	storage = 0;
+ 	os_atomic_inc(&cs_native4k_ready_blobs, relaxed);
++	if (limit >= (32ull << 20)) {
++		extern int cpu_number(void);
++		uint64_t rn, hn;
++		absolutetime_to_nanoseconds(t_read, &rn);
++		absolutetime_to_nanoseconds(t_hash, &hn);
++		const char *name = vnode_getname_printable(vp);
++		printf("PANDORA CS4K: %s %llu MiB (cpu %d at the end): read %llu ms, hash %llu ms, %llu MB/s hashed (both passes)\n",
++		    name, limit >> 20, cpu_number(), rn / 1000000, hn / 1000000, hn ? (2 * limit * 1000) / hn : 0);
++		vnode_putname_printable(name);
++	}
+ 	error = 0;
+ out:
+ 	if (buffer != NULL) {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 255a32f..3439607 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -30,6 +30,10 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
++#if defined(PANDORA)
++	/* 0210: what an iPhone's RTC driver publishes; IOKitInitializeTime waits up to 30 s for it. */
++	publishResource("IORTC", this);
++#endif
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
