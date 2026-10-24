@@ -150,3 +150,115 @@ edit('NativeTurnipSmoke.h',
      """    snprintf(slash + 1, size - size_t(slash + 1 - path), "libvulkan_freedreno.dylib");
     if (access(path, R_OK) != 0) snprintf(path, size, "%s", "/usr/lib/libvulkan_freedreno.dylib");   // ios-pandora
     return true;""")
+
+# ---- ios-pandora: frame capture for the App Library (bb26) -------------------------------------------------
+# Its full-screen blur draws empty (the zoomed home screen snapshot behind shows through, the rest is black),
+# with no refusal on record. Right after newTextureWithBytesNoCopy makes the App Library's image, the next
+# 800 events backboardd encodes are logged as "pandora-metal cap": render passes (attachments, level, load and
+# store actions, clear colour), pipelines (both functions, colour format), textures bound (size, format, mip
+# levels, type, view parent, IOSurface), viewports, scissors, draws, texture copies, mipmap generation and
+# commits. Twice per boot at most.
+edit('NativeBridgeMetalFrontend.mm',
+     """#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+""",
+     """#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
+static std::atomic<int> gCapture{0};
+static char gCapNamesKey;
+static inline bool capturing() {return gCapture.load(std::memory_order_relaxed)>0;}
+static void capture(NSString *line) {if(gCapture.fetch_sub(1,std::memory_order_relaxed)>0)NSLog(@"pandora-metal cap %@",line);}
+static NSString *capId(id object) {return [NSString stringWithFormat:@"%05lx",(unsigned long)(((uintptr_t)(__bridge void *)object>>4)&0xfffff)];}
+static NSString *capTexture(id<MTLTexture> t) {
+ if(!t)return @"-";
+ id<MTLTexture> parent=[(id)t respondsToSelector:@selector(parentTexture)]?t.parentTexture:nil;
+ const bool surface=[(id)t respondsToSelector:@selector(iosurface)] && t.iosurface;
+ return [NSString stringWithFormat:@"%@ %lux%lu f%lu m%lu t%lu%@%@%@",capId(t),(unsigned long)t.width,(unsigned long)t.height,
+  (unsigned long)t.pixelFormat,(unsigned long)t.mipmapLevelCount,(unsigned long)t.textureType,surface?@" surface":@"",
+  parent?@" view-of ":@"",parent?capId(parent):@""];
+}
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   if(++made<=5)NSLog(@"pandora-metal nocopy: made fmt""",
+     """   static std::atomic<int> captures{0};
+   if(captures.fetch_add(1)<2)gCapture.store(800);
+   if(++made<=5)NSLog(@"pandora-metal nocopy: made fmt""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;""",
+     """ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ objc_setAssociatedObject(state,&gCapNamesKey,[NSString stringWithFormat:@"%@ / %@ c0 f%lu blend %d",d.vertexFunction.name,d.fragmentFunction.name,
+  (unsigned long)d.colorAttachments[0].pixelFormat,(int)d.colorAttachments[0].blendingEnabled],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ return (id<MTLRenderPipelineState>)state;""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+""",
+     """- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+ if(capturing())capture([NSString stringWithFormat:@"pipe %@ %@",capId(state),objc_getAssociatedObject(state,&gCapNamesKey)]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+""",
+     """- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+ if(capturing())capture([NSString stringWithFormat:@"tex %s%lu %@",stage==1?"v":stage==2?"f":"c",(unsigned long)index,capTexture(texture)]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)setViewport:(MTLViewport)v {
+""",
+     """- (void)setViewport:(MTLViewport)v {
+ if(capturing())capture([NSString stringWithFormat:@"viewport %.1f %.1f %.1fx%.1f",v.originX,v.originY,v.width,v.height]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)setScissorRect:(MTLScissorRect)r {
+""",
+     """- (void)setScissorRect:(MTLScissorRect)r {
+ if(capturing())capture([NSString stringWithFormat:@"scissor %lu %lu %lux%lu",(unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+""",
+     """- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+ if(capturing())capture([NSString stringWithFormat:@"draw p%lu v%lu+%lu i%lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+""",
+     """                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+ if(capturing())capture([NSString stringWithFormat:@"drawidx p%lu n%lu i%lu",(unsigned long)t,(unsigned long)n,(unsigned long)i]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+""",
+     """- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+ if(capturing()) {
+  NSMutableString *line=[NSMutableString stringWithFormat:@"pass rt %lux%lu",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
+  for(unsigned i=0;i<4;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];if(!c.texture)continue;
+   [line appendFormat:@" | c%u %@ lv%lu sl%lu load%lu store%lu clear %.2f,%.2f,%.2f,%.2f%@",i,capTexture(c.texture),(unsigned long)c.level,
+    (unsigned long)c.slice,(unsigned long)c.loadAction,(unsigned long)c.storeAction,c.clearColor.red,c.clearColor.green,c.clearColor.blue,
+    c.clearColor.alpha,c.resolveTexture?[@" resolve " stringByAppendingString:capTexture(c.resolveTexture)]:@""];
+  }
+  if(d.depthAttachment.texture)[line appendFormat:@" | depth %@ load%lu",capTexture(d.depthAttachment.texture),(unsigned long)d.depthAttachment.loadAction];
+  if(d.stencilAttachment.texture)[line appendFormat:@" | stencil %@ load%lu",capTexture(d.stencilAttachment.texture),(unsigned long)d.stencilAttachment.loadAction];
+  capture(line);
+ }
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+""",
+     """              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+ if(capturing())capture([NSString stringWithFormat:@"copy %@ lv%lu %lu,%lu %lux%lu -> %@ lv%lu %lu,%lu",capTexture(s),(unsigned long)sl,(unsigned long)so.x,
+  (unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height,capTexture(d),(unsigned long)dl,(unsigned long)dO.x,(unsigned long)dO.y]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+""",
+     """- (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+ if(capturing())capture([NSString stringWithFormat:@"mipmaps %@",capTexture(t)]);
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+ self.committed=YES;
+""",
+     """ if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+ if(capturing())capture(@"commit");
+ self.committed=YES;
+""")
