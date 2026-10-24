@@ -263,57 +263,38 @@ edit('NativeBridgeMetalFrontend.mm',
  self.committed=YES;
 """)
 
-# ---- ios-pandora: bytes-no-copy textures follow their bytes (bb27) ------------------------------------------
-# The capture: QuartzCore samples the App Library's two full-screen ASTC images (made by
-# newTextureWithBytesNoCopy) in the frame's second pass, with no blur pass at all: the material is baked into
-# them. They were filled once when made; QuartzCore writes their bytes afterwards (a texture over the bytes
-# would see that), so one stayed zero (the black) and one kept an older picture (the sharp home screen).
-# Now the texture keeps its source: before each commit that uses it, the bytes are compared with what was last
-# uploaded and uploaded again when they differ.
+# ---- ios-pandora: what the App Library's ASTC bytes look like (bb28) ------------------------------------------
+# Re-uploading at commit (38391ce) never fired for the App Library (its bytes do not change after the texture is
+# made) and froze backboardd in the app switcher, so it is gone. The image still shows a sharp picture in one part
+# and black elsewhere. For a block-compressed texture the next lines describe the bytes as rows of blocks: an 8x8
+# grid of the image, each cell the share of all-zero blocks (z), ASTC void-extent (single colour) blocks (v) and
+# other blocks (o), so the picture's layout can be compared with the screen, and the callers.
 edit('NativeBridgeMetalFrontend.mm',
-     """// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
-""",
-     """// ios-pandora: a bytes-no-copy texture's source (tools/metal/adapt_ios16.py): the caller's bytes, their rows, what
-// was last uploaded, and the deallocator's owner.
-@interface PandoraNoCopySource : NSObject
-@property(nonatomic) const void *bytes;
-@property(nonatomic) NSUInteger rowBytes,rows,width,height;
-@property(nonatomic,strong) NSMutableData *seen;
-@property(nonatomic,strong) NSData *owner;
-@end
-@implementation PandoraNoCopySource
-@end
-static char gNoCopyKey;
-static std::atomic<uint64_t> gNoCopyRefreshes{0};
-static void refreshNoCopy(id object) {
- PandoraNoCopySource *s=objc_getAssociatedObject(object,&gNoCopyKey);
- if(!s)return;
- const size_t size=s.rowBytes*s.rows;
- if(!memcmp(s.seen.bytes,s.bytes,size))return;
- memcpy(s.seen.mutableBytes,s.bytes,size);
- [(id<MTLTexture>)object replaceRegion:MTLRegionMake2D(0,0,s.width,s.height) mipmapLevel:0 withBytes:s.bytes bytesPerRow:s.rowBytes];
- if(++gNoCopyRefreshes<=5)NSLog(@"pandora-metal nocopy: uploaded again (%lux%lu)",(unsigned long)s.width,(unsigned long)s.height);
-}
-// ios-pandora: the App Library capture (tools/metal/adapt_ios16.py).
-""")
-edit('NativeBridgeMetalFrontend.mm',
-     """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
-   if(deallocator) {
-    static char ownerKey;
-    NSData *owner=[[NSData alloc] initWithBytesNoCopy:bytes length:length deallocator:^(void *b,NSUInteger l){deallocator(b,l);}];
-    objc_setAssociatedObject(texture,&ownerKey,owner,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-   }""",
-     """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
-   PandoraNoCopySource *source=[PandoraNoCopySource new];
-   source.bytes=bytes;source.rowBytes=rowBytes;source.rows=rows;source.width=d.width;source.height=d.height;
-   source.seen=[NSMutableData dataWithBytes:bytes length:rowBytes*rows];
-   if(deallocator)source.owner=[[NSData alloc] initWithBytesNoCopy:bytes length:length deallocator:^(void *b,NSUInteger l){deallocator(b,l);}];
-   objc_setAssociatedObject(texture,&gNoCopyKey,source,OBJC_ASSOCIATION_RETAIN_NONATOMIC);""")
-edit('NativeBridgeMetalFrontend.mm',
-     """ if(capturing())capture(@"commit");
- self.committed=YES;
-""",
-     """ if(capturing())capture(@"commit");
- for(id owner in _resourceOwners)refreshNoCopy(owner);   // ios-pandora: bytes-no-copy textures follow their bytes
- self.committed=YES;
-""")
+     """   static std::atomic<int> captures{0};""",
+     """   if(bb==16) {   // ios-pandora: the block layout of the bytes, 8x8 grid
+    static std::atomic<int> described{0};
+    if(described.fetch_add(1)<6) {
+     const uint8_t *blocks=(const uint8_t *)bytes;
+     unsigned zero[8][8]={},single[8][8]={},other[8][8]={};
+     for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<rowBytes/16;x++) {
+      const uint8_t *b=blocks+y*rowBytes+x*16;
+      bool z=true;for(unsigned k=0;k<16;k++)if(b[k]){z=false;break;}
+      const unsigned gy=(unsigned)(y*8/rows),gx=(unsigned)(x*8/(rowBytes/16));
+      if(z)zero[gy][gx]++;else if(((b[0]|(b[1]<<8))&0x1ff)==0x1fc)single[gy][gx]++;else other[gy][gx]++;
+     }
+     void *frames[8];const int n=backtrace(frames,8);std::string callers;char item[96];
+     for(int i=1;i<n;i++){Dl_info info{};if(!dladdr(frames[i],&info) || !info.dli_fname)continue;const char *slash=strrchr(info.dli_fname,'/');
+      snprintf(item,sizeof item," %s+%lx",slash?slash+1:info.dli_fname,(unsigned long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));callers+=item;}
+     const unsigned image=(unsigned)described.load();
+     NSLog(@"pandora-metal nocopy blocks #%u %lux%lu %lu per row |%s",image,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)rowBytes,callers.c_str());
+     for(unsigned gy=0;gy<8;gy++) {
+      NSMutableString *line=[NSMutableString string];
+      for(unsigned gx=0;gx<8;gx++) {
+       const unsigned all=zero[gy][gx]+single[gy][gx]+other[gy][gx];
+       [line appendFormat:@" %02u/%02u/%02u",all?zero[gy][gx]*99/all:0,all?single[gy][gx]*99/all:0,all?other[gy][gx]*99/all:0];
+      }
+      NSLog(@"pandora-metal nocopy grid #%u r%u z/v/o:%@",image,gy,line);
+     }
+    }
+   }
+   static std::atomic<int> captures{0};""")
