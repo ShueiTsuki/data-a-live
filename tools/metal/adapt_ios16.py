@@ -718,3 +718,97 @@ edit('NativeBridgeMetalFrontend.mm',
   probeBindings(made)[@"pass"]=pass;
  }
 """)
+
+# ---- ios-pandora: what the CPU wrote vs what the GPU reads, for the probed draw (bb39) ------------------------
+# bb38 replayed on the PC (metal2vulkan on lavapipe, /opt/work/replay): QuartzCore's shader translates right, but the
+# 64 bytes at vertex buffer 2 + 208 (its mvp matrix) as captured at setVertexBuffer are no matrix, every triangle has
+# no area and nothing is drawn; a real matrix there draws the image. QuartzCore may write the matrix after binding.
+# Now, for the first probed draws, each buffer bound to the draw is logged (64 bytes from its offset) at the draw, at
+# commit and after completion from the CPU, and after completion as the GPU reads it (a blit into a fresh buffer), with
+# what kind of buffer it is. The texture's own descriptor (usage, storage, swizzle) is logged where it is made.
+edit('NativeBridgeMetalFrontend.mm',
+     """#include <sys/sysctl.h>
+static int pandoraAstcProbeLevel""",
+     """#include <sys/sysctl.h>
+#include <objc/message.h>
+static int pandoraAstcProbeLevel""")
+edit('NativeBridgeMetalFrontend.mm',
+     """static const char *probeStage(uint32_t stage) {return stage==1?"v":stage==2?"f":"c";}""",
+     """static const char *probeStage(uint32_t stage) {return stage==1?"v":stage==2?"f":"c";}
+static char gProbeWatchKey;
+static NSString *probeBufferKind(id buffer) {
+ NSMutableString *s=[NSMutableString stringWithFormat:@"len %lu storage %lu",(unsigned long)[(id<MTLBuffer>)buffer length],
+  (unsigned long)[(id<MTLBuffer>)buffer storageMode]];
+ SEL wrapped=NSSelectorFromString(@"wrapped");
+ if([buffer respondsToSelector:wrapped] && ((void *(*)(id,SEL))objc_msgSend)(buffer,wrapped))[s appendString:@" no-copy"];
+ if([(id<MTLBuffer>)buffer heap])[s appendString:@" heap"];
+ return s;
+}""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+""",
+     """ if(pandoraAstcProbe())   // ios-pandora: the buffer itself, for the probe's CPU/GPU comparison
+  probeBindings(self)[[NSString stringWithFormat:@"~%sbuffer%lu",probeStage(stage),(unsigned long)index]]=buffer?@[buffer,@(offset)]:@[];
+ if(pandoraAstcProbe()) {   // ios-pandora: remembered for the probe's draw log, with the first bytes from the offset
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   NSDictionary *seen=probeBindings(self);
+   for(NSString *key in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])probeLog([NSString stringWithFormat:@"%d",nth],key,seen[key]);
+  }""",
+     """   NSDictionary *seen=probeBindings(self);
+   for(NSString *key in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])
+    if(![key hasPrefix:@"~"])probeLog([NSString stringWithFormat:@"%d",nth],key,seen[key]);
+   // the buffers as the CPU holds them now; watched again at commit and after completion (the GPU's view too)
+   NSMutableArray *watch=objc_getAssociatedObject(self.commandBuffer,&gProbeWatchKey);
+   if(!watch){watch=[NSMutableArray array];objc_setAssociatedObject(self.commandBuffer,&gProbeWatchKey,watch,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+   for(NSString *key in seen)if([key hasPrefix:@"~"] && [seen[key] count]==2) {
+    id<MTLBuffer> buffer=seen[key][0];const NSUInteger offset=[seen[key][1] unsignedLongValue];
+    const uint8_t *c=(const uint8_t *)buffer.contents;
+    NSString *label=[NSString stringWithFormat:@"%d %@+%lu",nth,[key substringFromIndex:1],(unsigned long)offset];
+    NSLog(@"pandora-metal watch %@ at draw: %@ | %@",label,probeBufferKind(buffer),c && offset<buffer.length?probeHex(c+offset,buffer.length-offset,64):@"(no contents)");
+    [watch addObject:@[buffer,@(offset),label]];
+   }
+  }""")
+edit('NativeBridgeMetalFrontend.mm',
+     """  flushSurfaces(_surfaces);
+  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+  // Completion owns this reference""",
+     """  flushSurfaces(_surfaces);
+  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+  for(NSArray *w in objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: the probe's buffers at commit
+   id<MTLBuffer> buffer=w[0];const NSUInteger offset=[w[1] unsignedLongValue];const uint8_t *c=(const uint8_t *)buffer.contents;
+   NSLog(@"pandora-metal watch %@ at commit: %@",w[2],c && offset<buffer.length?probeHex(c+offset,buffer.length-offset,64):@"(no contents)");
+  }
+  // Completion owns this reference""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ @synchronized(gInFlight){[gInFlight removeObject:self];}
+ if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {""",
+     """ @synchronized(gInFlight){[gInFlight removeObject:self];}
+ if(NSArray *watch=objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: after completion, CPU and GPU views
+  id<MTLCommandQueue> queue=(id<MTLCommandQueue>)self.queue;
+  for(NSArray *w in watch) {
+   id<MTLBuffer> buffer=w[0];const NSUInteger offset=[w[1] unsignedLongValue];NSString *label=w[2];
+   const uint8_t *c=(const uint8_t *)buffer.contents;
+   NSLog(@"pandora-metal watch %@ done, CPU: %@",label,c && offset<buffer.length?probeHex(c+offset,buffer.length-offset,64):@"(no contents)");
+   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+    const NSUInteger n=MIN((NSUInteger)64,buffer.length-offset);
+    id<MTLBuffer> copy=[buffer.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    memset(copy.contents,0xa5,64);
+    id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLBlitCommandEncoder> b=[cb blitCommandEncoder];
+    [b copyFromBuffer:buffer sourceOffset:offset toBuffer:copy destinationOffset:0 size:n];
+    [b endEncoding];[cb commit];[cb waitUntilCompleted];
+    NSLog(@"pandora-metal watch %@ done, GPU: %@ (status %ld)",label,probeHex(copy.contents,n,64),(long)cb.status);
+   });
+  }
+ }
+ if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   if(probe && bb==16 && d.width>=512) {""",
+     """   if(probe && bb==16 && d.width>=512)   // ios-pandora: QuartzCore's own descriptor of the image (bb39)
+    NSLog(@"pandora-metal astc descriptor: usage %lu storage %lu cpu cache %lu hazard %lu resource options %lu swizzle %u/%u/%u/%u "
+          "type %lu mips %lu samples %lu allow gpu opt %d | bytes %p length %lu",(unsigned long)d.usage,(unsigned long)d.storageMode,
+          (unsigned long)d.cpuCacheMode,(unsigned long)d.hazardTrackingMode,(unsigned long)d.resourceOptions,(unsigned)d.swizzle.red,
+          (unsigned)d.swizzle.green,(unsigned)d.swizzle.blue,(unsigned)d.swizzle.alpha,(unsigned long)d.textureType,
+          (unsigned long)d.mipmapLevelCount,(unsigned long)d.sampleCount,(int)d.allowGPUOptimizedContents,
+          bytes,(unsigned long)length);
+   if(probe && bb==16 && d.width>=512) {""")
