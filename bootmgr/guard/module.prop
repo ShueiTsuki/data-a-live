@@ -1,0 +1,6 @@
+id=pandora_bootmgr_guard
+name=pandora boot menu guard
+version=1
+versionCode=1
+author=ios_pandora
+description=Turns off the iOS entry of the boot_b menu when iosroot/ioslog/adspfw in /data/local/tmp leave the blocks the menu was built with.

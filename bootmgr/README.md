@@ -39,10 +39,11 @@ python -I bootmgr/test/fdt_test.py   # 用手机的设备树测"认开机模式"
 - 写入后如果安卓起不来：音量下 + 电源进 fastboot（引导程序没动，这条路一直在），执行撤销命令。
 - 系统更新会换槽并写入新的 boot，菜单自然消失，安卓照常。
 
-## 还没做（写入 boot_b 之前要做完）
+## 保护
 
-iOS 的系统盘、日志、固件包这三个文件的位置是做镜像时固定进去的。文件被删、重建或被挪动后再进 iOS，会写坏安卓的数据。写入前要先加上：
+iOS 的系统盘、日志、固件包这三个文件的位置是做镜像时固定进去的。文件被删、重建或被挪动后再进 iOS，会写坏安卓的数据。所以：
 
-1. 三个文件加"不可改动"标记。
-2. 安卓里的看门脚本：开机和之后每分钟核对三个文件的位置（和 `out/extents.txt` 里的校验值比），对不上就把 boot_b 里设置页的 `armed` 改成 0，菜单只显示 `iOS off`。
-3. 内核在写日志、挂载系统盘之前核对开头的标志。
+1. 三个文件加"不可改动"标记（`chattr +i`），安卓里删不掉、改不了。主会话的工具（`pinfile rawwrite`）是直接写存储块的，不受影响。
+2. 看门模块 `guard/`（Magisk 模块，`python -I bootmgr/guard/build_module.py` 打包成 `out/pandora_bootmgr_guard.zip`）：开机时和之后每分钟核对三个文件还钉着、位置的校验值和 boot 里设置页记的一样。对不上就把设置页的"允许进 iOS"改成 0、写上原因，菜单之后只显示 `iOS off: 原因`，直接进安卓。它不会再打开，要重新做镜像写入。日志在 `/data/adb/modules/pandora_bootmgr_guard/guard.log`。
+   电脑上的模拟测试：`MSYS_NO_PATHCONV=1 wsl -d Ubuntu-24.04 -- bash /mnt/d/DeepSeekHarness/claude/ios_pandora/bootmgr/test/guard_test.sh`
+3. 还没做（主会话的内核）：写日志、挂载系统盘之前核对开头的标志。
