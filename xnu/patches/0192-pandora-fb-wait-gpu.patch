@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 5510765..fdc40d7 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2264,6 +2264,14 @@ gpu_fence_done(uint32_t seq)
+ 	return (int32_t)(mem[1] - seq) >= 0;
+ }
+ 
++/* The last fence issued, 0 while the GPU is not up (iokit/Kernel/arm/SweetFramebuffer.cpp, 0192). */
++uint32_t pandora_gpu_issued(void);
++uint32_t
++pandora_gpu_issued(void)
++{
++	return gpu_ready ? gpu_seqno : 0;
++}
++
+ /* Without the lock: until fence seq or the timeout (0 = look once). 0, ETIMEDOUT, EINVAL. */
+ int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
+ int
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2d400eb..ab09633 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -181,6 +181,9 @@ sweet_fb_scale(uint32_t p, uint32_t k)
+ #include <sys/proc.h>
+ #if defined(PANDORA)
+ extern "C" void flush_dcache(vm_offset_t addr, unsigned count, int phys);
++#include <sys/errno.h>
++extern "C" uint32_t pandora_gpu_issued(void);                         /* bsd/dev/pandora_gpu.c */
++extern "C" int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
+ 
+ /* Patch 0188: with a Metal client the GPU writes IOSurfaces non-cacheably (bsd/dev/pandora_gpu.c);
+  * the copy below then cleans and invalidates each source row first, or it can copy stale lines. */
+@@ -274,6 +277,9 @@ public:
+ 	uint64_t      fGpuTime, fCpuTime;
+ 	bool          fGpuPending;
+ 	uint32_t      fGpuBusyTicks, fGpuFailed;
++	uint32_t      fPendingSeq;    /* PANDORA: GPU fence issued when fPending was swapped (0: none) */
++	bool          fGpuDeferred;   /* PANDORA: the last flush tick waited for that fence */
++	uint32_t      fStatGpuWait;   /* PANDORA: flush ticks that waited for the GPU */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -825,6 +831,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++#if defined(PANDORA)
++	/* A frame the GPU has not finished waits; it is shown on the first tick after. */
++	flush = fb->fDirty && ((count % fb->fFlushTicks) == 0 || fb->fGpuDeferred);
++	if (flush && fb->fPendingSeq && pandora_gpu_wait(fb->fPendingSeq, 0) == ETIMEDOUT) {
++		flush = false;
++		if (!fb->fGpuDeferred) {
++			fb->fStatGpuWait++;
++		}
++		fb->fGpuDeferred = true;
++	} else if (flush) {
++		fb->fGpuDeferred = false;
++	}
++#endif
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -901,6 +920,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ #endif
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++#if defined(PANDORA)
++	fPendingSeq = sweetfb_gpu_frames() ? pandora_gpu_issued() : 0;
++#endif
+ 	fStatSwaps++;
+ 	if (fDirty) {
+ 		fStatDropped++;         /* the previous frame was never shown */
+@@ -1203,12 +1225,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 		absolutetime_to_nanoseconds(fStatCopyMax, &max_ns);
+ 		absolutetime_to_nanoseconds(t1 - fStatStart, &span_ns);
+ 		IOLockLock(fLock);
+-		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
+-		fStatSwaps = fStatDropped = 0;
++		uint32_t swaps = fStatSwaps, dropped = fStatDropped, gpuWait = fStatGpuWait;
++		fStatSwaps = fStatDropped = fStatGpuWait = 0;
+ 		IOLockUnlock(fLock);
+ 		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
+-		    "%u swaps, %u not shown\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
+-		    max_ns / 1000, swaps, dropped);
++		    "%u swaps, %u not shown, %u waited for the GPU\n", fStatFrames, span_ns / 1000000,
++		    avg_ns / 1000, max_ns / 1000, swaps, dropped, gpuWait);
+ 		uint64_t gpu_ns, cpu_ns;
+ 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
+ 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);

@@ -2264,6 +2264,14 @@ gpu_fence_done(uint32_t seq)
 	return (int32_t)(mem[1] - seq) >= 0;
 }
 
+/* The last fence issued, 0 while the GPU is not up (iokit/Kernel/arm/SweetFramebuffer.cpp, 0192). */
+uint32_t pandora_gpu_issued(void);
+uint32_t
+pandora_gpu_issued(void)
+{
+	return gpu_ready ? gpu_seqno : 0;
+}
+
 /* Without the lock: until fence seq or the timeout (0 = look once). 0, ETIMEDOUT, EINVAL. */
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 int

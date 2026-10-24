@@ -124,5 +124,5 @@ GPUPOOL=${POOL#0} KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_t
 
 echo "== 6. results"
 L=$ROOT/device/logs/$NAME.txt
-grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA GPU UC: (AGX|client|open)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|MTLTEST:|AMFI: .*(vktest|libvulkan)|dyld|NativeAdrenoMetal|panic\(" "$L" | cut -c1-240 | head -120
+grep -E "PANDORA GPU: (buffer pool|slice mask|hw_init rest|level 1[0-5] |self-test)|PANDORA GPU UC: (AGX|client|open)|PANDORA FILES|SWEET EXECSWAP|VKTEST:|MTLTEST:|AMFI: .*(vktest|libvulkan)|dyld|NativeAdrenoMetal|panic\(" "$L" | cut -c1-240 | head -120 || true
 echo "VKTEST PASS $(grep -c 'VKTEST: PASS' "$L"), FAIL lines $(grep -c 'VKTEST: .*FAIL' "$L"), restarts $(grep -c 'restart type' "$L")"
