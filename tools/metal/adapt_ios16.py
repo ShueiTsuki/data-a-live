@@ -777,7 +777,9 @@ edit('NativeBridgeMetalFrontend.mm',
   flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
   for(NSArray *w in objc_getAssociatedObject(self,&gProbeWatchKey)) {   // ios-pandora: the probe's buffers at commit
    id<MTLBuffer> buffer=w[0];const NSUInteger offset=[w[1] unsignedLongValue];const uint8_t *c=(const uint8_t *)buffer.contents;
-   NSLog(@"pandora-metal watch %@ at commit: %@",w[2],c && offset<buffer.length?probeHex(c+offset,buffer.length-offset,64):@"(no contents)");
+   // bb39: QuartzCore writes these buffers after binding them; what the GPU reads is what they hold at commit, so the
+   // replay takes its bytes from here (1 KiB from the offset, in pieces).
+   probeLog([NSString stringWithFormat:@"commit %@",w[2]],@"bytes",c && offset<buffer.length?probeHex(c+offset,buffer.length-offset,1024):@"(no contents)");
   }
   // Completion owns this reference""")
 edit('NativeBridgeMetalFrontend.mm',
