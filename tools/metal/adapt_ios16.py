@@ -380,7 +380,11 @@ edit('NativeBridgeMetalFrontend.mm',
     static const uint8_t red[16]={0xfc,0xfd,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff};
     const NSUInteger blocks=rowBytes/16;
     for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<blocks/2;x++)memcpy(&copy[y*rowBytes+x*16],red,16);
-    if(probeLevel>=2) {
+    static std::atomic<int> handed{0};
+    const int handedNth=handed.fetch_add(1);
+    // Level 2: every large ASTC image is handed over as BGRA8; level 3: every other one (the first BGRA8, the second
+    // ASTC with its left half red), so one run shows both.
+    if(probeLevel==2 || (probeLevel>=3 && handedNth%2==0)) {
      // bb35: the ASTC blocks are in the texture exactly as uploaded, yet no red is drawn. Level 2 hands QuartzCore a
      // BGRA8 texture of the same size instead (left half red, right half green): colour on screen = only ASTC
      // sampling is wrong; still transparent = the sampling or the draw is wrong whatever the format.
@@ -447,7 +451,7 @@ static int pandoraAstcProbeLevel() {   // ios-pandora: boot-arg pandora_astc_pro
  return level;
 }
 static bool pandoraAstcProbe() {return pandoraAstcProbeLevel()>=1;}
-static char gProbePassTargetKey,gProbeReadbackKey;
+static char gProbePassTargetKey,gProbeReadbackKey,gProbeSamplerKey,gProbeBindingsKey;
 """)
 edit('NativeBridgeMetalFrontend.mm',
      """ return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];""",
@@ -526,3 +530,48 @@ edit('NativeBridgeMetalFrontend.mm',
    (unsigned long)d.rAddressMode,(unsigned long)d.borderColor,(int)d.normalizedCoordinates,d.lodMinClamp,d.lodMaxClamp,(unsigned long)d.compareFunction);
  }
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);""")
+
+# ---- ios-pandora: what the App Library draw binds, probe level 3 (bb36) ---------------------------------------
+# The samplers and fragment bytes bound when a probed texture is bound, for the first draws: with the samplers'
+# descriptors (kept on each sampler as it is made) and the first 64 bytes of each fragment bytes binding.
+edit('NativeBridgeMetalFrontend.mm',
+     """ NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;""",
+     """ NBSampler *sampler=[NBSampler new];sampler.handle=handle;
+ if(pandoraAstcProbe())objc_setAssociatedObject(sampler,&gProbeSamplerKey,[NSString stringWithFormat:@"min%lu mag%lu mip%lu addr%lu/%lu border%lu norm%d",
+  (unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,
+  (unsigned long)d.borderColor,(int)d.normalizedCoordinates],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ return (id<MTLSamplerState>)sampler;""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ [self check:nmb_encoder_set_sampler(_handle,stage,""",
+     """ if(pandoraAstcProbe() && stage==2) {   // ios-pandora: remembered for the probe's draw log
+  NSMutableDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
+  if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+  NSString *what=sampler?objc_getAssociatedObject(sampler,&gProbeSamplerKey):nil;
+  seen[[NSString stringWithFormat:@"s%lu",(unsigned long)index]]=what?:(sampler?@"?":@"none");
+ }
+ [self check:nmb_encoder_set_sampler(_handle,stage,""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""",
+     """ if(pandoraAstcProbe() && stage==2 && bytes) {   // ios-pandora: remembered for the probe's draw log
+  NSMutableDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
+  if(!seen){seen=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,&gProbeBindingsKey,seen,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+  NSMutableString *hex=[NSMutableString stringWithFormat:@"%lu:",(unsigned long)length];
+  for(NSUInteger k=0;k<length && k<64;k++)[hex appendFormat:@"%s%02x",k%4?"":" ",((const uint8_t *)bytes)[k]];
+  seen[[NSString stringWithFormat:@"b%lu",(unsigned long)index]]=hex;
+ }
+ [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   [targets addObject:target];
+  }
+ }""",
+     """   [targets addObject:target];
+  }
+  static std::atomic<int> drawsTold{0};
+  if(drawsTold.fetch_add(1)<12) {
+   NSDictionary *seen=objc_getAssociatedObject(self,&gProbeBindingsKey);
+   NSMutableString *line=[NSMutableString string];
+   for(NSString *k in [seen.allKeys sortedArrayUsingSelector:@selector(compare:)])[line appendFormat:@" [%@ %@]",k,seen[k]];
+   NSLog(@"pandora-metal probe draw: texture %lux%lu format %lu at index %lu stage %u;%@",(unsigned long)texture.width,
+         (unsigned long)texture.height,(unsigned long)texture.pixelFormat,(unsigned long)index,stage,line);
+  }
+ }""")

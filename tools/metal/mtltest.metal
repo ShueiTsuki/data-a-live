@@ -48,3 +48,22 @@ fragment float4 tex_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(0)
 	constexpr sampler s(filter::nearest);
 	return t.sample(s, in.uv);
 }
+
+// Part 6: the same with linear filtering, in pixel coordinates with clamp-to-zero, and at texture index 3.
+fragment float4 tex_lin_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(0)]])
+{
+	constexpr sampler s(filter::linear, address::clamp_to_edge);
+	return t.sample(s, in.uv);
+}
+
+fragment float4 tex_px_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(0)]])
+{
+	constexpr sampler s(coord::pixel, address::clamp_to_zero, filter::linear);
+	return t.sample(s, in.uv * float2(t.get_width(), t.get_height()));
+}
+
+fragment float4 tex3_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(3)]])
+{
+	constexpr sampler s(filter::nearest);
+	return t.sample(s, in.uv);
+}

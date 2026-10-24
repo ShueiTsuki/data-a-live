@@ -312,6 +312,93 @@ run(void)
 				failures += bad != 0 || cb.status != MTLCommandBufferStatusCompleted;
 			}
 		}
+
+		/* ---- part 6: what differs between part 5 and the App Library (bb32-bb35) ---- */
+		/* QuartzCore's 1125x2436 ASTC images hold the right blocks (read back), yet sampling them draws transparent black.
+		 * Each case draws an all-red image into a 64x64 target and counts red pixels: (a) ASTC 1125x2436, (b) ASTC 64x64,
+		 * (c) BGRA8 1125x2436, (d) ASTC 1125x2436 with linear filtering, (e) ASTC 1125x2436 in pixel coordinates with
+		 * clamp-to-zero, (f) ASTC 1125x2436 bound at texture index 3 as QuartzCore binds it. */
+		{
+			static const uint8_t red[16] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff };
+			id<MTLBuffer> out = [dev newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+			MTLTextureDescriptor *rt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			    width:64 height:64 mipmapped:NO];
+			rt.usage = MTLTextureUsageRenderTarget;
+			rt.storageMode = MTLStorageModePrivate;
+			id<MTLTexture> target = [dev newTextureWithDescriptor:rt];
+			id<MTLTexture> (^astcTexture)(NSUInteger, NSUInteger) = ^id<MTLTexture>(NSUInteger w, NSUInteger h) {
+				const NSUInteger row = (w + 3) / 4 * 16, rows = (h + 3) / 4;
+				uint8_t *bytes = malloc(row * rows);
+				for (NSUInteger i = 0; i < row * rows; i += 16) {
+					memcpy(bytes + i, red, 16);
+				}
+				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR
+				    width:w height:h mipmapped:NO];
+				d.usage = MTLTextureUsageShaderRead;
+				id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+				[t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bytes bytesPerRow:row];
+				free(bytes);
+				return t;
+			};
+			MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			    width:1125 height:2436 mipmapped:NO];
+			pd.usage = MTLTextureUsageShaderRead;
+			id<MTLTexture> plain = [dev newTextureWithDescriptor:pd];
+			uint32_t *px = malloc(1125 * 2436 * 4);
+			for (NSUInteger i = 0; i < 1125 * 2436; i++) {
+				px[i] = 0xffff0000u;   /* BGRA8: red */
+			}
+			[plain replaceRegion:MTLRegionMake2D(0, 0, 1125, 2436) mipmapLevel:0 withBytes:px bytesPerRow:1125 * 4];
+			free(px);
+			id<MTLTexture> big = astcTexture(1125, 2436), small = astcTexture(64, 64);
+			struct { const char *name, *fs; id<MTLTexture> tex; NSUInteger index; } cases[] = {
+				{ "6a ASTC 1125x2436 nearest", "tex_fs", big, 0 },
+				{ "6b ASTC 64x64 nearest", "tex_fs", small, 0 },
+				{ "6c BGRA8 1125x2436 nearest", "tex_fs", plain, 0 },
+				{ "6d ASTC 1125x2436 linear", "tex_lin_fs", big, 0 },
+				{ "6e ASTC 1125x2436 pixel coordinates, clamp to zero", "tex_px_fs", big, 0 },
+				{ "6f ASTC 1125x2436 at texture 3", "tex3_fs", big, 3 },
+			};
+			for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+				MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+				rpd.vertexFunction = [lib newFunctionWithName:@"quad_vs"];
+				rpd.fragmentFunction = [lib newFunctionWithName:@(cases[c].fs)];
+				rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+				err = nil;
+				id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+				if (check("part 6: render pipeline", rps, err) || check("part 6: target", target, nil) ||
+				    check("part 6: texture", cases[c].tex, nil)) {
+					failures++;
+					continue;
+				}
+				MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+				pass.colorAttachments[0].texture = target;
+				pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+				pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+				pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+				id<MTLCommandBuffer> cb = [queue commandBuffer];
+				id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+				[enc setRenderPipelineState:rps];
+				[enc setFragmentTexture:cases[c].tex atIndex:cases[c].index];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+				[blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+				    sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:256
+				    destinationBytesPerImage:64 * 256];
+				[blit endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				const uint32_t *got = (const uint32_t *)out.contents;
+				unsigned redPixels = 0;
+				for (unsigned i = 0; i < 64 * 64; i++) {
+					redPixels += got[i] == 0xff0000ffu;
+				}
+				say("MTLTEST: part %s: status %ld; %u of 4096 red; corners %08x %08x %08x %08x%s", cases[c].name, (long)cb.status,
+				    redPixels, got[0], got[63], got[64 * 63], got[64 * 64 - 1], redPixels == 4096 ? "" : " FAIL");
+				failures += redPixels != 4096 || cb.status != MTLCommandBufferStatusCompleted;
+			}
+		}
 }
 
 int
