@@ -54,6 +54,14 @@
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（Turnip Vulkan 驱动）、[metal2vulkan](https://github.com/steelbrain/metal2vulkan)（Metal 着色器翻译）。
 - Linux 内核的 msm/Adreno 驱动：GPU 寄存器和启动顺序的参考。
 
+## 支持开发
+
+如果这个项目对你有帮助，可以用微信扫码打赏：
+
+<img src="docs/wechat-reward.jpg" alt="微信赞赏码" width="240">
+
+打赏是支持开发者投入的时间，与苹果公司无关，不购买任何软件，也没有付费功能或付费版本。本项目永远不提供苹果的系统文件。
+
 ## 许可证
 
 内核补丁和编进内核的源码使用 APSL 2.0（与 xnu 相同）；其余本项目的代码和文档使用 MIT；第三方文件保留各自的许可证。详见 [LICENSE](LICENSE)。
