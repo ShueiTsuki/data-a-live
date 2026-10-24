@@ -16,6 +16,14 @@
  *     adds (one cycle each), not the PMU, which the hypervisor may trap;
  *   - SCMI performance protocol: version, domains, each domain's name, levels and limits, the current level.
  * The clock measure is repeated at 20 s and 60 s.
+ *
+ * Patch 0201: the governor, boot-arg pandora_cpu=2. After checking that a level set through SCMI moves the clock
+ * (each domain at its top and bottom level, measured on its first CPU), every 16 ms window it takes each domain's
+ * busiest CPU (idle time from recount, osfmk/arm/pandora_cpu_idle.c) and asks for the lowest level that gives
+ * 1.25 x what that CPU used (Linux schedutil: next = 1.25 * busy * current), at least twice the current clock
+ * when the CPU was nearly always busy (walt's hispeed jump). Up at once; down when four windows in a row want
+ * less. Capped at the firmware's sustained level (the boost levels above it are left alone) and at its limits,
+ * which it lowers when hot. Boot-args pandora_cpu_fix0 / pandora_cpu_fix1 = a fixed level for domain 0 / 1.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -33,6 +41,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void IOSleep(unsigned int milliseconds);
 extern processor_t thread_bind(processor_t processor);   /* kern/sched_prim.h, not exported to BSD */
+extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_cpu_idle.c */
 
 #define PDP_MBOX_TX_PA          0x19980000ull   /* qcom,pdp0 "tx" registers */
 #define PDP_MBOX_TX_CMD(ch)     (0x100u + (ch) * 8u + 4u)
@@ -214,24 +223,179 @@ cpu_clock_mhz(void)
 	return ns ? (uint32_t)(rounds * 16 * 1000 / ns) : 0;
 }
 
+/* The clock of CPU, measured from a thread bound to it. */
+static uint32_t
+cpu_clock_on(int cpu)
+{
+	processor_t p = cpu_to_processor(cpu);
+	if (p == PROCESSOR_NULL) {
+		return 0;
+	}
+	thread_bind(p);
+	thread_block(THREAD_CONTINUE_NULL);
+	const uint32_t mhz = cpu_clock_mhz();
+	thread_bind(PROCESSOR_NULL);
+	thread_block(THREAD_CONTINUE_NULL);
+	return mhz;
+}
+
+/* Each SCMI domain's first CPU (0 and 6). */
 static void
 cpu_clocks(const char *when)
 {
-	const ml_topology_info_t *t = ml_get_topology_info();
-	for (unsigned int c = 0; t && c < t->num_clusters; c++) {
-		const ml_topology_cluster_t *cl = &t->clusters[c];
-		processor_t p = cpu_to_processor((int)cl->first_cpu_id);
-		if (p == PROCESSOR_NULL) {
-			continue;
+	printf("PANDORA CPU: %s: cpu 0 (domain 0) about %u MHz, cpu 6 (domain 1) about %u MHz\n", when, cpu_clock_on(0),
+	    cpu_clock_on(6));
+}
+
+/* ---- governor (patch 0201) ---- */
+static const uint32_t cpu_khz0[] = { 384000, 537600, 691200, 787200, 883200, 998400, 1113600, 1228800, 1324800, 1440000,
+	1555200, 1670400, 1785600, 1900800, 1996800, 2112000, 2227200, 2361600, 2496000, 2611200, 2745600, 2899200, 3033600,
+	3187200, 3302400, 3398400, 3513600, 3628800 };
+static const uint32_t cpu_khz1[] = { 768000, 883200, 1017600, 1132800, 1267200, 1382400, 1497600, 1632000, 1747200, 1862400,
+	1977600, 2112000, 2227200, 2438400, 2668800, 2880000, 3129600, 3398400, 3648000, 3763200, 3859200, 3974400, 4070400,
+	4185600, 4262400, 4339200, 4396800 };
+struct cpu_domain {
+	const uint32_t *khz;
+	uint32_t levels, first, count;   /* table, CPUs first .. first + count - 1 */
+	uint32_t level, top, fixed;      /* current, cap, fixed level or ~0 */
+	uint32_t down_windows, want_max_down, changes, set_errors;
+	uint64_t busy_sum, khz_sum, windows;
+};
+static struct cpu_domain cpu_dom[2] = {
+	{ cpu_khz0, sizeof(cpu_khz0) / 4, 0, 6, 0, 27, ~0u, 0, 0, 0, 0, 0, 0, 0 },
+	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+static int
+cpu_set_level(uint32_t d, uint32_t level)
+{
+	uint32_t in[2] = { d, level }, out[4], n = 0;
+	const int r = scmi_call(SCMI_PROTO_PERF, 0x7, in, 2, out, 4, &n);
+	return r ? r : (n ? (int)out[0] : -4);
+}
+
+static uint32_t
+cpu_get(uint32_t d, uint32_t msg, uint32_t word)
+{
+	uint32_t in[1] = { d }, out[8], n = 0;
+	return (!scmi_call(SCMI_PROTO_PERF, msg, in, 1, out, 8, &n) && n > word && (int)out[0] == 0) ? out[word] : ~0u;
+}
+
+/* Does a level set move the clock? Each domain to its top and bottom level, measured on its first CPU. */
+static void
+cpu_check_levels(void)
+{
+	for (uint32_t d = 0; d < 2; d++) {
+		struct cpu_domain *dm = &cpu_dom[d];
+		const uint32_t tries[2] = { dm->top, 0 };
+		for (int k = 0; k < 2; k++) {
+			const int r = cpu_set_level(d, tries[k]);
+			IOSleep(20);
+			printf("PANDORA CPU: check: domain %u set level %u (%u MHz): result %d, firmware level now %d, cpu %u about %u MHz\n",
+			    d, tries[k], dm->khz[tries[k]] / 1000, r, (int)cpu_get(d, 0x8, 1), dm->first, cpu_clock_on((int)dm->first));
 		}
-		thread_bind(p);
-		thread_block(THREAD_CONTINUE_NULL);
-		const uint32_t mhz = cpu_clock_mhz();
-		printf("PANDORA CPU: %s: cluster %u (type %d, cpu %u) runs at about %u MHz (on cpu %d)\n", when, cl->cluster_id,
-		    (int)cl->cluster_type, cl->first_cpu_id, mhz, cpu_number());
 	}
-	thread_bind(PROCESSOR_NULL);
-	thread_block(THREAD_CONTINUE_NULL);
+}
+
+static void
+cpu_governor(void)
+{
+	uint64_t now, last_log, two;
+	uint64_t idle[8] = { 0 }, stamp;
+	int fix;
+	nanoseconds_to_absolutetime(2000 * NSEC_PER_MSEC, &two);
+	for (uint32_t d = 0; d < 2; d++) {
+		struct cpu_domain *dm = &cpu_dom[d];
+		const uint32_t top = cpu_get(d, 0x3, 4);   /* sustained level */
+		if (top != ~0u && top < dm->levels) {
+			dm->top = top;
+		}
+		fix = -1;
+		(void)PE_parse_boot_argn(d ? "pandora_cpu_fix1" : "pandora_cpu_fix0", &fix, sizeof(fix));
+		dm->fixed = fix >= 0 && (uint32_t)fix < dm->levels ? (uint32_t)fix : ~0u;
+		dm->level = dm->fixed != ~0u ? dm->fixed : dm->top;
+		const int r = cpu_set_level(d, dm->level);
+		printf("PANDORA CPU: governor: domain %u cpus %u-%u, %u levels, cap %u (%u MHz)%s, start at %u: %d\n", d, dm->first,
+		    dm->first + dm->count - 1, dm->levels, dm->top, dm->khz[dm->top] / 1000, dm->fixed != ~0u ? ", fixed" : "",
+		    dm->level, r);
+	}
+	for (int c = 0; c < 8; c++) {
+		idle[c] = pandora_cpu_idle_mach(c);
+	}
+	stamp = last_log = mach_absolute_time();
+	for (uint64_t round = 0;; round++) {
+		IOSleep(16);
+		now = mach_absolute_time();
+		const uint64_t span = now - stamp;
+		stamp = now;
+		uint32_t busy_pm[8];
+		for (int c = 0; c < 8; c++) {
+			const uint64_t i = pandora_cpu_idle_mach(c), di = i - idle[c];
+			idle[c] = i;
+			busy_pm[c] = span ? (uint32_t)(di >= span ? 0 : 1000 - di * 1000 / span) : 0;
+		}
+		for (uint32_t d = 0; d < 2; d++) {
+			struct cpu_domain *dm = &cpu_dom[d];
+			uint32_t busy = 0;
+			for (uint32_t c = dm->first; c < dm->first + dm->count; c++) {
+				busy = busy_pm[c] > busy ? busy_pm[c] : busy;
+			}
+			dm->busy_sum += busy;
+			dm->khz_sum += dm->khz[dm->level];
+			dm->windows++;
+			if (dm->fixed != ~0u) {
+				continue;
+			}
+			/* schedutil: 1.25 x what was used at the current clock; nearly always busy: at least twice the clock */
+			uint64_t need = (uint64_t)dm->khz[dm->level] * busy * 5 / 4 / 1000;
+			if (busy >= 900 && need < 2ull * dm->khz[dm->level]) {
+				need = 2ull * dm->khz[dm->level];
+			}
+			uint32_t want = 0;
+			while (want < dm->top && dm->khz[want] < need) {
+				want++;
+			}
+			if (want > dm->level) {
+				dm->down_windows = 0;
+			} else if (want < dm->level) {
+				dm->want_max_down = dm->down_windows ? (want > dm->want_max_down ? want : dm->want_max_down) : want;
+				if (++dm->down_windows < 4) {
+					continue;
+				}
+				want = dm->want_max_down;
+				dm->down_windows = 0;
+			} else {
+				dm->down_windows = 0;
+				continue;
+			}
+			if (want != dm->level) {
+				if (cpu_set_level(d, want) == 0) {
+					dm->level = want;
+					dm->changes++;
+				} else if (dm->set_errors++ < 5) {
+					printf("PANDORA CPU: governor: domain %u level %u refused\n", d, want);
+				}
+			}
+		}
+		/* every 2 s: average busyness and clock per domain, changes, the firmware's limit and level */
+		if (now - last_log >= two) {
+			last_log = now;
+			for (uint32_t d = 0; d < 2; d++) {
+				struct cpu_domain *dm = &cpu_dom[d];
+				const uint32_t limit = cpu_get(d, 0x6, 1), fw = cpu_get(d, 0x8, 1);
+				if (limit != ~0u && limit < dm->top && dm->level > limit) {
+					dm->level = limit;
+				}
+				if (round < 4000 || (round % 1250) < 125) {
+					printf("PANDORA CPU: governor: domain %u busy %llu%% avg %llu MHz, level %u (%u MHz), %u changes, limit %d, firmware %d\n",
+					    d, dm->windows ? dm->busy_sum / dm->windows / 10 : 0, dm->windows ? dm->khz_sum / dm->windows / 1000 : 0,
+					    dm->level, dm->khz[dm->level] / 1000, dm->changes, (int)limit, (int)fw);
+				}
+				dm->busy_sum = dm->khz_sum = dm->windows = 0;
+				dm->changes = 0;
+			}
+		}
+	}
 }
 
 static void
@@ -254,6 +418,13 @@ cpu_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 	cpu_clocks("at 3 s");
 	cpu_scmi_probe();
+	int mode = 1;
+	(void)PE_parse_boot_argn("pandora_cpu", &mode, sizeof(mode));
+	if (mode >= 2 && cpu_mbox && cpu_shmem) {
+		cpu_check_levels();
+		cpu_clocks("after the check");
+		cpu_governor();   /* does not return */
+	}
 	IOSleep(17000);
 	cpu_clocks("at 20 s");
 	IOSleep(40000);
