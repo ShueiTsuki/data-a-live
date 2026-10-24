@@ -190,10 +190,14 @@ sweep(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 	const MTLPixelFormat formats[] = { MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatRGBA8Unorm,
 		MTLPixelFormatRGBA16Float, MTLPixelFormatR8Unorm, MTLPixelFormatRG8Unorm, MTLPixelFormatRGB10A2Unorm,
 		MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB, MTLPixelFormatASTC_8x8_LDR };
-	const NSUInteger sizes[][2] = { { 64, 64 }, { 333, 77 }, { 1125, 2436 }, { 2048, 2048 } };
+	const NSUInteger sizes[][2] = { { 64, 64 }, { 333, 77 }, { 1125, 2436 } };   /* bb36: 2048x2048 ran the shared pool out */
 	const char *uploadName[4] = { "replace", "blit-private", "nocopy", "iosurface" };
 	unsigned cases = 0, good = 0, told = 0;
 	for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+		if ([(id)dev respondsToSelector:@selector(currentAllocatedSize)]) {   /* bb36: is what the sweep frees given back? */
+			say("MTLTEST: part 7: before format %lu the device holds %lu MiB", (unsigned long)formats[f],
+			    (unsigned long)(dev.currentAllocatedSize >> 20));
+		}
 		for (unsigned z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
 			for (unsigned u = 0; u < 4; u++) @autoreleasepool {
 				const MTLPixelFormat format = formats[f];
@@ -392,6 +396,178 @@ sweep(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 	}
 	say("MTLTEST: part 7: texture indices %u of 16 right%s%s", right, right == 16 ? "" : " FAIL:", wrong);
 	failures += right != 16;
+}
+
+/* ---- part 8: framebuffer fetch (bb37) ----
+ * QuartzCore's App Library draw reads its attachments in the shader (fc_framebuffer_fetch) and blends there; its
+ * output came out transparent although the texture and its sampling are right (bb30-bb36). Each case draws into
+ * BGRA8 targets of 64x64 and of 1125x2436 (private, as QuartzCore's) and checks five points:
+ *   a: cleared red, fetch_fs -> blue          b: solid_fs then fetch_fs in one pass -> solid with red and blue swapped
+ *   c: filled red by an earlier pass, loaded -> blue
+ *   d: cleared white, fetch_tex_fs over an all-red ASTC 1125x2436 image -> red
+ *   e: two attachments cleared red and blue, fetch2_fs -> swapped
+ * mtltest runs again and again in a boot (launchd restarts it with vktest); each launch takes the next TU_DEBUG of
+ * kTuDebug (main), so one boot shows the cases under each. */
+static const char *const kTuDebug[] = { "sysmem,nocb", "sysmem,nocb,noubwc", "sysmem,nocb,flushall", "sysmem,nocb,rast_order",
+	"sysmem,nocb,syncdraw", "nocb", "sysmem,nocb,noubwc,flushall" };
+
+static void
+fetchTests(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+	const char *tu = getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "-";
+	id<MTLRenderPipelineState> (^pipeline)(NSString *, unsigned) = ^id<MTLRenderPipelineState>(NSString *fs, unsigned colors) {
+		MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+		d.vertexFunction = [lib newFunctionWithName:@"quad_vs"];
+		d.fragmentFunction = [lib newFunctionWithName:fs];
+		for (unsigned c = 0; c < colors; c++) {
+			d.colorAttachments[c].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		}
+		NSError *e = nil;
+		id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:d error:&e];
+		if (!p) {
+			say("MTLTEST: part 8 [%s]: pipeline %s refused: %s", tu, fs.UTF8String, e.localizedDescription.UTF8String);
+		}
+		return p;
+	};
+	id<MTLRenderPipelineState> solid = pipeline(@"solid_fs", 1), fetch = pipeline(@"fetch_fs", 1),
+	    fetchTex = pipeline(@"fetch_tex_fs", 1), fetch2 = pipeline(@"fetch2_fs", 2);
+	/* the all-red ASTC image */
+	static const uint8_t red[16] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff };
+	MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:1125
+	    height:2436 mipmapped:NO];
+	ad.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> astc = [dev newTextureWithDescriptor:ad];
+	{
+		const NSUInteger row = 282 * 16, rows = 609;
+		uint8_t *bytes = malloc(row * rows);
+		for (NSUInteger i = 0; i < row * rows; i += 16) {
+			memcpy(bytes + i, red, 16);
+		}
+		[astc replaceRegion:MTLRegionMake2D(0, 0, 1125, 2436) mipmapLevel:0 withBytes:bytes bytesPerRow:row];
+		free(bytes);
+	}
+	const NSUInteger sizes[2][2] = { { 64, 64 }, { 1125, 2436 } };
+	for (unsigned z = 0; z < 2; z++) @autoreleasepool {
+		const NSUInteger w = sizes[z][0], h = sizes[z][1];
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w
+		    height:h mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		td.storageMode = MTLStorageModePrivate;
+		id<MTLTexture> t0 = [dev newTextureWithDescriptor:td], t1 = [dev newTextureWithDescriptor:td];
+		id<MTLBuffer> out = [dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
+		if (!t0 || !t1 || !out) {
+			say("MTLTEST: part 8 [%s] %lux%lu: no target", tu, (unsigned long)w, (unsigned long)h);
+			continue;
+		}
+		/* one pass over t0 (and t1 when `two`), loaded or cleared, drawing `draws` in order; then t0 (or t1) read back */
+		void (^pass)(MTLLoadAction, MTLClearColor, MTLClearColor, NSArray *, id<MTLTexture>, bool) =
+		    ^(MTLLoadAction load, MTLClearColor c0, MTLClearColor c1, NSArray *draws, id<MTLTexture> tex, bool two) {
+			MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+			p.colorAttachments[0].texture = t0;
+			p.colorAttachments[0].loadAction = load;
+			p.colorAttachments[0].clearColor = c0;
+			p.colorAttachments[0].storeAction = MTLStoreActionStore;
+			if (two) {
+				p.colorAttachments[1].texture = t1;
+				p.colorAttachments[1].loadAction = load;
+				p.colorAttachments[1].clearColor = c1;
+				p.colorAttachments[1].storeAction = MTLStoreActionStore;
+			}
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:p];
+			for (id<MTLRenderPipelineState> state in draws) {
+				[enc setRenderPipelineState:state];
+				if (tex) {
+					[enc setFragmentTexture:tex atIndex:0];
+				}
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			}
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+		};
+		/* the colour at five points of `t` as BGRA bytes, compared with `want`; a result line part */
+		NSString *(^check8)(id<MTLTexture>, const uint8_t *) = ^NSString *(id<MTLTexture> t, const uint8_t *want) {
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+			[bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+			    toBuffer:out destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+			[bl endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			const uint8_t *px = (const uint8_t *)out.contents;
+			const NSUInteger points[5][2] = { { w / 2, h / 2 }, { w / 4, h / 4 }, { 3 * w / 4, h / 4 }, { w / 4, 3 * h / 4 },
+				{ 3 * w / 4, 3 * h / 4 } };
+			unsigned bad = 0;
+			for (unsigned k = 0; k < 5; k++) {
+				const uint8_t *p = px + (points[k][1] * w + points[k][0]) * 4;
+				for (unsigned c = 0; c < 4; c++) {
+					if (abs((int)p[c] - want[c]) > 3) {
+						bad++;
+						break;
+					}
+				}
+			}
+			const uint8_t *m = px + (h / 2 * w + w / 2) * 4;
+			return bad ? [NSString stringWithFormat:@"FAIL %u/5 (centre bgra %02x%02x%02x%02x, want %02x%02x%02x%02x)", bad, m[0],
+			    m[1], m[2], m[3], want[0], want[1], want[2], want[3]] : @"ok";
+		};
+		const MTLClearColor redC = MTLClearColorMake(1, 0, 0, 1), blueC = MTLClearColorMake(0, 0, 1, 1),
+		    blackC = MTLClearColorMake(0, 0, 0, 1), whiteC = MTLClearColorMake(1, 1, 1, 1);
+		static const uint8_t blue[4] = { 255, 0, 0, 255 }, redB[4] = { 0, 0, 255, 255 }, swapped[4] = { 64, 128, 191, 255 };
+		NSMutableString *line = [NSMutableString string];
+		if (fetch) {
+			pass(MTLLoadActionClear, redC, redC, @[ fetch ], nil, false);
+			[line appendFormat:@" a %@;", check8(t0, blue)];
+		}
+		if (solid && fetch) {
+			pass(MTLLoadActionClear, blackC, blackC, @[ solid, fetch ], nil, false);
+			[line appendFormat:@" b %@;", check8(t0, swapped)];
+		}
+		if (fetch && solid) {
+			pass(MTLLoadActionClear, redC, redC, @[], nil, false);
+			pass(MTLLoadActionLoad, redC, redC, @[ fetch ], nil, false);
+			[line appendFormat:@" c %@;", check8(t0, blue)];
+		}
+		if (fetchTex && astc) {
+			pass(MTLLoadActionClear, whiteC, whiteC, @[ fetchTex ], astc, false);
+			[line appendFormat:@" d %@;", check8(t0, redB)];
+		}
+		if (fetch2) {
+			pass(MTLLoadActionClear, redC, blueC, @[ fetch2 ], nil, true);
+			[line appendFormat:@" e c0 %@, c1 %@;", check8(t0, blue), check8(t1, redB)];
+		}
+		say("MTLTEST: part 8 [TU_DEBUG=%s] %lux%lu:%s", tu, (unsigned long)w, (unsigned long)h, line.UTF8String);
+		failures += [line containsString:@"FAIL"];
+	}
+}
+
+/* Each launch in a boot takes the next of kTuDebug (counted in /var/tmp/mtltest.launch with the boot session's UUID). */
+static void
+pickTuDebug(void)
+{
+	char uuid[64] = { 0 }, text[128] = { 0 };
+	size_t size = sizeof(uuid) - 1;
+	unsigned n = 0;
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &size, NULL, 0) != 0) {
+		return;
+	}
+	int fd = open("/var/tmp/mtltest.launch", O_RDONLY);
+	if (fd >= 0) {
+		(void)read(fd, text, sizeof(text) - 1);
+		close(fd);
+		char *space = strchr(text, ' ');
+		if (space && (size_t)(space - text) == strlen(uuid) && !strncmp(text, uuid, strlen(uuid))) {
+			n = (unsigned)atoi(space + 1);
+		}
+	}
+	fd = open("/var/tmp/mtltest.launch", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		snprintf(text, sizeof(text), "%s %u", uuid, n + 1);
+		(void)write(fd, text, strlen(text));
+		close(fd);
+	}
+	setenv("TU_DEBUG", kTuDebug[n % (sizeof(kTuDebug) / sizeof(kTuDebug[0]))], 1);
 }
 
 static void
@@ -764,6 +940,7 @@ run(void)
 			}
 		}
 		sweep(dev, queue, lib);
+		fetchTests(dev, queue, lib);
 }
 
 int
@@ -775,7 +952,8 @@ main(void)
 			dup2(con, 1);
 			dup2(con, 2);
 		}
-		say("MTLTEST: start (%s)", getprogname());
+		pickTuDebug();
+		say("MTLTEST: start (%s) TU_DEBUG=%s", getprogname(), getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "-");
 		run();
 		say("MTLTEST: %s (%u failures)", failures ? "FAIL" : "PASS", failures);
 	}

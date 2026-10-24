@@ -29,12 +29,35 @@ def edit(name, old, new):
 
 
 edit('NativeAdrenoMetalPlugin.mm',
+     """#include <pthread.h>
+""",
+     """#include <pthread.h>
+#include <sys/sysctl.h>
+""")
+edit('NativeAdrenoMetalPlugin.mm',
      """    if (publish::requested()) return publish::deviceForPort(port);
     static bool attempted;""",
      """    if (publish::requested()) return publish::deviceForPort(port);
     // ios-pandora (iOS 16, Adreno 840): no stage-1 self-test, it drives the A740's raw ABI. A process named in
     // NativeAdrenoMetal.clients gets its own device, every other process (backboardd too) nil and its software renderer.
-    setenv("TU_DEBUG", "sysmem,nocb", 0);
+    {   // ios-pandora: TU_DEBUG from the boot-arg pandora_tu_debug=a,b,c when given (bb37), else sysmem,nocb; a value
+        // already in the environment wins either way (mtltest picks its own per launch).
+        static char chosen[128];
+        const char *flags = "sysmem,nocb";
+        char args[1024] = {};
+        size_t size = sizeof args - 1;
+        if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+            if (const char *at = strstr(args, "pandora_tu_debug=")) {
+                snprintf(chosen, sizeof chosen, "%.*s", (int)strcspn(at + 17, " "), at + 17);
+                flags = chosen;
+            }
+        setenv("TU_DEBUG", flags, 0);
+        static bool told;
+        if (!told) {
+            told = true;
+            NSLog(@"pandora-metal TU_DEBUG=%s", getenv("TU_DEBUG"));
+        }
+    }
     if (port) return publish::clientDevice(port);
     static bool attempted;""")
 edit('NativeAdrenoMetalPlugin.mm',

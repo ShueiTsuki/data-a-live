@@ -76,6 +76,39 @@ fragment float4 sweep_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(
 	return t.sample(s, in.uv * scale);
 }
 
+// Part 8: framebuffer fetch, as QuartzCore's App Library draw uses it (fc_framebuffer_fetch, its blend done in
+// the shader over two attachments; bb36). solid_fs writes a known colour; fetch_fs returns what it reads with red
+// and blue swapped, so a right read is told from an untouched or zero one; fetch_tex_fs multiplies a texture by
+// what it reads; fetch2_fs swaps two attachments.
+fragment float4 solid_fs(VertexUV in [[stage_in]])
+{
+	return float4(0.25, 0.5, 0.75, 1.0);
+}
+
+fragment float4 fetch_fs(VertexUV in [[stage_in]], float4 dst [[color(0)]])
+{
+	return dst.bgra;
+}
+
+fragment float4 fetch_tex_fs(VertexUV in [[stage_in]], float4 dst [[color(0)]], texture2d<float> t [[texture(0)]])
+{
+	constexpr sampler s(filter::linear);
+	return t.sample(s, in.uv) * dst;
+}
+
+struct TwoColors {
+	float4 c0 [[color(0)]];
+	float4 c1 [[color(1)]];
+};
+
+fragment TwoColors fetch2_fs(VertexUV in [[stage_in]], float4 d0 [[color(0)]], float4 d1 [[color(1)]])
+{
+	TwoColors out;
+	out.c0 = d1;
+	out.c1 = d0;
+	return out;
+}
+
 // Part 7: one 1x1 texture at each of the 16 indices; `which` picks the one to read.
 fragment float4 index_fs(VertexUV in [[stage_in]], constant uint &which [[buffer(0)]],
     texture2d<float> t0 [[texture(0)]], texture2d<float> t1 [[texture(1)]], texture2d<float> t2 [[texture(2)]],
