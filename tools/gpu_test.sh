@@ -6,7 +6,8 @@
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
-#      pre-release, and checks its SHA256SUMS
+#      pre-release, or with a directory copies an earlier run's files (out-root/turnip/NAME) or a
+#      local build, and checks its SHA256SUMS
 #   2. trust cache for vktest and libvulkan_freedreno.dylib (tools/pgputest/mktc.py)
 #   3. the GPU firmware pack (tools/mkfwpack.py): gen80200_{gmu,sqe,zap} from out-root/fwpack_src,
 #      vktest, the Turnip library and files.txt installing them (bsd/dev/pandora_files.c)
@@ -80,6 +81,11 @@ if [ "$ZIP" = release ]; then
 		sed -e 's|NativeAdrenoMetal.bundle/NativeAdrenoMetal$|NativeAdrenoMetal|' \
 			-e 's|NativeAdrenoMetal.bundle/Info.plist$|NativeAdrenoMetal.Info.plist|' "$T/SHA256SUMS.metal" >> "$T/SHA256SUMS"
 	fi
+elif [ -d "$ZIP" ]; then
+	# A directory: an earlier run's files (out-root/turnip/NAME) or a local build, nothing downloaded.
+	for f in libvulkan_freedreno.dylib vktest SHA256SUMS BUILD.txt NativeAdrenoMetal NativeAdrenoMetal.Info.plist mtltest; do
+		[ -f "$ZIP/$f" ] && cp "$ZIP/$f" "$T/"
+	done
 else
 	python -I -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$(winp "$ZIP")" "$(winp "$T")"
 fi
