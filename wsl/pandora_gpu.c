@@ -1676,6 +1676,10 @@ gpu_level11(void)
 #define CP_IB1_BASE_PIPE          0x900u
 #define CP_IB1_REM_SIZE_PIPE      0x902u
 #define CP_IB1_INIT_SIZE_PIPE     0x903u
+#define CP_IB2_BASE_PIPE          0x904u
+#define CP_IB2_REM_SIZE_PIPE      0x906u
+#define CP_IB2_INIT_SIZE_PIPE     0x907u
+#define CP_IB3_BASE_PIPE          0x908u
 
 static bool
 gpu_level12(void)
@@ -2176,7 +2180,7 @@ LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
 
 #define GPU_MAX_BOS       4096u
 #define GPU_MAX_CLIENTS   4u
-#define GPU_MAX_IBS       16u
+#define GPU_MAX_IBS       128u      /* NativeAdrenoAbiMaxBuffers (tools/turnip/abi_128.py, 0194) */
 struct gpu_bo {
 	bool used;
 	int client;
@@ -2544,8 +2548,14 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 	if (!n || n > GPU_MAX_IBS) {
 		return EINVAL;
 	}
-	uint64_t ib[GPU_MAX_IBS];
-	uint32_t dw[GPU_MAX_IBS], first = 0;
+	/* Off the kernel stack: 128 IBs (0194). */
+	uint64_t *ib = kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
+	uint32_t *dw = kalloc_data(n * sizeof(uint32_t), Z_WAITOK), first = 0;
+	if (!ib || !dw) {
+		kfree_data(ib, n * sizeof(uint64_t));
+		kfree_data(dw, n * sizeof(uint32_t));
+		return ENOMEM;
+	}
 	int err = 0;
 	lck_mtx_lock(&gpu_lock);
 	for (unsigned i = 0; i < n && !err; i++) {
@@ -2604,6 +2614,8 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 		gpu_clients[client].reset = false;
 	}
 	lck_mtx_unlock(&gpu_lock);
+	kfree_data(ib, n * sizeof(uint64_t));
+	kfree_data(dw, n * sizeof(uint32_t));
 	return err;
 }
 
@@ -2896,6 +2908,41 @@ gpu_level14(bool rest)
  * ring timestamp stops short of the last fence issued (bb19: backboardd froze, its waits timed
  * out until the end, and the log ring had no room left for what the GPU was doing).
  */
+/* 0194: the dwords of an IB around where the CP fetches (INIT - REM dwords in; it fetches ahead
+ * of what it runs), from the pool buffer that holds it. Under the lock. */
+static void
+gpu_hang_ib(const char *tag, uint64_t base, uint32_t init, uint32_t rem)
+{
+	if (!base || rem > init) {
+		return;
+	}
+	const uint32_t at = init - rem, from = at > 40 ? at - 40 : 0, to = MIN(init, at + 8);
+	for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
+		const struct gpu_bo *b = &gpu_bos[j];
+		if (!b->used || !b->iova || b->pages || base < b->iova || base + (uint64_t)to * 4 > b->iova + b->bytes) {
+			continue;
+		}
+		const uint64_t off = b->off + (base - b->iova) + (uint64_t)from * 4, len = (uint64_t)(to - from) * 4;
+		gpu_pool_sync(off, len, true);
+		vm_offset_t va = gpu_pool_map(off, len);
+		if (!va) {
+			return;
+		}
+		for (uint32_t i = from; i < to; i += 8) {
+			char line[128];
+			int n = snprintf(line, sizeof(line), "PANDORA GPU HANG: %s +%u:", tag, i);
+			for (uint32_t k = i; k < MIN(to, i + 8) && n > 0 && n < (int)sizeof(line); k++) {
+				n += snprintf(line + n, sizeof(line) - n, "%s%08x", k == at ? " >" : " ",
+				    ((const volatile uint32_t *)va)[k - from]);
+			}
+			printf("%s\n", line);
+		}
+		gpu_pool_unmap(va, off, len);
+		return;
+	}
+	printf("PANDORA GPU HANG: %s %llx not in a pool buffer\n", tag, (unsigned long long)base);
+}
+
 static void
 gpu_hang_dump(uint32_t ring)
 {
@@ -2908,6 +2955,21 @@ gpu_hang_dump(uint32_t ring)
 		    pipe == 1 ? "BR" : "BV", gr(CP_IB1_BASE_PIPE + 1), gr(CP_IB1_BASE_PIPE),
 		    gr(CP_IB1_REM_SIZE_PIPE), gr(CP_IB1_INIT_SIZE_PIPE), gr(CP_HW_FAULT_STATUS_PIPE),
 		    gr(CP_INTERRUPT_STATUS_PIPE), gr(CP_SQE_STATUS_PIPE));
+		/* 0194: IB2 and IB3 (a6xx.xml A8XX: CP_IB2_BASE 0x904, REM 0x906, INIT 0x907, CP_IB3_BASE 0x908),
+		 * then the commands each level fetches. */
+		const uint64_t ib1 = ((uint64_t)gr(CP_IB1_BASE_PIPE + 1) << 32) | gr(CP_IB1_BASE_PIPE);
+		const uint64_t ib2 = ((uint64_t)gr(CP_IB2_BASE_PIPE + 1) << 32) | gr(CP_IB2_BASE_PIPE);
+		const uint64_t ib3 = ((uint64_t)gr(CP_IB3_BASE_PIPE + 1) << 32) | gr(CP_IB3_BASE_PIPE);
+		const uint32_t r1 = gr(CP_IB1_REM_SIZE_PIPE), i1 = gr(CP_IB1_INIT_SIZE_PIPE);
+		const uint32_t r2 = gr(CP_IB2_REM_SIZE_PIPE), i2 = gr(CP_IB2_INIT_SIZE_PIPE);
+		const char *name = pipe == 1 ? "BR" : "BV";
+		printf("PANDORA GPU HANG: %s IB2 base %llx rem %08x init %08x IB3 base %llx\n", name,
+		    (unsigned long long)ib2, r2, i2, (unsigned long long)ib3);
+		char tag[16];
+		snprintf(tag, sizeof(tag), "%s IB1", name);
+		gpu_hang_ib(tag, ib1, i1, r1);
+		snprintf(tag, sizeof(tag), "%s IB2", name);
+		gpu_hang_ib(tag, ib2, i2, r2);
 	}
 	gw(CP_APERTURE_CNTL_HOST, 0);
 	for (uint32_t k = 0; k < GPU_HIST; k++) {

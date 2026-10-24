@@ -12,6 +12,7 @@ on:
       - tools/turnip/**
       - tools/vktest/**
       - tools/metal/**
+      - wsl/adreno/NativeAdrenoABI.h
 
 concurrency:
   group: turnip-${{ github.ref }}
@@ -63,6 +64,9 @@ jobs:
             git -C mesa apply --whitespace=nowarn "$PWD/unixnu/$p"
           done
           ls nativeadreno/NativeAdrenoABI.h
+          # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
+          python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
+          cmp nativeadreno/NativeAdrenoABI.h <(tr -d '\r' < wsl/adreno/NativeAdrenoABI.h)
 
       - name: Build
         timeout-minutes: 20   # 2 min when healthy; run 12 hung here for over 30

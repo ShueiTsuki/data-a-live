@@ -1,0 +1,214 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 9172f96..ab72dc8 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -1676,6 +1676,10 @@ gpu_level11(void)
+ #define CP_IB1_BASE_PIPE          0x900u
+ #define CP_IB1_REM_SIZE_PIPE      0x902u
+ #define CP_IB1_INIT_SIZE_PIPE     0x903u
++#define CP_IB2_BASE_PIPE          0x904u
++#define CP_IB2_REM_SIZE_PIPE      0x906u
++#define CP_IB2_INIT_SIZE_PIPE     0x907u
++#define CP_IB3_BASE_PIPE          0x908u
+ 
+ static bool
+ gpu_level12(void)
+@@ -2176,7 +2180,7 @@ LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
+ 
+ #define GPU_MAX_BOS       4096u
+ #define GPU_MAX_CLIENTS   4u
+-#define GPU_MAX_IBS       16u
++#define GPU_MAX_IBS       128u      /* NativeAdrenoAbiMaxBuffers (tools/turnip/abi_128.py, 0194) */
+ struct gpu_bo {
+ 	bool used;
+ 	int client;
+@@ -2544,8 +2548,14 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 	if (!n || n > GPU_MAX_IBS) {
+ 		return EINVAL;
+ 	}
+-	uint64_t ib[GPU_MAX_IBS];
+-	uint32_t dw[GPU_MAX_IBS], first = 0;
++	/* Off the kernel stack: 128 IBs (0194). */
++	uint64_t *ib = kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
++	uint32_t *dw = kalloc_data(n * sizeof(uint32_t), Z_WAITOK), first = 0;
++	if (!ib || !dw) {
++		kfree_data(ib, n * sizeof(uint64_t));
++		kfree_data(dw, n * sizeof(uint32_t));
++		return ENOMEM;
++	}
+ 	int err = 0;
+ 	lck_mtx_lock(&gpu_lock);
+ 	for (unsigned i = 0; i < n && !err; i++) {
+@@ -2604,6 +2614,8 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 		gpu_clients[client].reset = false;
+ 	}
+ 	lck_mtx_unlock(&gpu_lock);
++	kfree_data(ib, n * sizeof(uint64_t));
++	kfree_data(dw, n * sizeof(uint32_t));
+ 	return err;
+ }
+ 
+@@ -2896,6 +2908,41 @@ gpu_level14(bool rest)
+  * ring timestamp stops short of the last fence issued (bb19: backboardd froze, its waits timed
+  * out until the end, and the log ring had no room left for what the GPU was doing).
+  */
++/* 0194: the dwords of an IB around where the CP fetches (INIT - REM dwords in; it fetches ahead
++ * of what it runs), from the pool buffer that holds it. Under the lock. */
++static void
++gpu_hang_ib(const char *tag, uint64_t base, uint32_t init, uint32_t rem)
++{
++	if (!base || rem > init) {
++		return;
++	}
++	const uint32_t at = init - rem, from = at > 40 ? at - 40 : 0, to = MIN(init, at + 8);
++	for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
++		const struct gpu_bo *b = &gpu_bos[j];
++		if (!b->used || !b->iova || b->pages || base < b->iova || base + (uint64_t)to * 4 > b->iova + b->bytes) {
++			continue;
++		}
++		const uint64_t off = b->off + (base - b->iova) + (uint64_t)from * 4, len = (uint64_t)(to - from) * 4;
++		gpu_pool_sync(off, len, true);
++		vm_offset_t va = gpu_pool_map(off, len);
++		if (!va) {
++			return;
++		}
++		for (uint32_t i = from; i < to; i += 8) {
++			char line[128];
++			int n = snprintf(line, sizeof(line), "PANDORA GPU HANG: %s +%u:", tag, i);
++			for (uint32_t k = i; k < MIN(to, i + 8) && n > 0 && n < (int)sizeof(line); k++) {
++				n += snprintf(line + n, sizeof(line) - n, "%s%08x", k == at ? " >" : " ",
++				    ((const volatile uint32_t *)va)[k - from]);
++			}
++			printf("%s\n", line);
++		}
++		gpu_pool_unmap(va, off, len);
++		return;
++	}
++	printf("PANDORA GPU HANG: %s %llx not in a pool buffer\n", tag, (unsigned long long)base);
++}
++
+ static void
+ gpu_hang_dump(uint32_t ring)
+ {
+@@ -2908,6 +2955,21 @@ gpu_hang_dump(uint32_t ring)
+ 		    pipe == 1 ? "BR" : "BV", gr(CP_IB1_BASE_PIPE + 1), gr(CP_IB1_BASE_PIPE),
+ 		    gr(CP_IB1_REM_SIZE_PIPE), gr(CP_IB1_INIT_SIZE_PIPE), gr(CP_HW_FAULT_STATUS_PIPE),
+ 		    gr(CP_INTERRUPT_STATUS_PIPE), gr(CP_SQE_STATUS_PIPE));
++		/* 0194: IB2 and IB3 (a6xx.xml A8XX: CP_IB2_BASE 0x904, REM 0x906, INIT 0x907, CP_IB3_BASE 0x908),
++		 * then the commands each level fetches. */
++		const uint64_t ib1 = ((uint64_t)gr(CP_IB1_BASE_PIPE + 1) << 32) | gr(CP_IB1_BASE_PIPE);
++		const uint64_t ib2 = ((uint64_t)gr(CP_IB2_BASE_PIPE + 1) << 32) | gr(CP_IB2_BASE_PIPE);
++		const uint64_t ib3 = ((uint64_t)gr(CP_IB3_BASE_PIPE + 1) << 32) | gr(CP_IB3_BASE_PIPE);
++		const uint32_t r1 = gr(CP_IB1_REM_SIZE_PIPE), i1 = gr(CP_IB1_INIT_SIZE_PIPE);
++		const uint32_t r2 = gr(CP_IB2_REM_SIZE_PIPE), i2 = gr(CP_IB2_INIT_SIZE_PIPE);
++		const char *name = pipe == 1 ? "BR" : "BV";
++		printf("PANDORA GPU HANG: %s IB2 base %llx rem %08x init %08x IB3 base %llx\n", name,
++		    (unsigned long long)ib2, r2, i2, (unsigned long long)ib3);
++		char tag[16];
++		snprintf(tag, sizeof(tag), "%s IB1", name);
++		gpu_hang_ib(tag, ib1, i1, r1);
++		snprintf(tag, sizeof(tag), "%s IB2", name);
++		gpu_hang_ib(tag, ib2, i2, r2);
+ 	}
+ 	gw(CP_APERTURE_CNTL_HOST, 0);
+ 	for (uint32_t k = 0; k < GPU_HIST; k++) {
+diff --git a/iokit/Kernel/arm/NativeAdrenoABIv1.h b/iokit/Kernel/arm/NativeAdrenoABIv1.h
+index 3ca23cd..bae1c7a 100644
+--- a/iokit/Kernel/arm/NativeAdrenoABIv1.h
++++ b/iokit/Kernel/arm/NativeAdrenoABIv1.h
+@@ -12,7 +12,7 @@
+  * rather than ignored. */
+ enum {
+     NativeAdrenoAbiVersion = 1,
+-    NativeAdrenoAbiMaxBuffers = 16,
++    NativeAdrenoAbiMaxBuffers = 128,   /* ios-pandora: 16 upstream (tools/turnip/abi_128.py) */
+     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
+     NativeAdrenoMethodQuery = 1,
+     NativeAdrenoMethodBoAlloc = 2,
+@@ -151,7 +151,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
+ static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
+ static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
+ static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
+-static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
++static_assert(sizeof(NativeAdrenoAbiSubmit) == 3104, "ABI submit layout");
+ static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
+ static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
+ static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index ded9dd2..c554b41 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -20,6 +20,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <stddef.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
+@@ -48,6 +49,8 @@ void pandora_gpu_release_ref(void *ref);
+ #define PANDORA_GPU_OPEN_TYPE   0x4147u
+ #define PANDORA_GPU_TUNNEL      0x4e544e4cu     /* 'NTNL' */
+ #define PANDORA_GPU_PROBE       0xffffffffu
++/* The upstream submission (16 buffers); ours has NativeAdrenoAbiMaxBuffers = 128 (tools/turnip/abi_128.py). */
++#define PANDORA_GPU_SUBMIT16_BYTES (offsetof(NativeAdrenoAbiSubmit, buffers) + 16 * sizeof(NativeAdrenoAbiSubmitBuffer))
+ #define PANDORA_GPU_TOKENS      4096u
+ 
+ static IOReturn
+@@ -159,7 +162,9 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
+ 	if (m > 16 || pandora_gpu_sizes[m][0] == 0xffff) {
+ 		return kIOReturnUnsupported;
+ 	}
+-	if (in_len != pandora_gpu_sizes[m][0] || out_len != pandora_gpu_sizes[m][1]) {
++	/* Submit also takes the upstream 16-buffer layout (416 bytes: tools/pgputest, older Turnip). */
++	const bool legacySubmit = m == NativeAdrenoMethodSubmit && in_len == PANDORA_GPU_SUBMIT16_BYTES;
++	if ((in_len != pandora_gpu_sizes[m][0] && !legacySubmit) || out_len != pandora_gpu_sizes[m][1]) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	switch (m) {
+@@ -197,21 +202,37 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
+ 		return pandora_gpu_ret(pandora_gpu_bo_free(client_, a.handle));
+ 	}
+ 	case NativeAdrenoMethodSubmit: {
++		/* The header, then each buffer straight from the input: the 128-buffer submission (3 KB)
++		 * stays off the kernel stack. */
+ 		NativeAdrenoAbiSubmit a;
+-		memcpy(&a, in, sizeof(a));
+-		if (!a.buffer_count || a.buffer_count > NativeAdrenoAbiMaxBuffers || a.reserved || a.queue) {
++		const size_t head = offsetof(NativeAdrenoAbiSubmit, buffers);
++		memcpy(&a, in, head);
++		const uint32_t max = (in_len - head) / sizeof(NativeAdrenoAbiSubmitBuffer);
++		if (!a.buffer_count || a.buffer_count > max || a.reserved || a.queue) {
+ 			return kIOReturnBadArgument;
+ 		}
+ 		if (a.wait_fence && pandora_gpu_wait(a.wait_fence, a.wait_timeout_ns)) {
+ 			return kIOReturnTimeout;
+ 		}
+-		uint64_t iova[NativeAdrenoAbiMaxBuffers], bytes[NativeAdrenoAbiMaxBuffers];
+-		for (unsigned i = 0; i < a.buffer_count; i++) {
+-			iova[i] = a.buffers[i].iova;
+-			bytes[i] = a.buffers[i].bytes;
+-		}
++		const vm_size_t list = a.buffer_count * sizeof(uint64_t);
++		uint64_t *iova = (uint64_t *)IOMallocData(list), *bytes = (uint64_t *)IOMallocData(list);
++		int err = ENOMEM;
+ 		NativeAdrenoAbiSubmitReply r = { 0 };
+-		int err = pandora_gpu_submit(client_, iova, bytes, a.buffer_count, &r.fence);
++		if (iova != nullptr && bytes != nullptr) {
++			for (unsigned i = 0; i < a.buffer_count; i++) {
++				NativeAdrenoAbiSubmitBuffer b;
++				memcpy(&b, in + head + i * sizeof(b), sizeof(b));
++				iova[i] = b.iova;
++				bytes[i] = b.bytes;
++			}
++			err = pandora_gpu_submit(client_, iova, bytes, a.buffer_count, &r.fence);
++		}
++		if (iova != nullptr) {
++			IOFreeData(iova, list);
++		}
++		if (bytes != nullptr) {
++			IOFreeData(bytes, list);
++		}
+ 		memcpy(out, &r, sizeof(r));
+ 		return pandora_gpu_ret(err);
+ 	}

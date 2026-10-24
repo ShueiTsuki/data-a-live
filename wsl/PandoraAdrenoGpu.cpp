@@ -20,6 +20,7 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <stddef.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
@@ -48,6 +49,8 @@ void pandora_gpu_release_ref(void *ref);
 #define PANDORA_GPU_OPEN_TYPE   0x4147u
 #define PANDORA_GPU_TUNNEL      0x4e544e4cu     /* 'NTNL' */
 #define PANDORA_GPU_PROBE       0xffffffffu
+/* The upstream submission (16 buffers); ours has NativeAdrenoAbiMaxBuffers = 128 (tools/turnip/abi_128.py). */
+#define PANDORA_GPU_SUBMIT16_BYTES (offsetof(NativeAdrenoAbiSubmit, buffers) + 16 * sizeof(NativeAdrenoAbiSubmitBuffer))
 #define PANDORA_GPU_TOKENS      4096u
 
 static IOReturn
@@ -159,7 +162,9 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 	if (m > 16 || pandora_gpu_sizes[m][0] == 0xffff) {
 		return kIOReturnUnsupported;
 	}
-	if (in_len != pandora_gpu_sizes[m][0] || out_len != pandora_gpu_sizes[m][1]) {
+	/* Submit also takes the upstream 16-buffer layout (416 bytes: tools/pgputest, older Turnip). */
+	const bool legacySubmit = m == NativeAdrenoMethodSubmit && in_len == PANDORA_GPU_SUBMIT16_BYTES;
+	if ((in_len != pandora_gpu_sizes[m][0] && !legacySubmit) || out_len != pandora_gpu_sizes[m][1]) {
 		return kIOReturnBadArgument;
 	}
 	switch (m) {
@@ -197,21 +202,37 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 		return pandora_gpu_ret(pandora_gpu_bo_free(client_, a.handle));
 	}
 	case NativeAdrenoMethodSubmit: {
+		/* The header, then each buffer straight from the input: the 128-buffer submission (3 KB)
+		 * stays off the kernel stack. */
 		NativeAdrenoAbiSubmit a;
-		memcpy(&a, in, sizeof(a));
-		if (!a.buffer_count || a.buffer_count > NativeAdrenoAbiMaxBuffers || a.reserved || a.queue) {
+		const size_t head = offsetof(NativeAdrenoAbiSubmit, buffers);
+		memcpy(&a, in, head);
+		const uint32_t max = (in_len - head) / sizeof(NativeAdrenoAbiSubmitBuffer);
+		if (!a.buffer_count || a.buffer_count > max || a.reserved || a.queue) {
 			return kIOReturnBadArgument;
 		}
 		if (a.wait_fence && pandora_gpu_wait(a.wait_fence, a.wait_timeout_ns)) {
 			return kIOReturnTimeout;
 		}
-		uint64_t iova[NativeAdrenoAbiMaxBuffers], bytes[NativeAdrenoAbiMaxBuffers];
-		for (unsigned i = 0; i < a.buffer_count; i++) {
-			iova[i] = a.buffers[i].iova;
-			bytes[i] = a.buffers[i].bytes;
-		}
+		const vm_size_t list = a.buffer_count * sizeof(uint64_t);
+		uint64_t *iova = (uint64_t *)IOMallocData(list), *bytes = (uint64_t *)IOMallocData(list);
+		int err = ENOMEM;
 		NativeAdrenoAbiSubmitReply r = { 0 };
-		int err = pandora_gpu_submit(client_, iova, bytes, a.buffer_count, &r.fence);
+		if (iova != nullptr && bytes != nullptr) {
+			for (unsigned i = 0; i < a.buffer_count; i++) {
+				NativeAdrenoAbiSubmitBuffer b;
+				memcpy(&b, in + head + i * sizeof(b), sizeof(b));
+				iova[i] = b.iova;
+				bytes[i] = b.bytes;
+			}
+			err = pandora_gpu_submit(client_, iova, bytes, a.buffer_count, &r.fence);
+		}
+		if (iova != nullptr) {
+			IOFreeData(iova, list);
+		}
+		if (bytes != nullptr) {
+			IOFreeData(bytes, list);
+		}
 		memcpy(out, &r, sizeof(r));
 		return pandora_gpu_ret(err);
 	}
