@@ -2,7 +2,7 @@
 # One GPU test round on the phone, from Git Bash:
 #
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
-#                     [--clients "NAMES"] [--no-vktest] [--pool MIB]
+#                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -33,6 +33,7 @@ while [ $# -gt 0 ]; do
 	--no-metal) METAL=0; shift ;;
 	--clients) CLIENTS=$2; shift 2 ;;     # NativeAdrenoMetal.clients: processes the plugin gives a device
 	--pool) POOL=$2; shift 2 ;;            # MiB carved for the GPU (0: none)
+	--hz) HZ=$2; shift 2 ;;                # display copies per second (sweetfb_hz; ios_test.sh default 30)
 	--no-vktest) SWAP=; shift ;;          # vktest not run (launchd restarts it all boot, mtltest with it)
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
@@ -119,7 +120,7 @@ fi
 
 echo "== 5. boot"
 TC="/opt/work/ipsw/Firmware/087-86698-044.dmg.trustcache /opt/work/ipsw/Firmware/087-86593-047.dmg.trustcache+/opt/work/ipsw/Firmware/087-86715-047.dmg.trustcache+/opt/work/gputest/$NAME.tc"
-GPUPOOL=${POOL#0} KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
+SWEETFB_HZ=${HZ:-30} GPUPOOL=${POOL#0} KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
 	"pandora_gpu=$LEVEL $SWAP $ARGS" 2>&1 | grep -v NodeJS | tail -4
 
 echo "== 6. results"

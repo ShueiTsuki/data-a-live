@@ -4,6 +4,7 @@
 #
 #   [FW=/data/local/tmp/adspfw.img] tools/ios_test.sh NAME RUN SECONDS "extra boot-args"
 #
+# SWEETFB_HZ: display copies per second (default 30).
 # FW: also pass a pinned firmware pack (tools/mkfwpack.py) for the ADSP loader (0144).
 # Boots /data/local/tmp/iosroot.img (rd=ufsroot0, ufsrw=1 rootrw=1) with the log file
 # /data/local/tmp/ioslog.img, debug=0x8 (a panic resets the phone) and
@@ -13,7 +14,7 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 RUN=$2 SECS=$3 EXTRA=${4:-}
-BASE="ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2"
+BASE="ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=${SWEETFB_HZ:-30} sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2"
 mkdir -p "$ROOT/device/logs"
 bash "$ROOT/tools/boot_ios.sh" --file /data/local/tmp/iosroot.img --run "$RUN" --rd ufsroot0 --check hfsx \
 	--log /data/local/tmp/ioslog.img --debug 0x8 ${FW:+--fw "$FW"} \

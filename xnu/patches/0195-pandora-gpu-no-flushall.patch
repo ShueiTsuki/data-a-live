@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index ab72dc8..f97db6d 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2541,6 +2541,21 @@ pandora_gpu_bo_meta(int client, uint64_t handle, bool set, char *text, uint32_t
+  * run on BOTH when the first one starts with its own CP_THREAD_CONTROL (Turnip's tu_init_hw,
+  * 0x70970001), else on BR: the myron driver found the A840 hangs with all jobs on BR and with
+  * continuation jobs on BOTH. */
++/* 0195: boot-arg pandora_gpu_flushall=1 brings back the flush of every imported page per submission. */
++static bool
++gpu_flush_all(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = 0;
++		(void)PE_parse_boot_argn("pandora_gpu_flushall", &on, sizeof(on));
++	}
++	return on != 0;
++}
++
++/* 0195: time in pandora_gpu_submit (lookups, ring room, flush, framing), a line per 500 submissions. */
++static uint64_t gpu_stat_submits, gpu_stat_ns, gpu_stat_max_ns, gpu_stat_flushed, gpu_stat_ibs;
++
+ int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
+ int
+ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence)
+@@ -2548,6 +2563,7 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 	if (!n || n > GPU_MAX_IBS) {
+ 		return EINVAL;
+ 	}
++	const uint64_t t0 = mach_absolute_time();
+ 	/* Off the kernel stack: 128 IBs (0194). */
+ 	uint64_t *ib = kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
+ 	uint32_t *dw = kalloc_data(n * sizeof(uint32_t), Z_WAITOK), first = 0;
+@@ -2593,17 +2609,24 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 		}
+ 		delay(100);
+ 	}
+-	if (!err) {
++	if (!err && gpu_flush_all()) {
+ 		/* The client's imported buffers out of the CPU caches: their pages are the caller's
+-		 * cacheable memory, the GPU reads and writes them non-cacheably. */
++		 * cacheable memory, the GPU reads and writes them non-cacheably. 0195: only with
++		 * pandora_gpu_flushall=1. NativeMetal already cleans and invalidates the surfaces each
++		 * command buffer uses at commit and at completion (sys_dcache_flush, flushSurfaces); this
++		 * loop went over every surface backboardd ever imported on every submission (bb21: 83
++		 * surfaces, 27 ms from commit to completion for a 98-draw frame). */
+ 		for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
+ 			struct gpu_bo *b = &gpu_bos[j];
+ 			if (b->used && b->client == client && b->pages && b->iova) {
+ 				for (uint64_t k = 0; k < b->bytes >> 12; k++) {
+ 					flush_dcache64((addr64_t)b->pages[k], 0x1000, TRUE);
+ 				}
++				gpu_stat_flushed += b->bytes;
+ 			}
+ 		}
++	}
++	if (!err) {
+ 		uint32_t thread = first == 0x70970001u ? 3 : 1;
+ 		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
+ 		struct gpu_hist *h = &gpu_hist[(uint32_t)*fence % GPU_HIST];
+@@ -2612,6 +2635,17 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 		gpu_clients[client].submits++;
+ 		gpu_clients[client].fence = (uint32_t)*fence;
+ 		gpu_clients[client].reset = false;
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		gpu_stat_ns += ns;
++		gpu_stat_max_ns = MAX(gpu_stat_max_ns, ns);
++		gpu_stat_ibs += n;
++		if (++gpu_stat_submits % 500 == 0) {
++			printf("PANDORA GPU SUBMIT: %llu submissions, avg %llu us, max %llu us, %llu IBs each, "
++			    "flushed %llu MiB each (flushall %d)\n", gpu_stat_submits, gpu_stat_ns / 500 / 1000,
++			    gpu_stat_max_ns / 1000, gpu_stat_ibs / 500, gpu_stat_flushed / 500 >> 20, gpu_flush_all());
++			gpu_stat_ns = gpu_stat_max_ns = gpu_stat_flushed = gpu_stat_ibs = 0;
++		}
+ 	}
+ 	lck_mtx_unlock(&gpu_lock);
+ 	kfree_data(ib, n * sizeof(uint64_t));
