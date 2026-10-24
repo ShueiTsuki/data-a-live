@@ -1,0 +1,233 @@
+diff --git a/bsd/dev/pandora_cpu.c b/bsd/dev/pandora_cpu.c
+index 87ba15a..dac6cc9 100644
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -24,6 +24,16 @@
+  * when the CPU was nearly always busy (walt's hispeed jump). Up at once; down when four windows in a row want
+  * less. Capped at the firmware's sustained level (the boost levels above it are left alone) and at its limits,
+  * which it lowers when hot. Boot-args pandora_cpu_fix0 / pandora_cpu_fix1 = a fixed level for domain 0 / 1.
++ *
++ * Patch 0202 (freq2 on the phone: domain 0 follows, domain 1's level stays 8 whatever is set; the governor went
++ * down to 384-900 MHz and animations felt slower than at the bootloader's 1.67 GHz; cores 6-7 showed 0-1 % busy):
++ *   - domain 1 is tried four ways, each towards its own level so the clock tells which worked: a plain level set,
++ *     a level set plus pdp1's doorbell (qcom,pdp1 at 0x1a980000), the SCMI fast channel the firmware describes
++ *     (message 0xb), and limits set to one level (message 5). The governor then drives it the way that worked,
++ *     or leaves it alone;
++ *   - a floor: never below level 11 (1.67 GHz, as the bootloader left it) unless the domain has been nearly idle
++ *     (under 10 % busy) for 12 windows (about 0.2 s);
++ *   - every CPU's busyness in the 2 s lines.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -52,8 +62,10 @@ extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_
+ #define SCMI_FREE               0x1u
+ #define SCMI_ERROR              0x2u
+ 
+-static vm_offset_t cpu_mbox, cpu_shmem;
++static vm_offset_t cpu_mbox, cpu_shmem, cpu_mbox1;
+ static uint32_t cpu_token;
++#define PDP1_MBOX_TX_PA         0x1a980000ull   /* qcom,pdp1 "tx" registers */
++#define CPU_IOS_RAM_PA          0x8c0000000ull  /* iOS's own memory starts here: never map a firmware address above */
+ 
+ static uint32_t
+ rd32(vm_offset_t base, uint32_t off)
+@@ -260,18 +272,51 @@ struct cpu_domain {
+ 	uint32_t level, top, fixed;      /* current, cap, fixed level or ~0 */
+ 	uint32_t down_windows, want_max_down, changes, set_errors;
+ 	uint64_t busy_sum, khz_sum, windows;
++	int method;                      /* how a level is set: 0 SCMI, 1 SCMI + pdp1 doorbell, 2 fast channel, 3 limits; -1 none */
++	uint32_t floor, quiet;           /* the active floor; windows in a row under 10 % busy */
++	vm_offset_t fast, fast_db;       /* fast channel (method 2) and its doorbell */
++	uint64_t fast_db_set, fast_db_keep;
+ };
+ static struct cpu_domain cpu_dom[2] = {
+-	{ cpu_khz0, sizeof(cpu_khz0) / 4, 0, 6, 0, 27, ~0u, 0, 0, 0, 0, 0, 0, 0 },
+-	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0 },
++	{ cpu_khz0, sizeof(cpu_khz0) / 4, 0, 6, 0, 27, ~0u, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0 },
++	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0, -1, 11, 0, 0, 0, 0, 0 },
+ };
++static uint64_t cpu_busy_sum[8];
++
++static int
++cpu_set_level_via(uint32_t d, uint32_t level, int method)
++{
++	struct cpu_domain *dm = &cpu_dom[d];
++	uint32_t in[3] = { d, level, level }, out[4], n = 0;
++	int r;
++	switch (method) {
++	case 2:
++		if (!dm->fast) {
++			return -5;
++		}
++		*(volatile uint32_t *)dm->fast = level;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (dm->fast_db) {
++			const uint32_t keep = *(volatile uint32_t *)dm->fast_db & (uint32_t)dm->fast_db_keep;
++			*(volatile uint32_t *)dm->fast_db = keep | (uint32_t)dm->fast_db_set;
++		}
++		return 0;
++	case 3:
++		r = scmi_call(SCMI_PROTO_PERF, 0x5, in, 3, out, 4, &n);   /* limits: max = min = level */
++		return r ? r : (n ? (int)out[0] : -4);
++	default:
++		r = scmi_call(SCMI_PROTO_PERF, 0x7, in, 2, out, 4, &n);
++		if (!r && method == 1 && cpu_mbox1) {
++			wr32(cpu_mbox1, PDP_MBOX_TX_CMD(0), 1u);
++		}
++		return r ? r : (n ? (int)out[0] : -4);
++	}
++}
+ 
+ static int
+ cpu_set_level(uint32_t d, uint32_t level)
+ {
+-	uint32_t in[2] = { d, level }, out[4], n = 0;
+-	const int r = scmi_call(SCMI_PROTO_PERF, 0x7, in, 2, out, 4, &n);
+-	return r ? r : (n ? (int)out[0] : -4);
++	return cpu_set_level_via(d, level, cpu_dom[d].method < 0 ? 0 : cpu_dom[d].method);
+ }
+ 
+ static uint32_t
+@@ -281,20 +326,82 @@ cpu_get(uint32_t d, uint32_t msg, uint32_t word)
+ 	return (!scmi_call(SCMI_PROTO_PERF, msg, in, 1, out, 8, &n) && n > word && (int)out[0] == 0) ? out[word] : ~0u;
+ }
+ 
+-/* Does a level set move the clock? Each domain to its top and bottom level, measured on its first CPU. */
++/* The SCMI fast channel the firmware describes for DOMAIN's message MSG (0xb), mapped when it is plausible. */
++static void
++cpu_fast_channel(uint32_t d, uint32_t msg)
++{
++	struct cpu_domain *dm = &cpu_dom[d];
++	uint32_t in[2] = { d, msg }, out[16], n = 0;
++	const int r = scmi_call(SCMI_PROTO_PERF, 0xb, in, 2, out, 16, &n);
++	printf("PANDORA CPU: domain %u fast channel for message %u: error %d, %u words:", d, msg, r, n);
++	for (uint32_t i = 0; i < n && i < 12; i++) {
++		printf(" %08x", out[i]);
++	}
++	printf("\n");
++	if (r || n < 6 || out[0] != 0 || msg != 0x7) {
++		return;
++	}
++	/* status, attributes, rate limit, chan addr low/high, chan size, doorbell addr low/high, set mask low/high,
++	 * preserve mask low/high */
++	const uint64_t chan = (uint64_t)out[4] << 32 | out[3], db = n > 7 ? ((uint64_t)out[7] << 32 | out[6]) : 0;
++	if (chan && chan < CPU_IOS_RAM_PA && out[5] >= 4) {
++		const vm_offset_t page = ml_io_map(chan & ~0xfffull, 0x1000);
++		dm->fast = page ? page + (chan & 0xfff) : 0;
++	}
++	if (db && db < CPU_IOS_RAM_PA && (out[1] & 0x1)) {
++		const vm_offset_t page = ml_io_map(db & ~0xfffull, 0x1000);
++		dm->fast_db = page ? page + (db & 0xfff) : 0;
++		dm->fast_db_set = n > 9 ? ((uint64_t)out[9] << 32 | out[8]) : 1;
++		dm->fast_db_keep = n > 11 ? ((uint64_t)out[11] << 32 | out[10]) : 0;
++	}
++	printf("PANDORA CPU: domain %u fast channel at 0x%llx (%s), doorbell 0x%llx (%s)\n", d, chan, dm->fast ? "mapped" : "not used",
++	    db, dm->fast_db ? "mapped" : "not used");
++}
++
++/* Set LEVEL on domain D by METHOD and see what the firmware and the clock do. */
++static bool
++cpu_try(uint32_t d, uint32_t level, int method, const char *how)
++{
++	struct cpu_domain *dm = &cpu_dom[d];
++	const int r = cpu_set_level_via(d, level, method);
++	IOSleep(20);
++	const uint32_t fw = cpu_get(d, 0x8, 1);
++	printf("PANDORA CPU: check: domain %u level %u (%u MHz) by %s: result %d, firmware level now %d, cpu %u about %u MHz "
++	    "(this measure reads about 1.36 x the clock)\n", d, level, dm->khz[level] / 1000, how, r, (int)fw, dm->first,
++	    cpu_clock_on((int)dm->first));
++	return r == 0 && fw == level;
++}
++
++/* Does a level set move the clock? Domain 0 to its top and bottom level; domain 1 four ways, each towards its own
++ * level, the first that the firmware follows kept for the governor. */
+ static void
+ cpu_check_levels(void)
+ {
+-	for (uint32_t d = 0; d < 2; d++) {
+-		struct cpu_domain *dm = &cpu_dom[d];
+-		const uint32_t tries[2] = { dm->top, 0 };
+-		for (int k = 0; k < 2; k++) {
+-			const int r = cpu_set_level(d, tries[k]);
+-			IOSleep(20);
+-			printf("PANDORA CPU: check: domain %u set level %u (%u MHz): result %d, firmware level now %d, cpu %u about %u MHz\n",
+-			    d, tries[k], dm->khz[tries[k]] / 1000, r, (int)cpu_get(d, 0x8, 1), dm->first, cpu_clock_on((int)dm->first));
+-		}
++	cpu_mbox1 = ml_io_map(PDP1_MBOX_TX_PA, 0x1000);
++	(void)cpu_try(0, cpu_dom[0].top, 0, "SCMI");
++	cpu_dom[0].method = cpu_try(0, 0, 0, "SCMI") ? 0 : -1;
++	cpu_fast_channel(0, 0x7);
++	cpu_fast_channel(1, 0x7);
++	struct cpu_domain *d1 = &cpu_dom[1];
++	const uint32_t back = cpu_get(1, 0x8, 1);
++	if (cpu_try(1, d1->top, 0, "SCMI")) {
++		d1->method = 0;
++	} else if (cpu_try(1, 20, 1, "SCMI + pdp1 doorbell")) {
++		d1->method = 1;
++	} else if (d1->fast && cpu_try(1, 14, 2, "fast channel")) {
++		d1->method = 2;
++	} else if (cpu_try(1, 10, 3, "limits")) {
++		d1->method = 3;
++	}
++	if (d1->method != 3) {   /* the limits back to the whole range */
++		uint32_t in[3] = { 1, 28, 0 }, out[4], n = 0;
++		(void)scmi_call(SCMI_PROTO_PERF, 0x5, in, 3, out, 4, &n);
++	}
++	if (d1->method < 0 && back != ~0u) {
++		(void)cpu_set_level_via(1, back, 0);
+ 	}
++	printf("PANDORA CPU: check: domain 0 method %d, domain 1 method %d (0 SCMI, 1 SCMI + pdp1 doorbell, 2 fast channel, "
++	    "3 limits, -1 none)\n", cpu_dom[0].method, d1->method);
+ }
+ 
+ static void
+@@ -313,6 +420,13 @@ cpu_governor(void)
+ 		fix = -1;
+ 		(void)PE_parse_boot_argn(d ? "pandora_cpu_fix1" : "pandora_cpu_fix0", &fix, sizeof(fix));
+ 		dm->fixed = fix >= 0 && (uint32_t)fix < dm->levels ? (uint32_t)fix : ~0u;
++		if (dm->method < 0) {   /* no way to set it: left where the firmware has it */
++			const uint32_t now = cpu_get(d, 0x8, 1);
++			dm->fixed = now != ~0u && now < dm->levels ? now : 0;
++			printf("PANDORA CPU: governor: domain %u cannot be set, left at level %u\n", d, dm->fixed);
++			dm->level = dm->fixed;
++			continue;
++		}
+ 		dm->level = dm->fixed != ~0u ? dm->fixed : dm->top;
+ 		const int r = cpu_set_level(d, dm->level);
+ 		printf("PANDORA CPU: governor: domain %u cpus %u-%u, %u levels, cap %u (%u MHz)%s, start at %u: %d\n", d, dm->first,
+@@ -333,6 +447,7 @@ cpu_governor(void)
+ 			const uint64_t i = pandora_cpu_idle_mach(c), di = i - idle[c];
+ 			idle[c] = i;
+ 			busy_pm[c] = span ? (uint32_t)(di >= span ? 0 : 1000 - di * 1000 / span) : 0;
++			cpu_busy_sum[c] += busy_pm[c];
+ 		}
+ 		for (uint32_t d = 0; d < 2; d++) {
+ 			struct cpu_domain *dm = &cpu_dom[d];
+@@ -351,7 +466,10 @@ cpu_governor(void)
+ 			if (busy >= 900 && need < 2ull * dm->khz[dm->level]) {
+ 				need = 2ull * dm->khz[dm->level];
+ 			}
+-			uint32_t want = 0;
++			/* the floor (the bootloader's 1.67 GHz) unless nearly idle for about 0.2 s */
++			dm->quiet = busy < 100 ? dm->quiet + 1 : 0;
++			const uint32_t floor = dm->quiet >= 12 ? 0 : (dm->floor < dm->top ? dm->floor : dm->top);
++			uint32_t want = floor;
+ 			while (want < dm->top && dm->khz[want] < need) {
+ 				want++;
+ 			}
+@@ -380,6 +498,15 @@ cpu_governor(void)
+ 		/* every 2 s: average busyness and clock per domain, changes, the firmware's limit and level */
+ 		if (now - last_log >= two) {
+ 			last_log = now;
++			if (round < 4000 || (round % 1250) < 125) {
++				uint64_t w = cpu_dom[0].windows ? cpu_dom[0].windows : 1;
++				printf("PANDORA CPU: governor: busy per cpu %llu %llu %llu %llu %llu %llu | %llu %llu %%\n",
++				    cpu_busy_sum[0] / w / 10, cpu_busy_sum[1] / w / 10, cpu_busy_sum[2] / w / 10, cpu_busy_sum[3] / w / 10,
++				    cpu_busy_sum[4] / w / 10, cpu_busy_sum[5] / w / 10, cpu_busy_sum[6] / w / 10, cpu_busy_sum[7] / w / 10);
++			}
++			for (int c = 0; c < 8; c++) {
++				cpu_busy_sum[c] = 0;
++			}
+ 			for (uint32_t d = 0; d < 2; d++) {
+ 				struct cpu_domain *dm = &cpu_dom[d];
+ 				const uint32_t limit = cpu_get(d, 0x6, 1), fw = cpu_get(d, 0x8, 1);
