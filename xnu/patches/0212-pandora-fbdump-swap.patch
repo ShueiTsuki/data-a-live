@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ab09633..8e56883 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -958,7 +958,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		PE_parse_boot_argn("pandora_fbdump", &dumpSecs, sizeof(dumpSecs));
+ 		nanoseconds_to_absolutetime((uint64_t)dumpSecs * NSEC_PER_SEC, &dumpEvery);
+ 	}
+-	if (dumpSecs > 0 && fConsolePaused && t0 >= dumpNext) {
++	static int dumpSwap = -1;   /* 0212: pandora_fbdump_swap=N, one dump at backboardd's swap N */
++	if (dumpSwap < 0) {
++		dumpSwap = 0;
++		PE_parse_boot_argn("pandora_fbdump_swap", &dumpSwap, sizeof(dumpSwap));
++	}
++	if (dumpSwap > 0 ? (fConsolePaused && get32(rec, 0x50) == (uint32_t)dumpSwap)
++	    : (dumpSecs > 0 && fConsolePaused && t0 >= dumpNext)) {
+ 		dump = pandora_fbdump_begin(&dumpCap);
+ 		if (dump != NULL && dumpCap > 4096) {
+ 			bzero(dump, 4096);
