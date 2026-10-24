@@ -358,3 +358,32 @@ edit('NativeBridgeMetalFrontend.mm',
         (unsigned long long)r.height,(unsigned long long)r.row,(unsigned long long)r.offset,(unsigned long long)r.allocation,callers.c_str());
  }
 }""")
+
+# ---- ios-pandora: App Library probe, boot-arg pandora_astc_probe=1 (bb31) -----------------------------------
+# While a finger holds the App Library its background is right (QuartzCore blurs live); at rest it is drawn from
+# the two pre-blurred ASTC images and comes out transparent. With the boot-arg the left half of each block row of a
+# large ASTC image is replaced by opaque red single-colour (void-extent) blocks before the upload: red on the left
+# and the picture on the right = all fine; red and transparent = the real blocks are decoded wrong; nothing = the
+# drawing or compositing after the upload is at fault.
+edit('NativeBridgeMetalFrontend.mm',
+     """#include <execinfo.h>
+""",
+     """#include <execinfo.h>
+#include <sys/sysctl.h>
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
+   if(deallocator) {""",
+     """   static const bool probe=[]{char args[1024]={};size_t size=sizeof args-1;
+    return sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && strstr(args,"pandora_astc_probe=1")!=nullptr;}();
+   if(probe && bb==16 && d.width>=512) {
+    std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+rowBytes*rows);
+    static const uint8_t red[16]={0xfc,0xfd,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff};
+    const NSUInteger blocks=rowBytes/16;
+    for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<blocks/2;x++)memcpy(&copy[y*rowBytes+x*16],red,16);
+    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:copy.data() bytesPerRow:rowBytes];
+    NSLog(@"pandora-metal astc probe: %lux%lu, left %lu of %lu block columns red",(unsigned long)d.width,(unsigned long)d.height,
+          (unsigned long)(blocks/2),(unsigned long)blocks);
+   } else
+   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
+   if(deallocator) {""")
