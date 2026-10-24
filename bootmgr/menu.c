@@ -504,6 +504,24 @@ void menu_main(uint64_t fdt, uint64_t el, uint64_t load)
 	/* Save area: behind the Android kernel's image_size and the 2 MiB move slack. */
 	uint64_t save = linux_src + rd64(linux_src + 16) + SZ_2M;
 	int room = layout && save + BAND_BYTES <= load + declared;
+	if (bm_config.any_mode) {
+		/* Test builds: what the menu decides from, at the top of the screen (Android
+		 * draws over it later). */
+		uint32_t ls = 0, le = 0, faulted = 0, cfg = safe_rd32(VOLUP_GPIO, &faulted);
+		uint64_t s = chosen_prop(fdt, "linux,initrd-start", &ls);
+		uint64_t e = chosen_prop(fdt, "linux,initrd-end", &le);
+		row = 0;
+		hexline("LOADED", load);
+		hexline("IMGSIZE", declared);
+		hexline("FDT", fdt);
+		hexline("FDTSIZE", be32(fdt) == 0xd00dfeedu ? be32(fdt + 4) : 0);
+		hexline("INITRD", s && ls == 8 ? (uint64_t)be32(s) << 32 | be32(s + 4) : 0);
+		hexline("INITRDEND", e && le == 8 ? (uint64_t)be32(e) << 32 | be32(e + 4) : 0);
+		hexline("SAVE", save);
+		hexline("STATE", el << 32 | (uint64_t)faulted << 28 | (uint64_t)(cfg & 0xfffffff));
+		hexline("CHECKS", (uint64_t)layout << 12 | (uint64_t)room << 8 | (uint64_t)normal_mode(fdt) << 4 |
+		    (uint64_t)volup_usable());
+	}
 	if (room && el == 1 && (bm_config.any_mode || normal_mode(fdt)) && volup_usable() && menu(save)) {
 		fill(0, 0, FB_W, FB_H, BG);
 		row = 0;
@@ -511,5 +529,7 @@ void menu_main(uint64_t fdt, uint64_t el, uint64_t load)
 		hexline("LOADED", load);
 		halt_with("ERROR", boot_ios());
 	}
+	if (bm_config.any_mode)
+		wait_ms(bm_config.wait_ms);	/* time to read the lines above */
 	start_android(fdt, load, declared, layout);
 }
