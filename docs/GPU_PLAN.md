@@ -35,6 +35,7 @@
 9. **显示**：GPU 画完后仍由 CPU 把整屏拷到屏幕（每帧约 4–5 毫秒）；以后让显示控制器直接显示 GPU 的图像。
 10. **渲染模式**：Turnip 还开着 `TU_DEBUG=sysmem,nocb`，没用上 Adreno 的片上分块渲染（GMEM）。
 11. **预编译着色器**：现在全部运行时现编，编过的进手机上的管线缓存（bb23：backboardd 136 个管线，编译共 744 毫秒，最慢 224 毫秒；缓存命中 113、未命中 8）。苹果自带的 `default.pipelinelib` 是 AGX 机器码，用不上。把编好的缓存放进固件包，开机就有，第一次用某个效果时不再卡；缓存跟 Turnip 和插件的版本绑定，换版本要重新生成。
+12. **GPU 驱动拆成独立仓库**：按 UniXNU 的[贡献指南](https://unixnu.com/zh/contributing/repository)（每个硬件驱动一个公开仓库，带 `unixnu` 话题，以子模块接入），把 Adreno 840 驱动（`wsl/pandora_gpu.c`、`wsl/PandoraAdrenoGpu.cpp`、ABI 头文件、对应补丁）拆出来，`ios-pandora` 用子模块引用；同为骁龙 8 Elite Gen 5 的机器能直接用。GPU 稳定后再拆。
 
 ## 1. 手机上的 GPU [实测]
 

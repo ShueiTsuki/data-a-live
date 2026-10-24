@@ -33,6 +33,12 @@
 | `device/` | 只放说明文档；设备导出的原始数据不进仓库 |
 | `.github/workflows/` | 内核（`xnu.yml`）和 GPU 用户态（`turnip.yml`）的自动编译 |
 
+## 和 ios-sweet、UniXNU 的关系
+
+- **ios-sweet 一系**：本项目沿用 [ios-sweet](https://github.com/dipa-studio/ios-sweet) 的做法，在骁龙手机上原生跑 iPhone X 的 iOS 16，驱动直接编进 xnu 内核，以补丁的形式维护（`xnu/patches/`）。前面一部分补丁来自 ios-sweet 和 [ios-fuxi](https://github.com/bangprovn/ios-fuxi)，`pandora` 开头的补丁是本机专用的。
+- **UniXNU**：本项目**不是** UniXNU 的机型仓库（`UniXNU-<机型>`）。UniXNU 跑 iPadOS 17，有自己的构建系统，驱动是独立模块。本项目借用了 UniXNU 的 GPU 组件：NativeAdreno 的用户接口、ArmSmmu4K，以及 Metal 插件 NativeMetal 和配套的 Turnip 补丁。按 UniXNU 的[贡献指南](https://unixnu.com/zh/contributing/repository)带了 `unixnu` 话题。
+- **以后**：对别人有用的驱动（首先是 Adreno 840 GPU 驱动）会拆成独立仓库，带 `unixnu` 话题，本仓库改用子模块引用。
+
 ## 安全
 
 - 不刷写手机分区，不清数据；所有启动都是 `fastboot boot`，只在内存里，重启就回安卓。
