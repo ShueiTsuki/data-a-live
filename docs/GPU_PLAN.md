@@ -26,7 +26,7 @@
 
 1. **自动调频（DCVS）**：读 GPU 忙碌计数器，忙就升档、闲就降档（照 Linux devfreq 的默认规则），内存带宽跟着调；保留 `pandora_gpu_perf` 强制固定档位。
 2. **温度限制**：读 GPU 温度，过热封顶。
-3. **资源库纯黑**：NativeMetal 没实现 `newTextureWithBytesNoCopy`（直接拿一块内存当图像）；资源库长按时右半边闪烁，可能同源。
+3. **资源库背景**：资源库的模糊背景是两张预先模糊好的整屏 ASTC 4×4 图，QuartzCore 用 `newTextureWithBytesNoCopy` 建图（NativeMetal 原先拒绝，于是纯黑），而且是先建图、之后才往那块内存里写内容（bb27 抓帧）。插件现在按格式建同样的图，每次提交前比较内存、变了就重新上传（`tools/metal/adapt_ios16.py`）；待真机确认。
 4. **被拒的图像**：约 11/69 张 IOSurface 报 `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`，查清是哪种格式、行宽。
 5. **更多程序用 GPU**：现在只有 backboardd；之后放开 PosterBoard 等，再到普通应用。内核现在最多 4 个客户端，所有客户端共用一个 GPU 地址空间。
 6. **完成通知改用中断**：现在 Turnip 靠轮询等任务完成（一轮测试几万次超时轮询）。

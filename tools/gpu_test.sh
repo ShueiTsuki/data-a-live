@@ -48,13 +48,25 @@ rm -rf "$T" && mkdir -p "$T"
 if [ "$ZIP" = release ]; then
 	# The rolling turnip-ci pre-release (turnip.yml): public, no sign-in needed.
 	R=https://github.com/ShueiTsuki/data-a-live/releases/download/turnip-ci
-	for f in libvulkan_freedreno.dylib vktest SHA256SUMS BUILD.txt; do
+	# Large files: their xz copy when the build published one (turnip.yml; downloads here are slow),
+	# else the file itself; SHA256SUMS checks what comes out either way.
+	fetch() {
+		if curl -sSfL --retry 3 -o "$(winp "$T/$1.xz")" "$R/$1.xz"; then
+			python -I -c "import lzma,sys; open(sys.argv[1],'wb').write(lzma.decompress(open(sys.argv[1]+'.xz','rb').read()))" "$(winp "$T/$1")"
+			rm -f "$T/$1.xz"
+		else
+			curl -sSfL --retry 3 -o "$(winp "$T/$1")" "$R/$1"
+		fi
+	}
+	fetch libvulkan_freedreno.dylib
+	for f in vktest SHA256SUMS BUILD.txt; do
 		curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
 	done
 	cat "$T/BUILD.txt"
 	# The Metal plugin and mtltest, when the build published them (and --no-metal is not given).
 	if [ $METAL = 1 ] && curl -sSfL --retry 3 -o "$(winp "$T/SHA256SUMS.metal")" "$R/SHA256SUMS.metal"; then
-		for f in NativeAdrenoMetal NativeAdrenoMetal.Info.plist mtltest; do
+		fetch NativeAdrenoMetal
+		for f in NativeAdrenoMetal.Info.plist mtltest; do
 			curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
 		done
 		# SHA256SUMS.metal names the bundle paths; the release carries the same bytes under flat names.

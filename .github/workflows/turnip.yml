@@ -110,7 +110,9 @@ jobs:
           gh release view turnip-ci >/dev/null 2>&1 || gh release create turnip-ci --prerelease \
             --target "$GITHUB_SHA" --title "Turnip CI build (test only)" \
             --notes "Rolling test build from .github/workflows/turnip.yml: Turnip (Mesa, MIT) with UniXNU's Darwin kernel backend for iOS 16 arm64, and tools/vktest, for on-device GPU tests. Not a release. BUILD.txt names the commit."
-          gh release upload turnip-ci out/libvulkan_freedreno.dylib out/vktest out/SHA256SUMS out/BUILD.txt --clobber
+          # xz copies of the large files as well (16 MiB -> 1, 21 MiB -> 5): downloads here run at ~1 MB/min.
+          python3 -c 'import lzma,sys; open(sys.argv[1]+".xz","wb").write(lzma.compress(open(sys.argv[1],"rb").read(),preset=9))' out/libvulkan_freedreno.dylib
+          gh release upload turnip-ci out/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib.xz out/vktest out/SHA256SUMS out/BUILD.txt --clobber
 
       # NativeMetal (UniXNU's Metal plugin, adapted to iOS 16) and tools/metal/mtltest: a failure here
       # leaves the Turnip build above published.
@@ -156,7 +158,8 @@ jobs:
           cp NativeAdrenoMetal.bundle/NativeAdrenoMetal NativeAdrenoMetal
           cp NativeAdrenoMetal.bundle/Info.plist NativeAdrenoMetal.Info.plist
           cp SHA256SUMS SHA256SUMS.metal
-          gh release upload turnip-ci NativeAdrenoMetal NativeAdrenoMetal.Info.plist mtltest SHA256SUMS.metal --clobber
+          python3 -c 'import lzma,sys; open(sys.argv[1]+".xz","wb").write(lzma.compress(open(sys.argv[1],"rb").read(),preset=9))' NativeAdrenoMetal
+          gh release upload turnip-ci NativeAdrenoMetal NativeAdrenoMetal.xz NativeAdrenoMetal.Info.plist mtltest SHA256SUMS.metal --clobber
 
       # The Metal build log on the pre-release too (artifacts need a sign-in; the release does not).
       - name: Metal log to the pre-release
