@@ -620,11 +620,12 @@ edit('NativeBridgeMetalFrontend.mm',
   NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
   NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[0];
-  NSMutableString *full=[NSMutableString stringWithFormat:@"v %@ {%s} f %@ {%s} c0 %lu mask %lu blend %d %lu/%lu/%lu %lu/%lu/%lu samples %lu",
+  NSMutableString *full=[NSMutableString stringWithFormat:@"v %@ {%s} f %@ {%s} c0 %lu mask %lu blend %d %lu/%lu/%lu %lu/%lu/%lu c1 %lu mask %lu blend %d samples %lu",
    d.vertexFunction.name,vf?vf.constantsText.c_str():"",d.fragmentFunction.name,ff?ff.constantsText.c_str():"",(unsigned long)a.pixelFormat,
    (unsigned long)a.writeMask,(int)a.blendingEnabled,(unsigned long)a.sourceRGBBlendFactor,(unsigned long)a.destinationRGBBlendFactor,
    (unsigned long)a.rgbBlendOperation,(unsigned long)a.sourceAlphaBlendFactor,(unsigned long)a.destinationAlphaBlendFactor,
-   (unsigned long)a.alphaBlendOperation,(unsigned long)d.rasterSampleCount];
+   (unsigned long)a.alphaBlendOperation,(unsigned long)d.colorAttachments[1].pixelFormat,(unsigned long)d.colorAttachments[1].writeMask,
+   (int)d.colorAttachments[1].blendingEnabled,(unsigned long)d.rasterSampleCount];
   if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
    MTLVertexAttributeDescriptor *at=v.attributes[i];if(at.format==MTLVertexFormatInvalid)continue;
    [full appendFormat:@" a%u=%lu:%lu:%lu:%lu",i,(unsigned long)at.format,(unsigned long)at.offset,(unsigned long)at.bufferIndex,
@@ -931,3 +932,25 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(pandoraAstcProbe())probeBindings(self)[@"pipe"]=objc_getAssociatedObject(state,&gProbePipeKey)?:@"?";
  if(pandoraAstcProbe())probeBindings(self)[@"pipeid"]=capId(state);
 """)
+
+
+# ---- ios-pandora: the draws after the probed one too (bb41) --------------------------------------------------
+# bb40: the App Library's ASTC draws make every fragment (1125x1046 samples each), and the next draws of the same
+# pass (two of b2a8f, blending off, then b7854) cover the same area: they leave it transparent. Every draw after the
+# probed one in its encoder now goes into the replay log with its whole state and its buffers at commit, so the pass
+# can be replayed in order on the PC.
+def edit_all(name, old, new, count):
+    p = ROOT / name
+    s = p.read_text()
+    assert s.count(old) == count, (name, old[:70], s.count(old))
+    p.write_text(s.replace(old, new))
+    print('edited', name)
+
+
+edit_all('NativeBridgeMetalFrontend.mm',
+         """[probeBindings(self) removeObjectForKey:@"armed"];""",
+         """[probeBindings(self) removeObjectForKey:@"armed"];probeBindings(self)[@"following"]=@YES;""", 2)
+edit_all('NativeBridgeMetalFrontend.mm',
+         """ if(pandoraAstcProbe() && probeBindings(self)[@"armed"]) {   // ios-pandora: the probed draw's whole state""",
+         """ if(pandoraAstcProbe() && (probeBindings(self)[@"armed"] || probeBindings(self)[@"following"])) {   // ios-pandora: the probed draw's whole state, and the draws after it""", 2)
+edit_all('NativeBridgeMetalFrontend.mm', """  if(nth<8) {""", """  if(nth<48) {""", 2)
