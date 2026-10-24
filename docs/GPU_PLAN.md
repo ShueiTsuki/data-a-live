@@ -26,16 +26,18 @@
 
 1. **自动调频（DCVS）**：读 GPU 忙碌计数器，忙就升档、闲就降档（照 Linux devfreq 的默认规则），内存带宽跟着调；保留 `pandora_gpu_perf` 强制固定档位。
 2. **温度限制**：读 GPU 温度，过热封顶。
-3. **资源库背景**：资源库的模糊背景是两张预先模糊好的整屏 ASTC 4×4 图，QuartzCore 用 `newTextureWithBytesNoCopy` 建图（NativeMetal 原先拒绝，于是纯黑），而且是先建图、之后才往那块内存里写内容（bb27 抓帧）。插件现在按格式建同样的图，每次提交前比较内存、变了就重新上传（`tools/metal/adapt_ios16.py`）；待真机确认。
+3. **资源库背景**：手按住时正常（现场模糊），松手静止时改用两张预先模糊好的整屏 ASTC 4×4 图（1125×2436，QuartzCore 用 `newTextureWithBytesNoCopy` 建，插件按格式建图后复制一次），结果是透明。已查清（bb30–bb35）：数据正确（GPU 读回 171738 块全对，两种上传方式都一样）、ASTC 小图采样正确；把图左半换成红色后哪张中间图里都没有红色，画这两张图的那一步写出的是全透明。下一轮（bb36）：mtltest 全面扫描（格式 × 尺寸 × 上传方式 × 采样方式、贴图位 0–15），系统那边一张换普通格式对照，并记下这一笔的完整状态，之后在 mtltest 里原样重放。
 4. **被拒的图像**：约 11/69 张 IOSurface 报 `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`，查清是哪种格式、行宽。
 5. **更多程序用 GPU**：现在只有 backboardd；之后放开 PosterBoard 等，再到普通应用。内核现在最多 4 个客户端，所有客户端共用一个 GPU 地址空间。
-6. **完成通知改用中断**：现在 Turnip 靠轮询等任务完成（一轮测试几万次超时轮询）。
+6. **完成通知改用中断**：现在 Turnip 靠轮询等任务完成（一轮测试几千到几万次短超时轮询）。顺带把内核的超时计数分成"短超时询问"和"真正等不到"两类。
 7. **省电**：GPU 开机后一直全开（OOB 不放、没有 IFPC），熄屏也不断电。
 8. **出错恢复**：现在卡死只记现场，不会重置 GPU 恢复。
 9. **显示**：GPU 画完后仍由 CPU 把整屏拷到屏幕（每帧约 4–5 毫秒）；以后让显示控制器直接显示 GPU 的图像。
 10. **渲染模式**：Turnip 还开着 `TU_DEBUG=sysmem,nocb`，没用上 Adreno 的片上分块渲染（GMEM）。
 11. **预编译着色器**：现在全部运行时现编，编过的进手机上的管线缓存（bb23：backboardd 136 个管线，编译共 744 毫秒，最慢 224 毫秒；缓存命中 113、未命中 8）。苹果自带的 `default.pipelinelib` 是 AGX 机器码，用不上。把编好的缓存放进固件包，开机就有，第一次用某个效果时不再卡；缓存跟 Turnip 和插件的版本绑定，换版本要重新生成。
 12. **GPU 驱动拆成独立仓库**：按 UniXNU 的[贡献指南](https://unixnu.com/zh/contributing/repository)（每个硬件驱动一个公开仓库，带 `unixnu` 话题，以子模块接入），把 Adreno 840 驱动（`wsl/pandora_gpu.c`、`wsl/PandoraAdrenoGpu.cpp`、ABI 头文件、对应补丁）拆出来，`ios-pandora` 用子模块引用；同为骁龙 8 Elite Gen 5 的机器能直接用。GPU 稳定后再拆。
+13. **mtltest 全本地编**：测试着色器现在要 Apple 的 metal 编译器（只有 macOS），只能线上编。改成手写 AIR（LLVM 中间代码，metal2vulkan 的测试用例就是这么做的），本地用 Rust 带的 llvm-as 转换，再用小脚本打包成 metallib。
+14. **缓存一致**：插件现在每次提交前后清 CPU 缓存（借用内存的缓冲平均约 7 MB/次，bb31）。Adreno 支持直接读 CPU 缓存（安卓叫 IO-coherent），改用这种映射后就不用清。
 
 ## 1. 手机上的 GPU [实测]
 
