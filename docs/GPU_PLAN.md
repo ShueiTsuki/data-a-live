@@ -1,11 +1,39 @@
 # 真正的 GPU：让 iOS 16 的 Metal 跑在 17 Pro 的 Adreno 840 上（方案）
 
-状态：调研完成，未开始实现。没有动手机（只从安卓侧只读取了 GPU 型号和固件文件名）。
+状态（2026-10-24）：已实现到 backboardd 用 GPU 合成整个界面，见下面"0. 现状和待办"。第 1–8 节是动手前的调研，保留原样。
 每条事实后面标了来源：**[实测]** 在我们手机或镜像上直接看到的；**[读到]** 从别人的代码、文档或苹果二进制里读到的；**[推断]** 我们自己的判断。
 
 ## 一句话结论
 
 可行，而且不是从零开始：UniXNU 已经在 Adreno 740 上做出了 GPU 合成的桌面（iPadOS 17），ios-fuxi 已经在同一个 iOS 16 上把 GPU 和 Metal 设备跑通到"Metal 测试程序和独立的 CoreAnimation 测试程序用 GPU 出画面"。我们要做的是：把这套东西搬到 Adreno 840（新一代 gen8）上，并把 ios-fuxi 卡住的最后一段（真正的 backboardd 用 GPU 合成）做完。
+
+## 0. 现状和待办（2026-10-24）
+
+### 已经在手机上跑通的 [实测]
+
+| 部分 | 状态 | 日志 |
+| --- | --- | --- |
+| 上电、GMU、固件、SMMU、CP、zap | 第 1–15 级全过 | gpu5–gpu15 |
+| 1 GiB 显存池、用户接口（NativeAdreno ABI v1） | 通过 | pgpu1、pgpu4 |
+| Vulkan（Turnip）：计算、清屏、画三角形 | 通过 | vk1、vk2 |
+| Metal（NativeMetal + metal2vulkan）：计算、画图、画到 IOSurface | 通过 | mtl1、mtl2 |
+| backboardd 用 GPU 合成：开机标志、锁屏、主屏幕 | 通过 | bb9、bb18 |
+| 快速操作卡死（Turnip 把提交拆成 16 段一份，BR/BV 互等） | 修好：一次 128 段（0194） | bb20 → bb21 |
+| 每次提交刷遍所有导入图像的缓存 | 去掉（0195），一帧 27 → 10–15 毫秒 | bb21 → bb22 |
+| GPU 一直在最低档 160 MHz | 可选档（0196），726 MHz 时一帧 3–4 毫秒，60 帧 | bb23 |
+
+### 待办（按优先级）
+
+1. **自动调频（DCVS）**：读 GPU 忙碌计数器，忙就升档、闲就降档（照 Linux devfreq 的默认规则），内存带宽跟着调；保留 `pandora_gpu_perf` 强制固定档位。
+2. **温度限制**：读 GPU 温度，过热封顶。
+3. **资源库纯黑**：NativeMetal 没实现 `newTextureWithBytesNoCopy`（直接拿一块内存当图像）；资源库长按时右半边闪烁，可能同源。
+4. **被拒的图像**：约 11/69 张 IOSurface 报 `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`，查清是哪种格式、行宽。
+5. **更多程序用 GPU**：现在只有 backboardd；之后放开 PosterBoard 等，再到普通应用。内核现在最多 4 个客户端，所有客户端共用一个 GPU 地址空间。
+6. **完成通知改用中断**：现在 Turnip 靠轮询等任务完成（一轮测试几万次超时轮询）。
+7. **省电**：GPU 开机后一直全开（OOB 不放、没有 IFPC），熄屏也不断电。
+8. **出错恢复**：现在卡死只记现场，不会重置 GPU 恢复。
+9. **显示**：GPU 画完后仍由 CPU 把整屏拷到屏幕（每帧约 4–5 毫秒）；以后让显示控制器直接显示 GPU 的图像。
+10. **渲染模式**：Turnip 还开着 `TU_DEBUG=sysmem,nocb`，没用上 Adreno 的片上分块渲染（GMEM）。
 
 ## 1. 手机上的 GPU [实测]
 
