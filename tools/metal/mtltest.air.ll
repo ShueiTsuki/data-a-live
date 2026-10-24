@@ -1,6 +1,6 @@
 ; mtltest's shaders as AIR (tools/metal/mtltest.metal compiled by Apple's metal on CI, then
 ; disassembled and linked by tools/metal/mtltest_air.sh). build_plugin_linux.sh assembles it.
-; ModuleID = '/tmp/tmp.9XzdaWIMol/linked.bc'
+; ModuleID = '/tmp/tmp.6dECocV6rL/linked.bc'
 source_filename = "llvm-link"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
 target triple = "air64-apple-ios16.0.0"
@@ -9,7 +9,8 @@ target triple = "air64-apple-ios16.0.0"
 @__air_sampler_state.1 = internal addrspace(2) constant i64 -9188470239253755319, align 8
 @__air_sampler_state.2 = internal addrspace(2) constant i64 -9188470239253722624, align 8
 @__air_sampler_state.3 = internal addrspace(2) constant i64 -9188470239253757879, align 8
-@__air_sampler_state.4 = internal addrspace(2) constant i64 -9188470239253757879, align 8
+@__air_sampler_state.1.4 = internal addrspace(2) constant i64 -9188470239253755319, align 8
+@__air_sampler_state.5 = internal addrspace(2) constant i64 -9188470239253757879, align 8
 
 ; Function Attrs: norecurse nounwind memory(argmem: readwrite)
 define void @fill(ptr addrspace(1) captures(none) "air-buffer-no-alias" %0, i32 %1) local_unnamed_addr #0 {
@@ -17,7 +18,7 @@ define void @fill(ptr addrspace(1) captures(none) "air-buffer-no-alias" %0, i32 
   %4 = add i32 %3, 4096
   %5 = zext i32 %1 to i64
   %6 = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %5
-  store i32 %4, ptr addrspace(1) %6, align 4, !tbaa !68, !alias.scope !72
+  store i32 %4, ptr addrspace(1) %6, align 4, !tbaa !85, !alias.scope !89
   ret void
 }
 
@@ -34,7 +35,7 @@ define <{ <4 x float> }> @tri_vs(i32 %0) local_unnamed_addr #1 {
   store <2 x float> splat (float -1.000000e+00), ptr %6, align 8
   %7 = zext i32 %0 to i64
   %8 = getelementptr inbounds [3 x <2 x float>], ptr %2, i64 0, i64 %7
-  %9 = load <2 x float>, ptr %8, align 8, !tbaa !75
+  %9 = load <2 x float>, ptr %8, align 8, !tbaa !92
   %10 = shufflevector <2 x float> %9, <2 x float> undef, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
   %11 = shufflevector <4 x float> %10, <4 x float> <float undef, float undef, float 0.000000e+00, float 1.000000e+00>, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
   call void @llvm.lifetime.end.p0(ptr %2)
@@ -61,7 +62,7 @@ define <{ <4 x float>, <2 x float> }> @quad_vs(i32 %0) local_unnamed_addr #1 {
   store <2 x float> <float -1.000000e+00, float 3.000000e+00>, ptr %6, align 8
   %7 = zext i32 %0 to i64
   %8 = getelementptr inbounds [3 x <2 x float>], ptr %2, i64 0, i64 %7
-  %9 = load <2 x float>, ptr %8, align 8, !tbaa !75
+  %9 = load <2 x float>, ptr %8, align 8, !tbaa !92
   %10 = shufflevector <2 x float> %9, <2 x float> undef, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
   %11 = shufflevector <4 x float> %10, <4 x float> <float undef, float undef, float 0.000000e+00, float 1.000000e+00>, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
   %12 = extractelement <2 x float> %9, i64 0
@@ -102,10 +103,10 @@ define <4 x float> @tex_lin_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(1) 
 
 ; Function Attrs: convergent nounwind memory(read)
 define <4 x float> @tex_px_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(1) %2) local_unnamed_addr #6 {
-  %4 = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) readonly captures(none) %2, i32 0) #7, !alias.scope !76
+  %4 = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) readonly captures(none) %2, i32 0) #7, !alias.scope !93
   %5 = tail call fast float @air.convert.f.f32.u.i32(i32 %4) #8
   %6 = insertelement <2 x float> undef, float %5, i64 0
-  %7 = tail call i32 @air.get_height_texture_2d(ptr addrspace(1) readonly captures(none) %2, i32 0) #7, !alias.scope !76
+  %7 = tail call i32 @air.get_height_texture_2d(ptr addrspace(1) readonly captures(none) %2, i32 0) #7, !alias.scope !93
   %8 = tail call fast float @air.convert.f.f32.u.i32(i32 %7) #8
   %9 = insertelement <2 x float> %6, float %8, i64 1
   %10 = fmul fast <2 x float> %9, %1
@@ -132,16 +133,42 @@ define <4 x float> @tex3_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(1) rea
 
 ; Function Attrs: convergent nounwind memory(argmem: read)
 define <4 x float> @sweep_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %3, ptr addrspace(2) readonly captures(none) dereferenceable(8) "air-buffer-no-alias" %4) local_unnamed_addr #4 {
-  %6 = load <2 x float>, ptr addrspace(2) %4, align 8, !tbaa !75, !alias.scope !79, !noalias !82
+  %6 = load <2 x float>, ptr addrspace(2) %4, align 8, !tbaa !92, !alias.scope !96, !noalias !99
   %7 = fmul fast <2 x float> %6, %1
-  %8 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %3, <2 x float> %7, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5, !alias.scope !82, !noalias !79
+  %8 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) %3, <2 x float> %7, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5, !alias.scope !99, !noalias !96
   %9 = extractvalue { <4 x float>, i8 } %8, 0
   ret <4 x float> %9
 }
 
+; Function Attrs: norecurse nounwind memory(none)
+define <4 x float> @solid_fs(<4 x float> %0, <2 x float> %1) local_unnamed_addr #3 {
+  ret <4 x float> <float 2.500000e-01, float 5.000000e-01, float 7.500000e-01, float 1.000000e+00>
+}
+
+; Function Attrs: norecurse nounwind memory(none)
+define <4 x float> @fetch_fs(<4 x float> %0, <2 x float> %1, <4 x float> %2) local_unnamed_addr #3 {
+  %4 = shufflevector <4 x float> %2, <4 x float> undef, <4 x i32> <i32 2, i32 1, i32 0, i32 3>
+  ret <4 x float> %4
+}
+
+; Function Attrs: convergent nounwind memory(argmem: read)
+define <4 x float> @fetch_tex_fs(<4 x float> %0, <2 x float> %1, <4 x float> %2, ptr addrspace(1) readonly captures(none) %3) local_unnamed_addr #4 {
+  %5 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %3, ptr addrspace(2) readonly captures(none) @__air_sampler_state.1.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %6 = extractvalue { <4 x float>, i8 } %5, 0
+  %7 = fmul fast <4 x float> %6, %2
+  ret <4 x float> %7
+}
+
+; Function Attrs: norecurse nounwind memory(none)
+define <{ <4 x float>, <4 x float> }> @fetch2_fs(<4 x float> %0, <2 x float> %1, <4 x float> %2, <4 x float> %3) local_unnamed_addr #3 {
+  %5 = insertvalue <{ <4 x float>, <4 x float> }> undef, <4 x float> %3, 0
+  %6 = insertvalue <{ <4 x float>, <4 x float> }> %5, <4 x float> %2, 1
+  ret <{ <4 x float>, <4 x float> }> %6
+}
+
 ; Function Attrs: convergent nounwind memory(read)
 define <4 x float> @index_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(2) readonly captures(none) dereferenceable(4) "air-buffer-no-alias" %2, ptr addrspace(1) %3, ptr addrspace(1) %4, ptr addrspace(1) %5, ptr addrspace(1) %6, ptr addrspace(1) %7, ptr addrspace(1) %8, ptr addrspace(1) %9, ptr addrspace(1) %10, ptr addrspace(1) %11, ptr addrspace(1) %12, ptr addrspace(1) %13, ptr addrspace(1) %14, ptr addrspace(1) %15, ptr addrspace(1) %16, ptr addrspace(1) %17, ptr addrspace(1) %18) local_unnamed_addr #6 {
-  %20 = load i32, ptr addrspace(2) %2, align 4, !tbaa !68, !alias.scope !85, !noalias !88
+  %20 = load i32, ptr addrspace(2) %2, align 4, !tbaa !85, !alias.scope !102, !noalias !105
   switch i32 %20, label %51 [
     i32 0, label %21
     i32 1, label %23
@@ -161,67 +188,67 @@ define <4 x float> @index_fs(<4 x float> %0, <2 x float> %1, ptr addrspace(2) re
   ]
 
 21:                                               ; preds = %19
-  %22 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %3, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %22 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %3, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 23:                                               ; preds = %19
-  %24 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %4, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %24 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %4, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 25:                                               ; preds = %19
-  %26 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %5, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %26 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %5, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 27:                                               ; preds = %19
-  %28 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %6, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %28 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %6, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 29:                                               ; preds = %19
-  %30 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %7, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %30 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %7, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 31:                                               ; preds = %19
-  %32 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %8, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %32 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %8, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 33:                                               ; preds = %19
-  %34 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %9, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %34 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %9, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 35:                                               ; preds = %19
-  %36 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %10, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %36 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %10, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 37:                                               ; preds = %19
-  %38 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %11, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %38 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %11, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 39:                                               ; preds = %19
-  %40 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %12, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %40 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %12, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 41:                                               ; preds = %19
-  %42 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %13, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %42 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %13, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 43:                                               ; preds = %19
-  %44 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %14, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %44 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %14, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 45:                                               ; preds = %19
-  %46 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %15, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %46 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %15, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 47:                                               ; preds = %19
-  %48 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %16, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %48 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %16, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 49:                                               ; preds = %19
-  %50 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %17, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %50 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %17, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 51:                                               ; preds = %19
-  %52 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %18, ptr addrspace(2) readonly captures(none) @__air_sampler_state.4, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
+  %52 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %18, ptr addrspace(2) readonly captures(none) @__air_sampler_state.5, <2 x float> %1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #5
   br label %53
 
 53:                                               ; preds = %51, %49, %47, %45, %43, %41, %39, %37, %35, %33, %31, %29, %27, %25, %23, %21
@@ -247,8 +274,8 @@ attributes #8 = { nounwind memory(none) }
 !air.kernel = !{!6}
 !llvm.module.flags = !{!11, !12, !13, !14, !15, !16, !17, !18}
 !air.vertex = !{!19, !24}
-!air.fragment = !{!27, !30, !35, !36, !37, !40, !44}
-!air.sampler_states = !{!63, !64, !65, !66, !67}
+!air.fragment = !{!27, !30, !35, !36, !37, !40, !44, !47, !50, !53, !60}
+!air.sampler_states = !{!79, !80, !81, !82, !83, !84}
 
 !0 = !{!"Apple metal version 32023.157 (metalfe-32023.157)"}
 !1 = !{i32 2, i32 5, i32 0}
@@ -294,49 +321,66 @@ attributes #8 = { nounwind memory(none) }
 !41 = !{!32, !33, !34, !42, !43}
 !42 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"s"}
 !43 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2", !"air.arg_name", !"scale"}
-!44 = !{ptr @index_fs, !28, !45}
-!45 = !{!32, !33, !46, !47, !48, !49, !50, !51, !52, !53, !54, !55, !56, !57, !58, !59, !60, !61, !62}
-!46 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"which"}
-!47 = !{i32 3, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t0"}
-!48 = !{i32 4, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t1"}
-!49 = !{i32 5, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t2"}
-!50 = !{i32 6, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t3"}
-!51 = !{i32 7, !"air.texture", !"air.location_index", i32 4, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t4"}
-!52 = !{i32 8, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t5"}
-!53 = !{i32 9, !"air.texture", !"air.location_index", i32 6, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t6"}
-!54 = !{i32 10, !"air.texture", !"air.location_index", i32 7, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t7"}
-!55 = !{i32 11, !"air.texture", !"air.location_index", i32 8, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t8"}
-!56 = !{i32 12, !"air.texture", !"air.location_index", i32 9, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t9"}
-!57 = !{i32 13, !"air.texture", !"air.location_index", i32 10, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t10"}
-!58 = !{i32 14, !"air.texture", !"air.location_index", i32 11, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t11"}
-!59 = !{i32 15, !"air.texture", !"air.location_index", i32 12, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t12"}
-!60 = !{i32 16, !"air.texture", !"air.location_index", i32 13, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t13"}
-!61 = !{i32 17, !"air.texture", !"air.location_index", i32 14, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t14"}
-!62 = !{i32 18, !"air.texture", !"air.location_index", i32 15, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t15"}
-!63 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-!64 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1}
-!65 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.2}
-!66 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.3}
-!67 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.4}
-!68 = !{!69, !69, i64 0}
-!69 = !{!"int", !70, i64 0}
-!70 = !{!"omnipotent char", !71, i64 0}
-!71 = !{!"Simple C++ TBAA"}
-!72 = !{!73}
-!73 = distinct !{!73, !74, !"air-alias-scope-arg(0)"}
-!74 = distinct !{!74, !"air-alias-scopes(fill)"}
-!75 = !{!70, !70, i64 0}
-!76 = !{!77}
-!77 = distinct !{!77, !78, !"air-alias-scope-textures"}
-!78 = distinct !{!78, !"air-alias-scopes(tex_px_fs)"}
-!79 = !{!80}
-!80 = distinct !{!80, !81, !"air-alias-scope-arg(4)"}
-!81 = distinct !{!81, !"air-alias-scopes(sweep_fs)"}
-!82 = !{!83, !84}
-!83 = distinct !{!83, !81, !"air-alias-scope-textures"}
-!84 = distinct !{!84, !81, !"air-alias-scope-samplers"}
-!85 = !{!86}
-!86 = distinct !{!86, !87, !"air-alias-scope-arg(2)"}
-!87 = distinct !{!87, !"air-alias-scopes(index_fs)"}
-!88 = !{!89}
-!89 = distinct !{!89, !87, !"air-alias-scope-textures"}
+!44 = !{ptr @solid_fs, !28, !45}
+!45 = !{!32, !46}
+!46 = !{i32 1, !"air.fragment_input", !"generated(2uvDv2_f)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv", !"air.arg_unused"}
+!47 = !{ptr @fetch_fs, !28, !48}
+!48 = !{!32, !46, !49}
+!49 = !{i32 2, !"air.render_target", i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"dst"}
+!50 = !{ptr @fetch_tex_fs, !28, !51}
+!51 = !{!32, !33, !49, !52}
+!52 = !{i32 3, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}
+!53 = !{ptr @fetch2_fs, !54, !57}
+!54 = !{!55, !56}
+!55 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"c0"}
+!56 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"c1"}
+!57 = !{!32, !46, !58, !59}
+!58 = !{i32 2, !"air.render_target", i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"d0"}
+!59 = !{i32 3, !"air.render_target", i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"d1"}
+!60 = !{ptr @index_fs, !28, !61}
+!61 = !{!32, !33, !62, !63, !64, !65, !66, !67, !68, !69, !70, !71, !72, !73, !74, !75, !76, !77, !78}
+!62 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"which"}
+!63 = !{i32 3, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t0"}
+!64 = !{i32 4, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t1"}
+!65 = !{i32 5, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t2"}
+!66 = !{i32 6, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t3"}
+!67 = !{i32 7, !"air.texture", !"air.location_index", i32 4, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t4"}
+!68 = !{i32 8, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t5"}
+!69 = !{i32 9, !"air.texture", !"air.location_index", i32 6, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t6"}
+!70 = !{i32 10, !"air.texture", !"air.location_index", i32 7, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t7"}
+!71 = !{i32 11, !"air.texture", !"air.location_index", i32 8, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t8"}
+!72 = !{i32 12, !"air.texture", !"air.location_index", i32 9, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t9"}
+!73 = !{i32 13, !"air.texture", !"air.location_index", i32 10, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t10"}
+!74 = !{i32 14, !"air.texture", !"air.location_index", i32 11, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t11"}
+!75 = !{i32 15, !"air.texture", !"air.location_index", i32 12, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t12"}
+!76 = !{i32 16, !"air.texture", !"air.location_index", i32 13, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t13"}
+!77 = !{i32 17, !"air.texture", !"air.location_index", i32 14, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t14"}
+!78 = !{i32 18, !"air.texture", !"air.location_index", i32 15, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t15"}
+!79 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!80 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1}
+!81 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.2}
+!82 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.3}
+!83 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1.4}
+!84 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.5}
+!85 = !{!86, !86, i64 0}
+!86 = !{!"int", !87, i64 0}
+!87 = !{!"omnipotent char", !88, i64 0}
+!88 = !{!"Simple C++ TBAA"}
+!89 = !{!90}
+!90 = distinct !{!90, !91, !"air-alias-scope-arg(0)"}
+!91 = distinct !{!91, !"air-alias-scopes(fill)"}
+!92 = !{!87, !87, i64 0}
+!93 = !{!94}
+!94 = distinct !{!94, !95, !"air-alias-scope-textures"}
+!95 = distinct !{!95, !"air-alias-scopes(tex_px_fs)"}
+!96 = !{!97}
+!97 = distinct !{!97, !98, !"air-alias-scope-arg(4)"}
+!98 = distinct !{!98, !"air-alias-scopes(sweep_fs)"}
+!99 = !{!100, !101}
+!100 = distinct !{!100, !98, !"air-alias-scope-textures"}
+!101 = distinct !{!101, !98, !"air-alias-scope-samplers"}
+!102 = !{!103}
+!103 = distinct !{!103, !104, !"air-alias-scope-arg(2)"}
+!104 = distinct !{!104, !"air-alias-scopes(index_fs)"}
+!105 = !{!106}
+!106 = distinct !{!106, !104, !"air-alias-scope-textures"}
