@@ -1,0 +1,155 @@
+diff --git a/libkern/crypto/corecrypto_sha2.c b/libkern/crypto/corecrypto_sha2.c
+index c954dd2..7b05edf 100644
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -43,7 +43,13 @@
+  * the caller's SHA384_CTX/SHA512_CTX.
+  */
+ #include <corecrypto/ccsha2.h>
++#if defined(PANDORA)
++/* 0211: the ARMv8 SHA-2 instructions (osfmk/corecrypto/ccsha256_pandora_ce.c), as corecrypto's vng_arm */
++extern const struct ccdigest_info ccsha256_pandora_ce_di;
++#define SHA256_DI()                     (&ccsha256_pandora_ce_di)
++#else
+ #define SHA256_DI()                     (&ccsha256_ltc_di)
++#endif
+ #define SHA256_INIT(di, ctx)            ccdigest_init(di, ctx)
+ #define SHA256_UPDATE(di, ctx, len, d)  ccdigest_update(di, ctx, len, d)
+ #else
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 37002b4..45c034a 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -6,6 +6,7 @@ osfmk/vm/vm_apple_protect.c	 standard
+ osfmk/arm/fuxi_adreno_host.c	standard
+ osfmk/arm/pandora_cpu_idle.c	standard
+ osfmk/arm/pandora_perfctl.c	standard
++osfmk/corecrypto/ccsha256_pandora_ce.c	standard
+ osfmk/vm/vm_fourk_pager.c	 standard
+ 
+ osfmk/arm64/hi_res_clock_map.c 	optional hi_res_clock
+diff --git a/osfmk/corecrypto/ccsha256_pandora_ce.c b/osfmk/corecrypto/ccsha256_pandora_ce.c
+new file mode 100644
+index 0000000..2adc36e
+--- /dev/null
++++ b/osfmk/corecrypto/ccsha256_pandora_ce.c
+@@ -0,0 +1,119 @@
++/*
++ * PANDORA: SHA-256 with the ARMv8 SHA-2 instructions (patch 0211).
++ *
++ * Apple's corecrypto computes SHA-256 with these instructions on every arm64 iPhone
++ * (ccsha256_vng_arm); that code is not in the open-source XNU, so this kernel (ios-sweet's
++ * SWEET configuration, no corecrypto kext) hashed code-signature pages with the portable C
++ * ccsha256_ltc_compress: about 400 MB/s, 33 s of every boot spent hashing the 3.2 GB dyld
++ * shared cache twice (boot2, PANDORA CS4K). Same digest_info as ccsha256_ltc_di, only the
++ * compress function differs. The kernel is built with -march=armv8.2-a+crypto and the SoC's
++ * cores have the SHA-2 instructions (ID_AA64ISAR0_EL1.SHA2). The kernel is built with
++ * -nostdinc (no arm_neon.h) and by two compilers (Apple's in CI, LLVM's locally), so the
++ * instructions are written as inline asm on plain 128-bit vectors, one per statement.
++ *
++ * PANDORA_SHA256_CE_TEST builds the same function as a standalone user program
++ * (tools/sha256ce_test.sh runs it under qemu-aarch64 against hashlib's digests).
++ */
++#if defined(PANDORA_SHA256_CE_TEST)
++#include <stddef.h>
++#include <stdint.h>
++typedef void *ccdigest_state_t;
++#define ccdigest_u32(s) ((uint32_t *)(s))
++extern const uint32_t ccsha256_K[64];
++#else
++#include <corecrypto/ccsha2.h>
++#include <corecrypto/ccdigest_priv.h>
++#include "ccdigest_internal.h"
++#include "ccsha2_internal.h"
++#endif
++
++typedef unsigned int pce_v4 __attribute__((vector_size(16)));
++typedef unsigned int pce_v4u __attribute__((vector_size(16), aligned(4)));   /* for 4-byte aligned memory */
++
++/* Four big-endian message words. */
++static inline pce_v4
++pce_load_be(const uint8_t *p)
++{
++	pce_v4 v;
++	for (int i = 0; i < 4; i++) {
++		v[i] = (unsigned int)p[4 * i] << 24 | (unsigned int)p[4 * i + 1] << 16 | (unsigned int)p[4 * i + 2] << 8 |
++		    p[4 * i + 3];
++	}
++	return v;
++}
++
++static inline pce_v4
++pce_sha256h(pce_v4 abcd, pce_v4 efgh, pce_v4 wk)
++{
++	__asm__ ("sha256h %q0, %q1, %2.4s" : "+w"(abcd) : "w"(efgh), "w"(wk));
++	return abcd;
++}
++
++static inline pce_v4
++pce_sha256h2(pce_v4 efgh, pce_v4 abcd, pce_v4 wk)
++{
++	__asm__ ("sha256h2 %q0, %q1, %2.4s" : "+w"(efgh) : "w"(abcd), "w"(wk));
++	return efgh;
++}
++
++static inline pce_v4
++pce_sha256su0(pce_v4 w0, pce_v4 w1)
++{
++	__asm__ ("sha256su0 %0.4s, %1.4s" : "+w"(w0) : "w"(w1));
++	return w0;
++}
++
++static inline pce_v4
++pce_sha256su1(pce_v4 x, pce_v4 w2, pce_v4 w3)
++{
++	__asm__ ("sha256su1 %0.4s, %1.4s, %2.4s" : "+w"(x) : "w"(w2), "w"(w3));
++	return x;
++}
++
++void ccsha256_pandora_ce_compress(ccdigest_state_t state, size_t nblocks, const void *in);
++
++void
++ccsha256_pandora_ce_compress(ccdigest_state_t state, size_t nblocks, const void *in)
++{
++	uint32_t *s = ccdigest_u32(state);
++	const uint8_t *p = (const uint8_t *)in;
++	pce_v4 abcd = *(const pce_v4u *)&s[0], efgh = *(const pce_v4u *)&s[4];
++
++	while (nblocks--) {
++		const pce_v4 abcd0 = abcd, efgh0 = efgh;
++		pce_v4 m[4];
++		for (int i = 0; i < 4; i++) {
++			m[i] = pce_load_be(p + 16 * i);
++		}
++		/* 16 groups of 4 rounds; groups 0-11 also extend the message schedule:
++		 * W[4i+16 ..] = su1(su0(W[4i ..], W[4i+4 ..]), W[4i+8 ..], W[4i+12 ..]). */
++		for (int i = 0; i < 16; i++) {
++			const pce_v4 wk = m[i & 3] + *(const pce_v4u *)&ccsha256_K[4 * i];
++			const pce_v4 a = abcd;
++			abcd = pce_sha256h(abcd, efgh, wk);
++			efgh = pce_sha256h2(efgh, a, wk);
++			if (i < 12) {
++				m[i & 3] = pce_sha256su1(pce_sha256su0(m[i & 3], m[(i + 1) & 3]), m[(i + 2) & 3], m[(i + 3) & 3]);
++			}
++		}
++		abcd += abcd0;
++		efgh += efgh0;
++		p += 64;
++	}
++	*(pce_v4u *)&s[0] = abcd;
++	*(pce_v4u *)&s[4] = efgh;
++}
++
++#if !defined(PANDORA_SHA256_CE_TEST)
++const struct ccdigest_info ccsha256_pandora_ce_di = {
++	.output_size = CCSHA256_OUTPUT_SIZE,
++	.state_size = CCSHA256_STATE_SIZE,
++	.block_size = CCSHA256_BLOCK_SIZE,
++	.oid_size = ccoid_sha256_len,
++	.oid = CC_DIGEST_OID_SHA256,
++	.initial_state = ccsha256_initial_state,
++	.compress = ccsha256_pandora_ce_compress,
++	.final = ccdigest_final_64be,
++	.impl = CC_IMPL_SHA256_VNG_ARM,
++};
++#endif
