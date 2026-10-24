@@ -542,6 +542,197 @@ fetchTests(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 	}
 }
 
+/* ---- part 9: QuartzCore's own App Library draws, replayed (bb42) ----
+ * The App Library's draws in QuartzCore's own library (fixed_vert_lph_spc / fixed_frag_lph_cph), specialized with the
+ * constants backboardd used and fed the buffers it had at commit (mtltest_qc.h, from the plugin's capture), the quad
+ * moved to fill a 64x64 target cleared blue: on the PC (metal2vulkan on lavapipe) these give an opaque colour.
+ *   a: the fill (draw 2, no image) with its vertex colour made red  -> red
+ *   b: the fill with its captured vertex colour (0,0,0,1)            -> opaque black
+ *   c: the image draw (draw 0) over an all-red ASTC, colour white    -> red
+ * Transparent here where the PC is opaque points at the phone's side (the vertex fetch, the device). */
+#include "mtltest_qc.h"
+
+static MTLFunctionConstantValues *
+qcConstants(const char *text)
+{
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	char *copy = strdup(text), *save = NULL;
+	for (char *tok = strtok_r(copy, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+		char *type = strchr(tok, ':');
+		char *hex = type ? strchr(type + 1, ':') : NULL;
+		if (!type || !hex) {
+			continue;
+		}
+		*type++ = 0, *hex++ = 0;
+		uint8_t bytes[16] = { 0 };
+		for (unsigned i = 0; i < sizeof(bytes) && hex[2 * i] && hex[2 * i + 1]; i++) {
+			unsigned v = 0;
+			sscanf(hex + 2 * i, "%2x", &v);
+			bytes[i] = (uint8_t)v;
+		}
+		[values setConstantValue:bytes type:(MTLDataType)atoi(type) withName:@(tok)];
+	}
+	free(copy);
+	return values;
+}
+
+static void
+qcReplay(id<MTLDevice> dev, id<MTLCommandQueue> queue)
+{
+	NSError *err = nil;
+	id<MTLLibrary> qc = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"/System/Library/Frameworks/QuartzCore.framework/default.metallib"]
+	    error:&err];
+	if (check("part 9: QuartzCore library", qc, err)) {
+		return;
+	}
+	const NSUInteger W = 64;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:W
+	    mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> c0 = [dev newTextureWithDescriptor:td], c1 = [dev newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [dev newBufferWithLength:W * W * 4 options:MTLResourceStorageModeShared];
+	/* the all-red ASTC image at f3 and a grey 32x32 at f9, as bound in the capture */
+	static const uint8_t red[16] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff };
+	MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:1125
+	    height:2436 mipmapped:NO];
+	ad.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> astc = [dev newTextureWithDescriptor:ad];
+	uint8_t *blocks = malloc(282 * 16 * 609);
+	for (NSUInteger i = 0; i < 282 * 16 * 609; i += 16) {
+		memcpy(blocks + i, red, 16);
+	}
+	[astc replaceRegion:MTLRegionMake2D(0, 0, 1125, 2436) mipmapLevel:0 withBytes:blocks bytesPerRow:282 * 16];
+	free(blocks);
+	MTLTextureDescriptor *gd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:32
+	    height:32 mipmapped:NO];
+	gd.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> grey = [dev newTextureWithDescriptor:gd];
+	uint32_t greyPx[32 * 32];
+	for (unsigned i = 0; i < 32 * 32; i++) {
+		greyPx[i] = 0xff808080u;
+	}
+	[grey replaceRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0 withBytes:greyPx bytesPerRow:32 * 4];
+	id<MTLSamplerState> sampler = [dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+	struct {
+		const struct QcDraw *draw;
+		const char *name;
+		uint16_t colour[4];   /* half; 0 = keep the captured one */
+		uint8_t want[4];      /* BGRA */
+	} cases[] = {
+		{ &qc2, "9a fill, vertex colour red", { 0x3c00, 0, 0, 0x3c00 }, { 0, 0, 255, 255 } },
+		{ &qc2, "9b fill, captured vertex colour", { 0, 0, 0, 0 }, { 0, 0, 0, 255 } },
+		{ &qc0, "9c image over red ASTC, vertex colour white", { 0x3c00, 0x3c00, 0x3c00, 0x3c00 }, { 0, 0, 255, 255 } },
+	};
+	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) @autoreleasepool {
+		const struct QcDraw *d = cases[c].draw;
+		err = nil;
+		id<MTLFunction> vf = [qc newFunctionWithName:@(d->vertex) constantValues:qcConstants(d->vconst) error:&err];
+		if (check("part 9: vertex function", vf, err)) {
+			continue;
+		}
+		id<MTLFunction> ff = [qc newFunctionWithName:@(d->fragment) constantValues:qcConstants(d->fconst) error:&err];
+		if (check("part 9: fragment function", ff, err)) {
+			continue;
+		}
+		MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+		rpd.vertexFunction = vf;
+		rpd.fragmentFunction = ff;
+		rpd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		rpd.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		rpd.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+		MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+		const MTLVertexFormat formats[4] = { MTLVertexFormatFloat4, MTLVertexFormatFloat2, MTLVertexFormatFloat2, MTLVertexFormatHalf4 };
+		const NSUInteger offsets[4] = { 0, 16, 24, 32 };
+		for (unsigned a = 0; a < 4; a++) {
+			vd.attributes[a].format = formats[a];
+			vd.attributes[a].offset = offsets[a];
+			vd.attributes[a].bufferIndex = 1;
+		}
+		vd.layouts[1].stride = 48;
+		rpd.vertexDescriptor = vd;
+		id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+		if (check("part 9: pipeline", rps, err)) {
+			continue;
+		}
+		/* the captured vertices, moved to fill the target (their extent mapped onto 0..W), colour as the case says */
+		uint8_t vertices[192];
+		memcpy(vertices, d->vertices, sizeof(vertices));
+		float lo[2] = { 1e30f, 1e30f }, hi[2] = { -1e30f, -1e30f };
+		for (unsigned v = 0; v < 4; v++) {
+			const float *p = (const float *)(vertices + v * 48);
+			for (unsigned k = 0; k < 2; k++) {
+				lo[k] = MIN(lo[k], p[k]), hi[k] = MAX(hi[k], p[k]);
+			}
+		}
+		for (unsigned v = 0; v < 4; v++) {
+			float *p = (float *)(vertices + v * 48);
+			for (unsigned k = 0; k < 2; k++) {
+				p[k] = hi[k] > lo[k] ? (p[k] - lo[k]) / (hi[k] - lo[k]) * W : 0;
+			}
+			if (cases[c].colour[3]) {
+				memcpy(vertices + v * 48 + 32, cases[c].colour, 8);
+			}
+		}
+		const float mvp[16] = { 2.0f / W, 0, 0, 0, 0, -2.0f / W, 0, 0, 0, 0, 0, 0, -1, 1, 0, 1 };
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = c0;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[1].texture = c1;
+		pass.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+		pass.colorAttachments[1].storeAction = MTLStoreActionDontCare;
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+		[enc setRenderPipelineState:rps];
+		for (unsigned b = 0; b < d->count; b++) {
+			const struct QcBinding *bind = &d->bindings[b];
+			NSMutableData *bytes = [NSMutableData dataWithBytes:bind->bytes length:bind->length];
+			if (bind->stage == 1 && bind->index == 1) {
+				bytes = [NSMutableData dataWithBytes:vertices length:sizeof(vertices)];
+			} else if (bind->stage == 1 && bind->index == 2) {
+				memcpy(bytes.mutableBytes, mvp, sizeof(mvp));
+			}
+			[bytes setLength:MAX(bytes.length, (NSUInteger)4096)];
+			id<MTLBuffer> buffer = [dev newBufferWithBytes:bytes.bytes length:bytes.length options:MTLResourceStorageModeShared];
+			if (bind->stage == 1) {
+				[enc setVertexBuffer:buffer offset:0 atIndex:bind->index];
+			} else {
+				[enc setFragmentBuffer:buffer offset:0 atIndex:bind->index];
+			}
+		}
+		[enc setFragmentTexture:astc atIndex:3];
+		[enc setFragmentTexture:grey atIndex:9];
+		[enc setFragmentSamplerState:sampler atIndex:0];
+		static const uint16_t indices[6] = { 0, 1, 2, 2, 1, 3 };
+		id<MTLBuffer> ib = [dev newBufferWithBytes:indices length:sizeof(indices) options:MTLResourceStorageModeShared];
+		[enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:ib
+		    indexBufferOffset:0];
+		[enc endEncoding];
+		id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+		[bl copyFromTexture:c0 sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, W, 1)
+		    toBuffer:out destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * W * 4];
+		[bl endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		const uint8_t *px = (const uint8_t *)out.contents, *m = px + (W / 2 * W + W / 2) * 4;
+		unsigned clear = 0, blue = 0, right = 0;
+		for (unsigned i = 0; i < W * W; i++) {
+			const uint8_t *p = px + i * 4;
+			clear += p[3] == 0;
+			blue += p[0] == 255 && p[1] == 0 && p[2] == 0 && p[3] == 255;
+			right += abs(p[0] - cases[c].want[0]) <= 3 && abs(p[1] - cases[c].want[1]) <= 3 && abs(p[2] - cases[c].want[2]) <= 3 &&
+			    abs(p[3] - cases[c].want[3]) <= 3;
+		}
+		say("MTLTEST: part 9 %s: status %ld; centre bgra %02x%02x%02x%02x (want %02x%02x%02x%02x); %u right, %u transparent, %u "
+		    "untouched blue of %lu%s",
+		    cases[c].name, (long)cb.status, m[0], m[1], m[2], m[3], cases[c].want[0], cases[c].want[1], cases[c].want[2],
+		    cases[c].want[3], right, clear, blue, (unsigned long)(W * W), right == W * W ? "" : " FAIL");
+		failures += right != W * W;
+	}
+}
+
 /* Each launch in a boot takes the next of kTuDebug (counted in /var/tmp/mtltest.launch with the boot session's UUID). */
 static void
 pickTuDebug(void)
@@ -609,6 +800,14 @@ run(void)
 		id<MTLCommandQueue> queue = [dev newCommandQueue];
 		if (check("part 1: newCommandQueue", queue, nil)) {
 			return;
+		}
+		{   /* boot-arg mtltest_only=9: part 9 alone (light enough to run beside backboardd every launch) */
+			char args[1024] = { 0 };
+			size_t size = sizeof(args) - 1;
+			if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "mtltest_only=9")) {
+				qcReplay(dev, queue);
+				return;
+			}
 		}
 		id<MTLBuffer> buf = [dev newBufferWithLength:64 * 1024 options:MTLResourceStorageModeShared];
 		if (check("part 1: newBufferWithLength", buf, nil)) {
@@ -941,6 +1140,7 @@ run(void)
 		}
 		sweep(dev, queue, lib);
 		fetchTests(dev, queue, lib);
+		qcReplay(dev, queue);
 }
 
 int
