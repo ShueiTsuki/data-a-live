@@ -99,7 +99,7 @@ open(sys.argv[2], 'w').write(t[:m.end() - 4] + decl + t[m.end() - 4:])
 PY
 	COMPAT=(-I "$B/gen/compat")
 fi
-# -x drops local symbols (strip -x); lld signs ad hoc as it writes, after that.
+# -x drops local symbols (strip -x).
 clang++ "${BASE[@]}" "${LINK[@]}" "${COMPAT[@]}" -std=c++17 -fobjc-arc -Wno-deprecated-declarations -bundle \
 	-I "$NA" -I "$U/kits/AdrenoPM4" -I "$MESA/include" -I "$B/gen" \
 	-x objective-c++ "$NM/NativeAdrenoMetalPlugin.mm" "$NM/NativeBridgeMetalFrontend.mm" -x none \
@@ -107,6 +107,8 @@ clang++ "${BASE[@]}" "${LINK[@]}" "${COMPAT[@]}" -std=c++17 -fobjc-arc -Wno-depr
 	-framework Foundation -framework Metal -framework IOSurface \
 	-o "$BUNDLE/NativeAdrenoMetal"
 rm -rf "$BUNDLE/NativeAdrenoMetal.dSYM"
+# Signed again as codesign -s - --identifier does on CI (lld's own signature is a linker-signed one).
+rcodesign sign --binary-identifier org.blu-sharky.NativeAdrenoMetal "$BUNDLE/NativeAdrenoMetal" 2>/dev/null
 python3 - "$BUNDLE/Info.plist" <<'EOF'
 import plistlib, sys
 plistlib.dump({k: v for k, v in (kv.split('=', 1) for kv in (
