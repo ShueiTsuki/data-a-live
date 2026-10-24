@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/pandora_cpu.c b/bsd/dev/pandora_cpu.c
+index dac6cc9..aaaf6ab 100644
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -34,6 +34,10 @@
+  *   - a floor: never below level 11 (1.67 GHz, as the bootloader left it) unless the domain has been nearly idle
+  *     (under 10 % busy) for 12 windows (about 0.2 s);
+  *   - every CPU's busyness in the 2 s lines.
++ *
++ * Patch 0203 (freq3: domain 1 follows only its fast channel, 0x1a980118 with the doorbell at 0x1a98011c; domain 0
++ * has one too): domain 0 also moves to its fast channel when the firmware follows it there; domain 1's floor is
++ * level 8 (1.75 GHz, as the bootloader left it). The scheduler side is osfmk/kern/sched_prim.c (pandora_bigfirst).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -279,7 +283,7 @@ struct cpu_domain {
+ };
+ static struct cpu_domain cpu_dom[2] = {
+ 	{ cpu_khz0, sizeof(cpu_khz0) / 4, 0, 6, 0, 27, ~0u, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0 },
+-	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0, -1, 11, 0, 0, 0, 0, 0 },
++	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0, -1, 8, 0, 0, 0, 0, 0 },
+ };
+ static uint64_t cpu_busy_sum[8];
+ 
+@@ -382,6 +386,9 @@ cpu_check_levels(void)
+ 	cpu_dom[0].method = cpu_try(0, 0, 0, "SCMI") ? 0 : -1;
+ 	cpu_fast_channel(0, 0x7);
+ 	cpu_fast_channel(1, 0x7);
++	if (cpu_dom[0].method == 0 && cpu_dom[0].fast && cpu_try(0, 5, 2, "fast channel")) {
++		cpu_dom[0].method = 2;
++	}
+ 	struct cpu_domain *d1 = &cpu_dom[1];
+ 	const uint32_t back = cpu_get(1, 0x8, 1);
+ 	if (cpu_try(1, d1->top, 0, "SCMI")) {
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..87d3d20 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -433,6 +433,11 @@ int enable_task_set_cluster_type = 0;
+ bool system_ecore_only = false;
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if defined(PANDORA)
++/* pandora: boot-arg pandora_bigfirst=1, an idle CPU is taken from the highest number down (the big cores 6-7). */
++static int sched_pandora_bigfirst = 0;
++#endif
++
+ void
+ sched_init(void)
+ {
+@@ -468,6 +473,11 @@ sched_init(void)
+ 	if (PE_parse_boot_argn("direct_handoff", &direct_handoff, sizeof(direct_handoff))) {
+ 		allow_direct_handoff = direct_handoff;
+ 	}
++#if defined(PANDORA)
++	if (PE_parse_boot_argn("pandora_bigfirst", &sched_pandora_bigfirst, sizeof(sched_pandora_bigfirst))) {
++		kprintf("Scheduler: pandora_bigfirst %d\n", sched_pandora_bigfirst);
++	}
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 	if (PE_parse_boot_argn("enable_skstsct", &enable_task_set_cluster_type, sizeof(enable_task_set_cluster_type))) {
+@@ -5246,7 +5256,11 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(PANDORA)
++		int cpuid = sched_pandora_bigfirst ? bit_first(idle_primary_map) : lsb_first(idle_primary_map);
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;

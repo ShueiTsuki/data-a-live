@@ -34,6 +34,10 @@
  *   - a floor: never below level 11 (1.67 GHz, as the bootloader left it) unless the domain has been nearly idle
  *     (under 10 % busy) for 12 windows (about 0.2 s);
  *   - every CPU's busyness in the 2 s lines.
+ *
+ * Patch 0203 (freq3: domain 1 follows only its fast channel, 0x1a980118 with the doorbell at 0x1a98011c; domain 0
+ * has one too): domain 0 also moves to its fast channel when the firmware follows it there; domain 1's floor is
+ * level 8 (1.75 GHz, as the bootloader left it). The scheduler side is osfmk/kern/sched_prim.c (pandora_bigfirst).
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -279,7 +283,7 @@ struct cpu_domain {
 };
 static struct cpu_domain cpu_dom[2] = {
 	{ cpu_khz0, sizeof(cpu_khz0) / 4, 0, 6, 0, 27, ~0u, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0 },
-	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0, -1, 11, 0, 0, 0, 0, 0 },
+	{ cpu_khz1, sizeof(cpu_khz1) / 4, 6, 2, 0, 26, ~0u, 0, 0, 0, 0, 0, 0, 0, -1, 8, 0, 0, 0, 0, 0 },
 };
 static uint64_t cpu_busy_sum[8];
 
@@ -382,6 +386,9 @@ cpu_check_levels(void)
 	cpu_dom[0].method = cpu_try(0, 0, 0, "SCMI") ? 0 : -1;
 	cpu_fast_channel(0, 0x7);
 	cpu_fast_channel(1, 0x7);
+	if (cpu_dom[0].method == 0 && cpu_dom[0].fast && cpu_try(0, 5, 2, "fast channel")) {
+		cpu_dom[0].method = 2;
+	}
 	struct cpu_domain *d1 = &cpu_dom[1];
 	const uint32_t back = cpu_get(1, 0x8, 1);
 	if (cpu_try(1, d1->top, 0, "SCMI")) {
