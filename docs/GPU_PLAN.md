@@ -38,6 +38,7 @@
 12. **GPU 驱动拆成独立仓库**：按 UniXNU 的[贡献指南](https://unixnu.com/zh/contributing/repository)（每个硬件驱动一个公开仓库，带 `unixnu` 话题，以子模块接入），把 Adreno 840 驱动（`wsl/pandora_gpu.c`、`wsl/PandoraAdrenoGpu.cpp`、ABI 头文件、对应补丁）拆出来，`ios-pandora` 用子模块引用；同为骁龙 8 Elite Gen 5 的机器能直接用。GPU 稳定后再拆。
 13. **mtltest 全本地编**：测试着色器现在要 Apple 的 metal 编译器（只有 macOS），只能线上编。改成手写 AIR（LLVM 中间代码，metal2vulkan 的测试用例就是这么做的），本地用 Rust 带的 llvm-as 转换，再用小脚本打包成 metallib。
 14. **缓存一致**：插件现在每次提交前后清 CPU 缓存（借用内存的缓冲平均约 7 MB/次，bb31）。Adreno 支持直接读 CPU 缓存（安卓叫 IO-coherent），改用这种映射后就不用清。
+15. **120 Hz**：要三环都到 120 才有用。（1）屏幕：现在由引导程序点亮，我们没有显示控制器驱动，先查它实际刷新率和支持的模式，再做时序切换；（2）送画面：现在 CPU 每帧拷整屏约 4 毫秒，120 Hz 时只剩 8.3 毫秒，要等第 9 项（显示控制器直接显示 GPU 的图）；（3）iOS：iPhone X 只有 60 Hz，iOS 只在 ProMotion 机型上画 120 帧，要让系统认为屏幕支持 120 Hz，可能还要改机型判断，可行性待查。排在第 9 项之后。
 
 ## 1. 手机上的 GPU [实测]
 
