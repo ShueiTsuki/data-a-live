@@ -51,23 +51,28 @@ if [ "$ZIP" = release ]; then
 	# Large files: their xz copy when the build published one (turnip.yml; downloads here are slow),
 	# else the file itself; SHA256SUMS checks what comes out either way.
 	fetch() {
-		if curl -sSfL --retry 3 -o "$(winp "$T/$1.xz")" "$R/$1.xz"; then
+		# Resumed after a dropped connection (ten tries) before falling back to the whole file.
+		local ok=1 t
+		for t in 1 2 3 4 5 6 7 8 9 10; do
+			curl -sSfL -C - --max-time 600 -o "$(winp "$T/$1.xz")" "$R/$1.xz" && { ok=0; break; }
+		done
+		if [ $ok = 0 ]; then
 			python -I -c "import lzma,sys; open(sys.argv[1],'wb').write(lzma.decompress(open(sys.argv[1]+'.xz','rb').read()))" "$(winp "$T/$1")"
 			rm -f "$T/$1.xz"
 		else
-			curl -sSfL --retry 3 -o "$(winp "$T/$1")" "$R/$1"
+			curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/$1")" "$R/$1"
 		fi
 	}
 	fetch libvulkan_freedreno.dylib
 	for f in vktest SHA256SUMS BUILD.txt; do
-		curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
+		curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/$f")" "$R/$f"
 	done
 	cat "$T/BUILD.txt"
 	# The Metal plugin and mtltest, when the build published them (and --no-metal is not given).
-	if [ $METAL = 1 ] && curl -sSfL --retry 3 -o "$(winp "$T/SHA256SUMS.metal")" "$R/SHA256SUMS.metal"; then
+	if [ $METAL = 1 ] && curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/SHA256SUMS.metal")" "$R/SHA256SUMS.metal"; then
 		fetch NativeAdrenoMetal
 		for f in NativeAdrenoMetal.Info.plist mtltest; do
-			curl -sSfL --retry 3 -o "$(winp "$T/$f")" "$R/$f"
+			curl -sSfL --retry 3 --max-time 600 -o "$(winp "$T/$f")" "$R/$f"
 		done
 		# SHA256SUMS.metal names the bundle paths; the release carries the same bytes under flat names.
 		sed -e 's|NativeAdrenoMetal.bundle/NativeAdrenoMetal$|NativeAdrenoMetal|' \
