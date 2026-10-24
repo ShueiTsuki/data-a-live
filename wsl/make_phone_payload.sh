@@ -3,6 +3,7 @@
 # ADTFLAGS=--qemu-gic NAME=outq: QEMU-GIC variant for tools/qemu_loader.py into shim/loader/outq/
 # CPUS=N: cores to start (default 1); DEBUG=0x8: panics restart (0xc waits, DB_NMI)
 # KERNEL=FILE: this kernel instead of RUNDIR's (e.g. tools/mkprelink.py output with original kexts)
+# LOGO=FILE: the boot logo image (default the IPSW's applelogo in /opt/work/ipsw/logo)
 # RD=ufsroot0: root on UFS (with ADTFLAGS --root-extents for a pinned userdata file), no RAM
 #   disk; default RD=md0 with the sweet-init RAM disk
 # TRUSTCACHE="FILE..." : IPSW trust caches (first = static) into the payload and the ADT
@@ -31,4 +32,12 @@ if [ -n "${TRUSTCACHE:-}" ]; then
 fi
 mkdir -p $P/shim/loader/$N
 cp $O/payload.bin $P/shim/loader/$N/payload.bin
+# The boot logo shim/loader shows without -v: Apple's, from the user's IPSW (Firmware/all_flash/
+# applelogo@3x~iphone.im4p), never committed. LOGO=FILE for another; none: a black screen.
+LOGO=${LOGO:-/opt/work/ipsw/logo/applelogo@3x~iphone.im4p}
+if [ -f "$LOGO" ]; then
+	python3 -I $P/tools/bootlogo.py "$LOGO" $P/shim/loader/$N/logo.bin
+else
+	rm -f $P/shim/loader/$N/logo.bin
+fi
 sha256sum $K $O/payload.bin

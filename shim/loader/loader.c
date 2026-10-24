@@ -11,6 +11,10 @@
  *
  * MMU is off: every access is Device memory (-mstrict-align, 8-byte copies).
  * Linked at 0 and loaded anywhere: no absolute pointers in data.
+ *
+ * v2: like iBoot, without "-v" among the payload's boot-args the screen shows only the boot
+ * logo (logo.S, tools/bootlogo.py) centred on black, and the kernel keeps it there (patch 0206)
+ * until iOS presents its first frame. With "-v", or when something goes wrong, text as before.
  */
 #include <stdint.h>
 #include "font.h"
@@ -38,9 +42,11 @@ void fatal(void) __attribute__((noreturn));
 #define YELLOW 0xffffff00u
 #define GREEN  0xff40ff40u
 #define RED    0xffff4040u
+#define BLACK  0xff000000u
 
 static volatile uint32_t *const fb = (volatile uint32_t *)(uintptr_t)FB;
 static int row;
+static int verbose = 1;     /* text on screen; 0 = the boot logo only */
 
 static void fill(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t c)
 {
@@ -67,6 +73,8 @@ static void put_char(int col, char ch, uint32_t fg)
 
 static void line(const char *label, const char *text, uint32_t fg)
 {
+	if (!verbose)
+		return;
 	int c = 0;
 	while (*label)
 		put_char(c++, *label++, YELLOW);
@@ -124,6 +132,49 @@ _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_a
 _Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
 
 extern const unsigned char _payload_start[], _payload_end[];
+extern const unsigned char _logo_start[], _logo_end[];
+
+/* "-v" as a word among the embedded payload's boot-args; also yes when there is no payload,
+ * so that the error is shown. */
+static int wants_verbose(void)
+{
+	const struct payload *p = (const struct payload *)(uintptr_t)_payload_start;
+	static const char want[] = "SWEETXNU";
+	for (int i = 0; i < 8; i++)
+		if (p->magic[i] != want[i])
+			return 1;
+	const char *c = p->cmdline;
+	for (int i = 0; i + 1 < BOOT_LINE_LENGTH && c[i]; i++)
+		if (c[i] == '-' && c[i + 1] == 'v' && (i == 0 || c[i - 1] == ' ') &&
+		    (i + 2 == BOOT_LINE_LENGTH || c[i + 2] == ' ' || c[i + 2] == 0))
+			return 1;
+	return 0;
+}
+
+/* The logo (tools/bootlogo.py: "PLOGO\0\0\1", width, height, ARGB pixels) centred, as iBoot
+ * draws its applelogo. Nothing when logo.S is empty. */
+static void draw_logo(void)
+{
+	const volatile uint32_t *l = (const volatile uint32_t *)(uintptr_t)_logo_start;
+	uint64_t n = (uintptr_t)_logo_end - (uintptr_t)_logo_start;
+	static const char magic[8] = { 'P', 'L', 'O', 'G', 'O', 0, 0, 1 };
+	const volatile unsigned char *m = (const volatile unsigned char *)l;
+	if (n < 16)
+		return;
+	for (int i = 0; i < 8; i++)
+		if (m[i] != (unsigned char)magic[i])
+			return;
+	uint32_t w = l[2], h = l[3];
+	if (w > FB_W || h > FB_H || n < 16 + (uint64_t)w * h * 4)
+		return;
+	uint32_t x0 = (FB_W - w) / 2, y0 = (FB_H - h) / 2;
+	for (uint32_t y = 0; y < h; y++) {
+		volatile uint32_t *dst = fb + (y0 + y) * (FB_STRIDE / 4) + x0;
+		const volatile uint32_t *src = l + 4 + (uint64_t)y * w;
+		for (uint32_t x = 0; x < w; x++)
+			dst[x] = src[x];
+	}
+}
 
 static void copy64(uint64_t dst, uint64_t src, uint64_t n)
 {
@@ -226,12 +277,24 @@ static const char *boot(void)
 void loader_main(uint64_t fdt, uint64_t el, uint64_t load)
 {
 	(void)fdt;
-	fill(0, 0, FB_W, FB_H, BG);
 	row = 0;
-	line("PANDORA", "loader v1 - nothing is written to storage", GREEN);
+	verbose = wants_verbose();
+	if (verbose) {
+		fill(0, 0, FB_W, FB_H, BG);
+	} else {
+		fill(0, 0, FB_W, FB_H, BLACK);
+		draw_logo();
+	}
+	line("PANDORA", "loader v2 - nothing is written to storage", GREEN);
 	line("LEVEL", el == 1 ? "EL1" : "NOT EL1", el == 1 ? WHITE : RED);
 	hexline("LOADED", load);
 	const char *err = el == 1 ? boot() : "XNU needs EL1";
+	if (!verbose) {     /* an error is always shown, as text */
+		verbose = 1;
+		fill(0, 0, FB_W, FB_H, BG);
+		line("PANDORA", "loader v2 - nothing is written to storage", GREEN);
+		hexline("LOADED", load);
+	}
 	line("ERROR", err, RED);
 	/* Leave the message up for 60 s, then go back to Android. */
 	uint64_t f, t0, t;

@@ -11,6 +11,10 @@ SECTIONS {
 	_bss_end = .;
 	. += 0x8000;
 	_stack_top = .;
+	. = ALIGN(16);
+	_logo_start = .;
+	.logo : { *(.logo) }
+	_logo_end = .;
 	. = ALIGN(4096);
 	_payload_start = .;
 	.payload : { *(.payload) }
