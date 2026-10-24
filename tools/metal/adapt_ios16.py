@@ -374,13 +374,27 @@ edit('NativeBridgeMetalFrontend.mm',
 edit('NativeBridgeMetalFrontend.mm',
      """   [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
    if(deallocator) {""",
-     """   static const bool probe=[]{char args[1024]={};size_t size=sizeof args-1;
-    return sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && strstr(args,"pandora_astc_probe=1")!=nullptr;}();
+     """   const int probeLevel=pandoraAstcProbeLevel();const bool probe=probeLevel>=1;
    if(probe && bb==16 && d.width>=512) {
     std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+rowBytes*rows);
     static const uint8_t red[16]={0xfc,0xfd,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff};
     const NSUInteger blocks=rowBytes/16;
     for(NSUInteger y=0;y<rows;y++)for(NSUInteger x=0;x<blocks/2;x++)memcpy(&copy[y*rowBytes+x*16],red,16);
+    if(probeLevel>=2) {
+     // bb35: the ASTC blocks are in the texture exactly as uploaded, yet no red is drawn. Level 2 hands QuartzCore a
+     // BGRA8 texture of the same size instead (left half red, right half green): colour on screen = only ASTC
+     // sampling is wrong; still transparent = the sampling or the draw is wrong whatever the format.
+     MTLTextureDescriptor *plain=[d copy];plain.pixelFormat=MTLPixelFormatBGRA8Unorm;
+     id<MTLTexture> swap=[(id<MTLDevice>)self newTextureWithDescriptor:plain];
+     if(swap) {
+      std::vector<uint32_t> px((size_t)d.width*d.height);
+      for(NSUInteger y=0;y<d.height;y++)for(NSUInteger x=0;x<d.width;x++)px[y*d.width+x]=x<d.width/2?0xffff0000u:0xff00ff00u;
+      [swap replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:px.data() bytesPerRow:d.width*4];
+      texture=swap;
+      objc_setAssociatedObject(swap,&gProbeReadbackKey,@YES,OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // read back its targets too
+      NSLog(@"pandora-metal astc probe: %lux%lu handed over as BGRA8, left red right green",(unsigned long)d.width,(unsigned long)d.height);
+     }
+    } else {
     // bb34: no red reached any render target. The first image is uploaded by replaceRegion, the second through a
     // shared buffer and a blit; each is then copied back by the GPU and compared block by block with what went up.
     static std::atomic<int> nth{0};
@@ -412,6 +426,7 @@ edit('NativeBridgeMetalFrontend.mm',
     NSLog(@"pandora-metal astc probe #%d %lux%lu by %s, left %lu of %lu block columns red; read back left same/zero/untouched/other "
           "%u/%u/%u/%u right %u/%u/%u/%u (status %ld)",which,(unsigned long)d.width,(unsigned long)d.height,which%2==0?"replaceRegion":"blit",
           (unsigned long)(blocks/2),(unsigned long)blocks,same[0],zero[0],untouched[0],other[0],same[1],zero[1],untouched[1],other[1],(long)c.status);
+    }
    } else
    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
    if(deallocator) {""")
@@ -425,11 +440,13 @@ edit('NativeBridgeMetalFrontend.mm',
      """#include <sys/sysctl.h>
 """,
      """#include <sys/sysctl.h>
-static bool pandoraAstcProbe() {   // ios-pandora: boot-arg pandora_astc_probe=1 (tools/metal/adapt_ios16.py)
- static const bool on=[]{char args[1024]={};size_t size=sizeof args-1;
-  return sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && strstr(args,"pandora_astc_probe=1")!=nullptr;}();
- return on;
+static int pandoraAstcProbeLevel() {   // ios-pandora: boot-arg pandora_astc_probe=N (tools/metal/adapt_ios16.py)
+ static const int level=[]{char args[1024]={};size_t size=sizeof args-1;
+  if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0)return 0;
+  const char *at=strstr(args,"pandora_astc_probe=");return at?atoi(at+19):0;}();
+ return level;
 }
+static bool pandoraAstcProbe() {return pandoraAstcProbeLevel()>=1;}
 static char gProbePassTargetKey,gProbeReadbackKey;
 """)
 edit('NativeBridgeMetalFrontend.mm',
@@ -442,7 +459,8 @@ edit('NativeBridgeMetalFrontend.mm',
      """ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  [self check:nmb_encoder_set_texture""",
      """ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
- if(texture && pandoraAstcProbe() && texture.pixelFormat==MTLPixelFormatASTC_4x4_LDR && texture.width>=512) {
+ if(texture && pandoraAstcProbe() && ((texture.pixelFormat==MTLPixelFormatASTC_4x4_LDR && texture.width>=512) ||
+                                       objc_getAssociatedObject(texture,&gProbeReadbackKey))) {
   id target=objc_getAssociatedObject(self,&gProbePassTargetKey);   // ios-pandora: read it back at completion
   if(target) {
    NSMutableSet *targets=objc_getAssociatedObject(_commandBuffer,&gProbeReadbackKey);
@@ -497,3 +515,14 @@ edit('NativeBridgeMetalFrontend.mm',
   }
  }
  NSArray *completedHandlers;""")
+
+# ---- ios-pandora: sampler states in the log with the probe (bb35) --------------------------------------------
+edit('NativeBridgeMetalFrontend.mm',
+     """ NmbSampler *handle=nmb_sampler_new(gDevice,&s);""",
+     """ if(pandoraAstcProbe()) {   // ios-pandora: what QuartzCore samples with (tools/metal/adapt_ios16.py)
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<40)NSLog(@"pandora-metal sampler: min %lu mag %lu mip %lu address %lu/%lu/%lu border %lu normalized %d lod %.1f-%.1f compare %lu",
+   (unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,
+   (unsigned long)d.rAddressMode,(unsigned long)d.borderColor,(int)d.normalizedCoordinates,d.lodMinClamp,d.lodMaxClamp,(unsigned long)d.compareFunction);
+ }
+ NmbSampler *handle=nmb_sampler_new(gDevice,&s);""")
