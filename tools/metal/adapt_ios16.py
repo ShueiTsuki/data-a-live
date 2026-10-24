@@ -972,3 +972,45 @@ edit('NativeBridgeMetalFrontend.mm',
   seen[[NSString stringWithFormat:@"%sbufferoffset%lu",probeStage(stage),(unsigned long)index]]=@(offset);
  }
 """)
+
+# ---- ios-pandora: 'b3a8' surfaces whose planes report no row bytes (bb43) -------------------------------------
+# bb43: QuartzCore's own App Library draws render right on the phone (mtltest part 9). What stays empty is a layer
+# drawn from a full-screen two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10): the frontend refused it every
+# time (step 3) because IOSurfaceGetBytesPerRowOfPlane answers 0 for it here. Its allocation is exactly two linear
+# planes, rows aligned to 64 bytes, one after the other, rounded to 4 KiB: 1125x2436 -> 4544 * 2436 + 1152 * 2436 =
+# 13875456 -> 13877248, 1065x282 -> 1519616, as logged. Those planes are now computed when the surface gives none.
+edit('NativeBridgeMetalFrontend.mm',
+     """static NBTexture *textureOnSurface(NBBuffer *buffer,""",
+     """// ios-pandora: a 'b3a8' surface's planes when it reports none (bb43): {offset0, row0, offset1, row1}, or false.
+static bool pandoraB3a8Planes(IOSurfaceRef surface,size_t allocation,size_t planes[4]) {
+ if(!surface || IOSurfaceGetPixelFormat(surface)!=0x62336138 || IOSurfaceGetPlaneCount(surface)!=2)return false;
+ if(IOSurfaceGetBytesPerRowOfPlane(surface,0) && IOSurfaceGetBytesPerRowOfPlane(surface,1))return false;
+ const size_t w=IOSurfaceGetWidth(surface),h=IOSurfaceGetHeight(surface);
+ const size_t row0=(w*4+63)&~(size_t)63,row1=(w+63)&~(size_t)63;
+ if(!w || !h || row0*h+row1*h>allocation)return false;
+ planes[0]=0;planes[1]=row0;planes[2]=row0*h;planes[3]=row1;
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<8)NSLog(@"pandora-metal b3a8 %lux%lu: planes computed (row %lu at 0, row %lu at %lu; %lu of %lu bytes)",(unsigned long)w,
+  (unsigned long)h,(unsigned long)row0,(unsigned long)row1,(unsigned long)(row0*h),(unsigned long)(row0*h+row1*h),(unsigned long)allocation);
+ return true;
+}
+static NBTexture *textureOnSurface(NBBuffer *buffer,""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));""",
+     """ const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ size_t computed[4];   // ios-pandora: a 'b3a8' surface without plane rows (bb43)
+ if(!chromaRow && pandoraB3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
+ NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ const uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
+ const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+""",
+     """ uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
+ size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+ size_t computed[4];   // ios-pandora: a 'b3a8' surface without plane rows (bb43)
+ if(!row && plane<2 && pandoraB3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
+""")
