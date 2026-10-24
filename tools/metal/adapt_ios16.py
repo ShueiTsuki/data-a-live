@@ -298,3 +298,63 @@ edit('NativeBridgeMetalFrontend.mm',
     }
    }
    static std::atomic<int> captures{0};""")
+
+# ---- ios-pandora: no-copy memory is cleaned like surfaces (bb30) ---------------------------------------------
+# The kernel maps imported user memory for the GPU uncached and leaves the CPU's caches to the importer
+# (NativeAdrenoABI.h; pandora_gpu.c flushes every import only with pandora_gpu_flushall=1). NativeMetal cleans
+# the IOSurfaces a command buffer uses, but not memory from newBufferWithBytesNoCopy or textures over it, so
+# the GPU can read what the CPU has not written back yet (bb30: the Settings icon showed only its top rows).
+# Now those ranges are cleaned and invalidated at commit and at completion too, as the surfaces are.
+edit('NativeBridgeMetalFrontend.mm',
+     """static NBTexture *textureOnBuffer(NBBuffer *buffer,""",
+     """// ios-pandora: no-copy buffers a command uses, directly or under a texture (tools/metal/adapt_ios16.py).
+static std::atomic<uint64_t> gWrappedFlushes{0},gWrappedFlushBytes{0};
+static void flushWrapped(NSSet *owners) {
+ if(!owners.count)return;
+ std::vector<std::pair<uintptr_t,size_t>> ranges;
+ for(id o in owners) {
+  NBBuffer *b=nil;
+  if([o isKindOfClass:[NBBuffer class]])b=o;
+  else if([o isKindOfClass:[NBTexture class]])b=((NBTexture *)o).buffer;
+  if(b && b.wrapped)ranges.emplace_back(reinterpret_cast<uintptr_t>(b.wrapped),(size_t)[(id<MTLBuffer>)b length]);
+ }
+ if(ranges.empty())return;
+ std::sort(ranges.begin(),ranges.end());
+ const auto last=std::unique(ranges.begin(),ranges.end());
+ for(auto it=ranges.begin();it!=last;++it){sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);gWrappedFlushBytes+=it->second;}
+ const uint64_t n=++gWrappedFlushes;
+ if(n<=3 || n%2000==0)NSLog(@"pandora-metal wrapped: %llu cleanings, %llu MiB in all",(unsigned long long)n,(unsigned long long)(gWrappedFlushBytes.load()>>20));
+}
+static NBTexture *textureOnBuffer(NBBuffer *buffer,""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ flushSurfaces(_surfaces);
+ // Actual GPU completion""",
+     """ flushSurfaces(_surfaces);
+ flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+ // Actual GPU completion""")
+edit('NativeBridgeMetalFrontend.mm',
+     """  flushSurfaces(_surfaces);
+  // Completion owns this reference""",
+     """  flushSurfaces(_surfaces);
+  flushWrapped(_resourceOwners);   // ios-pandora: no-copy memory too
+  // Completion owns this reference""")
+
+# ---- ios-pandora: refused IOSurface textures in the log (bb30) -----------------------------------------------
+# A texture over an IOSurface that the frontend cannot make is only counted (bb30: 148 of 173 refused, the last
+# a 1125x2436 two-plane RGB10A8_2P_XR10 surface). Its layer is then not drawn, which could be the App Library's
+# missing background. The first refusals now say what they were and who asked.
+edit('NativeBridgeMetalFrontend.mm',
+     """ std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
+}""",
+     """ std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<40) {
+  void *frames[8];const int n=backtrace(frames,8);std::string callers;char item[96];
+  for(int i=1;i<n;i++){Dl_info info{};if(!dladdr(frames[i],&info) || !info.dli_fname)continue;const char *slash=strrchr(info.dli_fname,'/');
+   snprintf(item,sizeof item," %s+%lx",slash?slash+1:info.dli_fname,(unsigned long)((uintptr_t)frames[i]-(uintptr_t)info.dli_fbase));callers+=item;}
+  const uint32_t f=r.format;
+  NSLog(@"pandora-metal surface refused: step %u '%c%c%c%c' planes %u plane %u pf %u %llux%llu row %llu offset %llu alloc %llu |%s",
+        r.step,(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,r.planes,r.plane,r.pixelFormat,(unsigned long long)r.width,
+        (unsigned long long)r.height,(unsigned long long)r.row,(unsigned long long)r.offset,(unsigned long long)r.allocation,callers.c_str());
+ }
+}""")

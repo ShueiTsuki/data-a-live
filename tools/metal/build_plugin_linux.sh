@@ -4,7 +4,8 @@
 #
 #   SDK=/path/iPhoneOS16.1.sdk tools/metal/build_plugin_linux.sh UNIXNU NATIVEMETAL NATIVEADRENO METAL2VULKAN MESA OUT
 #
-# Arguments as in build_plugin.sh. NATIVEMETAL and METAL2VULKAN are patched in place: pass fresh copies.
+# Arguments as in build_plugin.sh. NATIVEMETAL is patched in place: pass a fresh copy. METAL2VULKAN gets
+# NativeMetal's patches unless it has them; CARGO_TARGET keeps the Rust build between runs.
 set -euo pipefail
 U=$(cd "$1" && pwd); NM=$(cd "$2" && pwd); NA=$(cd "$3" && pwd); M2V=$(cd "$4" && pwd); MESA=$(cd "$5" && pwd)
 OUT=$6; mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
@@ -38,9 +39,14 @@ print("};")' "$B/$n.spv" "$n"
 } > "$B/gen/NativeTurnipShaders.h"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
+# A metal2vulkan tree kept between builds (so Rust reuses its build) already carries the patches.
 for p in "$NM"/bridge/patches/000*.patch; do
-	echo "   $(basename "$p")"
-	git -C "$M2V" apply "$p"
+	if git -C "$M2V" apply --reverse --check "$p" 2>/dev/null; then
+		echo "   $(basename "$p") (already applied)"
+	else
+		echo "   $(basename "$p")"
+		git -C "$M2V" apply "$p"
+	fi
 done
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
@@ -69,8 +75,8 @@ NMB_RUNTIME_ID=$RID NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/functi
 	IPHONEOS_DEPLOYMENT_TARGET=16.0 SDKROOT="$SDK" \
 	CC_aarch64_apple_ios=clang CXX_aarch64_apple_ios=clang++ AR_aarch64_apple_ios="$LLVM/llvm-ar" \
 	CFLAGS_aarch64_apple_ios="-target arm64-apple-ios16.0 -isysroot $SDK" \
-	cargo +1.98.0 build --release --manifest-path "$B/Cargo.toml" --target aarch64-apple-ios --target-dir "$B/target"
-BRIDGE=$B/target/aarch64-apple-ios/release/libnative_metal_bridge.a
+	cargo +1.98.0 build --release --manifest-path "$B/Cargo.toml" --target aarch64-apple-ios --target-dir "${CARGO_TARGET:-$B/target}"
+BRIDGE=${CARGO_TARGET:-$B/target}/aarch64-apple-ios/release/libnative_metal_bridge.a
 ls -l "$BRIDGE"
 
 echo "== plugin bundle (UniXNU build-adreno-metal-plugin.py)"
