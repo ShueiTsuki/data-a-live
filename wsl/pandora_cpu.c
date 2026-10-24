@@ -38,6 +38,11 @@
  * Patch 0203 (freq3: domain 1 follows only its fast channel, 0x1a980118 with the doorbell at 0x1a98011c; domain 0
  * has one too): domain 0 also moves to its fast channel when the firmware follows it there; domain 1's floor is
  * level 8 (1.75 GHz, as the bootloader left it). The scheduler side is osfmk/kern/sched_prim.c (pandora_bigfirst).
+ *
+ * Patch 0204 (freq3, freq4: since the fast channels came in, the limits read back 255 for domain 0 and 0 for
+ * domain 1, and the cap at the limit only moved the governor's own record of domain 1's level to 0 every 2 s,
+ * while the firmware stayed at 8-26; the next window then asked for the floor, a drop to 1.75 GHz): no cap at the
+ * limits; every 2 s the firmware's current level is taken when it differs from the record.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -517,13 +522,14 @@ cpu_governor(void)
 			for (uint32_t d = 0; d < 2; d++) {
 				struct cpu_domain *dm = &cpu_dom[d];
 				const uint32_t limit = cpu_get(d, 0x6, 1), fw = cpu_get(d, 0x8, 1);
-				if (limit != ~0u && limit < dm->top && dm->level > limit) {
-					dm->level = limit;
-				}
+				const bool taken = fw != ~0u && fw < dm->levels && fw != dm->level;
 				if (round < 4000 || (round % 1250) < 125) {
-					printf("PANDORA CPU: governor: domain %u busy %llu%% avg %llu MHz, level %u (%u MHz), %u changes, limit %d, firmware %d\n",
+					printf("PANDORA CPU: governor: domain %u busy %llu%% avg %llu MHz, level %u (%u MHz), %u changes, limit %d, firmware %d%s\n",
 					    d, dm->windows ? dm->busy_sum / dm->windows / 10 : 0, dm->windows ? dm->khz_sum / dm->windows / 1000 : 0,
-					    dm->level, dm->khz[dm->level] / 1000, dm->changes, (int)limit, (int)fw);
+					    dm->level, dm->khz[dm->level] / 1000, dm->changes, (int)limit, (int)fw, taken ? " (taken)" : "");
+				}
+				if (taken) {
+					dm->level = fw;
 				}
 				dm->busy_sum = dm->khz_sum = dm->windows = 0;
 				dm->changes = 0;
