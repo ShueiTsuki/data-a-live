@@ -13,3 +13,7 @@ outq/
 __pycache__/
 /tools/pinfile/pinfile
 out-root/
+
+# Local test payloads
+shim/loader/tctest/
+*.bin

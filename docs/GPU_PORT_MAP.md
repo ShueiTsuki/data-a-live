@@ -4,11 +4,11 @@
 标记：**[读到]** = 亲眼读到的代码或数据，附 文件:行；**[推断]** = 由读到的东西推出来的，没在机器上验证。
 
 路径简写：
-- `U/` = `D:\DeepSeekHarness\claude\unixnu_review\gpu\`（七个组件的独立克隆；NativeAdreno 最新提交 b686b90，2026-10-23）
-- `S/` = `D:\DeepSeekHarness\claude\unixnu_review\UniXNU-sheng\package\`（sheng 板级包，**真正跑通 GMU 的代码在这里**）
-- `LX/` = 上次调研的 Linux 源码 `...\0c6fe11f-...\scratchpad\lx\`（`a6xx_gmu.c`、`a6xx_hfi.c` 等；`LX/fetched/` 有 gpucc/gcc/gxclkctl-kaanapali.c、kaanapali.dtsi 在 `LX/`）
-- `KG/` = 高通 KGSL 源 `...\scratchpad\kgsl_src\gfx-kernel.lnx.16.0.r14-rel.*`
-- `DT` = 我们手机的安卓设备树 `D:\DeepSeekHarness\claude\ios_pandora\device\pandora-live.dts`
+- `U/` = UniXNU 各 GPU 组件仓库的本地克隆（七个组件；NativeAdreno 最新提交 b686b90，2026-10-23）
+- `S/` = UniXNU sheng 板级包的 `package/` 目录（**真正跑通 GMU 的代码在这里**）
+- `LX/` = Linux 源码（`a6xx_gmu.c`、`a6xx_hfi.c` 等；`LX/fetched/` 有 gpucc/gcc/gxclkctl-kaanapali.c、kaanapali.dtsi 在 `LX/`）
+- `KG/` = 高通 KGSL 源 `gfx-kernel.lnx.16.0.r14-rel.*`
+- `DT` = 我们手机的安卓设备树 `device/pandora-live.dts`（设备导出，不在仓库里）
 
 ---
 

@@ -1,0 +1,37 @@
+ios-pandora licensing
+
+This repository holds two kinds of work under two licences, plus third-party
+files that keep their own terms.
+
+1. Kernel changes: Apple Public Source License 2.0 (LICENSES/APSL-2.0.txt)
+
+   - xnu/patches/**  (modifications of Apple's xnu-8796 kernel)
+   - the kernel source files under wsl/ that the build copies into the xnu
+     tree: wsl/*.c, wsl/*.cpp, wsl/*.h and wsl/*.c.txt
+
+   These modify or extend xnu, which Apple publishes under the APSL 2.0, so
+   they are distributed under the same licence. Some patches build on the
+   xnu patches of ios-sweet and ios-fuxi; those are modifications of xnu as
+   well.
+
+2. Everything else written for this project: MIT (LICENSES/MIT.txt)
+
+   tools/, shim/, the build and test scripts under wsl/ (*.sh, *.py),
+   .github/, and the documentation (*.md).
+
+3. Third-party files, under their own licences (their notices are kept next
+   to them):
+
+   - wsl/adreno/ArmSmmu4K*.{c,h}: ArmSmmu4K, MIT (wsl/adreno/LICENSE.ArmSmmu4K)
+   - wsl/adreno/NativeAdrenoABI.h: NativeAdreno, MIT
+     (wsl/adreno/LICENSE.NativeAdreno)
+   - tools/native_prelink/: UniXNU, BSD-2-Clause-Patent
+     (tools/native_prelink/LICENSE)
+   - shim/*/font.h: the 8x16 console font table from ios-sweet's shim
+     (generated from the cp850-8x16 PSF console font)
+
+Not in this repository and not covered by any of the above: Apple's iOS
+system files (IPSW, dyld shared cache, SDK), Qualcomm and Xiaomi firmware,
+and anything read from a phone. The build fetches or expects them separately.
+
+SPDX identifiers: APSL-2.0, MIT, BSD-2-Clause-Patent.
