@@ -26,3 +26,25 @@ fragment float4 tri_fs()
 {
 	return float4(0.0, 1.0, 0.0, 1.0);
 }
+
+// Part 5: a full-screen triangle that samples texture 0 with nearest filtering (an ASTC 4x4 image,
+// bb27-bb29: the App Library's ASTC images come out transparent).
+struct VertexUV {
+	float4 position [[position]];
+	float2 uv;
+};
+
+vertex VertexUV quad_vs(uint vid [[vertex_id]])
+{
+	const float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+	VertexUV v;
+	v.position = float4(p[vid], 0.0, 1.0);
+	v.uv = float2((p[vid].x + 1.0) * 0.5, (1.0 - p[vid].y) * 0.5);
+	return v;
+}
+
+fragment float4 tex_fs(VertexUV in [[stage_in]], texture2d<float> t [[texture(0)]])
+{
+	constexpr sampler s(filter::nearest);
+	return t.sample(s, in.uv);
+}

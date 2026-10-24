@@ -11,6 +11,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -226,6 +227,89 @@ run(void)
 			}
 			if (surface) {
 				CFRelease(surface);
+			}
+		}
+
+		/* ---- part 5: sample an ASTC 4x4 image (the App Library's material, bb27-bb29) ---- */
+		/* 8x8 texels = 2x2 void-extent blocks, one colour each: red, green (top), blue, white (bottom).
+		 * (a) an ordinary texture filled by replaceRegion, (b) newTextureWithBytesNoCopy as QuartzCore makes it. */
+		{
+			uint8_t blocks[4][16];
+			const uint16_t colour[4][4] = { { 0xffff, 0, 0, 0xffff }, { 0, 0xffff, 0, 0xffff },
+				{ 0, 0, 0xffff, 0xffff }, { 0xffff, 0xffff, 0xffff, 0xffff } };
+			for (unsigned b = 0; b < 4; b++) {
+				const uint8_t head[8] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };   /* LDR void extent, no extent */
+				memcpy(blocks[b], head, 8);
+				memcpy(blocks[b] + 8, colour[b], 8);
+			}
+			const uint32_t want[4] = { 0xff0000ffu, 0xff00ff00u, 0xffff0000u, 0xffffffffu };
+			MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+			rpd.vertexFunction = [lib newFunctionWithName:@"quad_vs"];
+			rpd.fragmentFunction = [lib newFunctionWithName:@"tex_fs"];
+			rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+			err = nil;
+			id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+			MTLTextureDescriptor *rt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			    width:8 height:8 mipmapped:NO];
+			rt.usage = MTLTextureUsageRenderTarget;
+			rt.storageMode = MTLStorageModePrivate;
+			id<MTLTexture> target = [dev newTextureWithDescriptor:rt];
+			MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR
+			    width:8 height:8 mipmapped:NO];
+			ad.usage = MTLTextureUsageShaderRead;
+			ad.storageMode = MTLStorageModeShared;
+			for (unsigned way = 0; way < 2 && !check("part 5: render pipeline", rps, err) && !check("part 5: target", target, nil);
+			    way++) {
+				id<MTLTexture> astc = nil;
+				void *bytes = NULL;
+				if (way == 0) {
+					astc = [dev newTextureWithDescriptor:ad];
+					[astc replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:blocks bytesPerRow:32];
+				} else if (posix_memalign(&bytes, 16384, 16384) == 0) {
+					memset(bytes, 0, 16384);
+					memcpy(bytes, blocks, sizeof(blocks));
+					SEL sel = NSSelectorFromString(@"newTextureWithBytesNoCopy:length:descriptor:deallocator:");
+					if ([(id)dev respondsToSelector:sel]) {
+						id (*make)(id, SEL, void *, NSUInteger, MTLTextureDescriptor *, void (^)(void *, NSUInteger)) =
+						    (id (*)(id, SEL, void *, NSUInteger, MTLTextureDescriptor *, void (^)(void *, NSUInteger)))objc_msgSend;
+						astc = make(dev, sel, bytes, 16384, ad, ^(void *b, NSUInteger l) { (void)l; free(b); });
+					} else {
+						free(bytes);
+					}
+				}
+				if (check(way ? "part 5b: ASTC texture (newTextureWithBytesNoCopy)" : "part 5a: ASTC texture (replaceRegion)",
+				    astc, nil)) {
+					continue;
+				}
+				MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+				pass.colorAttachments[0].texture = target;
+				pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+				pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+				pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+				id<MTLCommandBuffer> cb = [queue commandBuffer];
+				id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+				[enc setRenderPipelineState:rps];
+				[enc setFragmentTexture:astc atIndex:0];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+				[blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+				    sourceSize:MTLSizeMake(8, 8, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:32
+				    destinationBytesPerImage:256];
+				[blit endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				const uint32_t *px = (const uint32_t *)buf.contents;
+				unsigned bad = 0;
+				for (unsigned y = 0; y < 8; y++) {
+					for (unsigned x = 0; x < 8; x++) {
+						bad += px[y * 8 + x] != want[(y / 4) * 2 + x / 4];
+					}
+				}
+				say("MTLTEST: part 5%c: status %ld; corners %08x %08x %08x %08x (want %08x %08x %08x %08x); %u of 64 wrong%s",
+				    way ? 'b' : 'a', (long)cb.status, px[0], px[7], px[56], px[63], want[0], want[1], want[2], want[3], bad,
+				    bad ? " FAIL" : "");
+				failures += bad != 0 || cb.status != MTLCommandBufferStatusCompleted;
 			}
 		}
 }
