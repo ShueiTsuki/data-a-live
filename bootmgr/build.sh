@@ -6,7 +6,7 @@
 #
 # --payload  XNU payload (default shim/loader/out/payload.bin, copied with everyday boot-args)
 # --stock    the phone's stock boot_b, full partition copy (default device/stock/boot_b.img)
-# --wait-ms  how long the line stays on the boot logo (default 3000)
+# --wait-ms  how long the line stays on the boot logo (default 5000)
 # --any-mode test builds: the line in every boot mode (fastboot boot may not look "normal")
 # --unarmed  volume up shows "iOS off" instead of starting iOS
 # Writes nothing to the phone.

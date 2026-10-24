@@ -30,7 +30,7 @@ def main():
             del args[i:i + 2]
             return v
         return default
-    wait_ms = int(opt('--wait-ms', '3000'))
+    wait_ms = int(opt('--wait-ms', '5000'))
     any_mode = '--any-mode' in args
     unarmed = '--unarmed' in args
     args = [a for a in args if a not in ('--any-mode', '--unarmed')]
