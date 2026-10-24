@@ -19,7 +19,13 @@
 #include <sys/sysctl.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <objc/runtime.h>
+#ifdef MTLTEST_AIR
+#include "mtltest_air.h"   /* mtltest.air.ll assembled by llvm-as, as bytes (xxd -i), made by build_plugin_linux.sh */
+#else
 #include "mtltest_metallib.h"   /* mtltest.metallib as bytes (xxd -i), made by build_plugin.sh */
+#endif
 
 static int con = -1;
 static unsigned failures;
@@ -400,12 +406,30 @@ run(void)
 		    NSStringFromClass([(id)dev class]).UTF8String, [dev supportsFamily:MTLGPUFamilyApple3],
 		    [dev supportsFamily:MTLGPUFamilyCommon2]);
 		NSError *err = nil;
+#ifdef MTLTEST_AIR
+		/* Built without Apple's metal compiler: bare AIR goes to the plugin's own entry for it, found through the image
+		 * that implements the device's methods. */
+		id (*withAir)(const void *, size_t) = NULL;
+		Dl_info info = { 0 };
+		IMP imp = class_getMethodImplementation([(id)dev class], @selector(newCommandQueue));
+		if (dladdr((const void *)imp, &info) && info.dli_fname) {
+			void *image = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+			if (image) {
+				withAir = (id (*)(const void *, size_t))dlsym(image, "native_bridge_metal_library_with_air");
+			}
+		}
+		id<MTLLibrary> lib = withAir ? withAir(mtltest_air, mtltest_air_len) : nil;
+		if (check("part 1: library from AIR (native_bridge_metal_library_with_air)", lib, nil)) {
+			return;
+		}
+#else
 		dispatch_data_t data = dispatch_data_create(mtltest_metallib, mtltest_metallib_len, NULL,
 		    DISPATCH_DATA_DESTRUCTOR_DEFAULT);
 		id<MTLLibrary> lib = [dev newLibraryWithData:data error:&err];
 		if (check("part 1: newLibraryWithData", lib, err)) {
 			return;
 		}
+#endif
 		id<MTLCommandQueue> queue = [dev newCommandQueue];
 		if (check("part 1: newCommandQueue", queue, nil)) {
 			return;

@@ -1,6 +1,6 @@
 #!/bin/bash
 # tools/metal/build_plugin.sh for Linux (WSL): builds NativeAdrenoMetal.bundle without Xcode, from an iOS 16 SDK
-# (headers and .tbd stubs only), clang 18 and ld64.lld. mtltest is not built: its shaders need Apple's metal compiler.
+# (headers and .tbd stubs only), clang 18 and ld64.lld. mtltest too, from its shaders as AIR text (tools/metal/mtltest.air.ll).
 #
 #   SDK=/path/iPhoneOS16.1.sdk tools/metal/build_plugin_linux.sh UNIXNU NATIVEMETAL NATIVEADRENO METAL2VULKAN MESA OUT
 #
@@ -117,6 +117,19 @@ plistlib.dump({k: v for k, v in (kv.split('=', 1) for kv in (
 	'NSPrincipalClass=NativeAdrenoMetalDevice', 'MinimumOSVersion=16.0'))}, open(sys.argv[1], 'wb'))
 EOF
 
+echo "== mtltest (tools/metal/mtltest.air.ll, assembled here: no metal compiler off macOS)"
+# The shaders as AIR text (made once from a CI-built metallib by tools/metal/mtltest_air.sh); mtltest built with
+# MTLTEST_AIR hands the AIR to the plugin's native_bridge_metal_library_with_air.
+EXTRA=()
+if [ -f "$ROOT/tools/metal/mtltest.air.ll" ]; then
+	"$LLVM_AS" -o "$B/mtltest_air" "$ROOT/tools/metal/mtltest.air.ll"
+	(cd "$B" && xxd -i mtltest_air > gen/mtltest_air.h)
+	clang "${BASE[@]}" "${LINK[@]}" -DMTLTEST_AIR -fobjc-arc -Wall -I "$B/gen" "$ROOT/tools/metal/mtltest.m" \
+		-framework Foundation -framework Metal -framework IOSurface -o "$OUT/mtltest"
+	rcodesign sign "$OUT/mtltest" 2>/dev/null
+	EXTRA=(mtltest)
+fi
+
 "$LLVM/llvm-otool" -L "$BUNDLE/NativeAdrenoMetal"
-(cd "$OUT" && sha256sum NativeAdrenoMetal.bundle/NativeAdrenoMetal NativeAdrenoMetal.bundle/Info.plist > SHA256SUMS && cat SHA256SUMS)
+(cd "$OUT" && sha256sum NativeAdrenoMetal.bundle/NativeAdrenoMetal NativeAdrenoMetal.bundle/Info.plist "${EXTRA[@]}" > SHA256SUMS && cat SHA256SUMS)
 ls -l "$BUNDLE"

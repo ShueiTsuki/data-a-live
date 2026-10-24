@@ -91,10 +91,11 @@ else
 fi
 (cd "$T" && sha256sum -c ${METAL_FROM:+--ignore-missing} SHA256SUMS)
 if [ -n "${METAL_FROM:-}" ]; then
-	# The local build's plugin over the artifact's (mtltest stays the artifact's), checked against its own sums.
+	# The local build's plugin (and mtltest, when it built one) over the artifact's, checked against its own sums.
 	wsl -d Ubuntu-24.04 -u root -- bash -c "cd $METAL_FROM && sha256sum -c SHA256SUMS >&2 &&
 		cp NativeAdrenoMetal.bundle/NativeAdrenoMetal $(wslp "$T")/NativeAdrenoMetal &&
-		cp NativeAdrenoMetal.bundle/Info.plist $(wslp "$T")/NativeAdrenoMetal.Info.plist" || exit 1
+		cp NativeAdrenoMetal.bundle/Info.plist $(wslp "$T")/NativeAdrenoMetal.Info.plist &&
+		if [ -f mtltest ]; then cp mtltest $(wslp "$T")/mtltest; fi" || exit 1
 	echo "plugin from $METAL_FROM: $(sha256sum "$T/NativeAdrenoMetal" | cut -c1-16)"
 fi
 HAVE_METAL=0; [ -f "$T/NativeAdrenoMetal" ] && HAVE_METAL=1
