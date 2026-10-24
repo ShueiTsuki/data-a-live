@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index fdc40d7..9172f96 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2012,6 +2012,15 @@ pkt4(uint32_t reg, uint32_t cnt)
+ 
+ static uint32_t gpu_seqno;
+ 
++/* The last submissions, by fence (0193, gpu_hang_dump). */
++#define GPU_HIST 16u
++struct gpu_hist {
++	uint32_t seq, thread, n, first, dw0, dwn;
++	int client;
++	uint64_t ib0, ibn;
++};
++static struct gpu_hist gpu_hist[GPU_HIST];
++
+ static void
+ ring_put_n(uint32_t op, const uint32_t *p, uint32_t n)
+ {
+@@ -2587,6 +2596,9 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
+ 		}
+ 		uint32_t thread = first == 0x70970001u ? 3 : 1;
+ 		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
++		struct gpu_hist *h = &gpu_hist[(uint32_t)*fence % GPU_HIST];
++		*h = (struct gpu_hist){ .seq = (uint32_t)*fence, .client = client, .thread = thread, .n = n,
++			                .first = first, .ib0 = ib[0], .dw0 = dw[0], .ibn = ib[n - 1], .dwn = dw[n - 1] };
+ 		gpu_clients[client].submits++;
+ 		gpu_clients[client].fence = (uint32_t)*fence;
+ 		gpu_clients[client].reset = false;
+@@ -2879,6 +2891,35 @@ gpu_level14(bool rest)
+ 	return good;
+ }
+ 
++/*
++ * Patch 0193: the last GPU_HIST submissions (pandora_gpu_submit), and a dump of the CP when the
++ * ring timestamp stops short of the last fence issued (bb19: backboardd froze, its waits timed
++ * out until the end, and the log ring had no room left for what the GPU was doing).
++ */
++static void
++gpu_hang_dump(uint32_t ring)
++{
++	printf("PANDORA GPU HANG: ring timestamp %u, issued %u, rbbm %08x int0 %08x cp int %08x "
++	    "rptr %u rptr bv %u wptr %u\n", ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(RBBM_INT_0_STATUS),
++	    gr(CP_INTERRUPT_STATUS_GLOBAL), gr(CP_RB_RPTR), gr(CP_RB_RPTR_BV), ring_wptr);
++	for (uint32_t pipe = 1; pipe <= 2; pipe++) {
++		gw(CP_APERTURE_CNTL_HOST, CP_APERTURE_PIPE(pipe));
++		printf("PANDORA GPU HANG: %s IB1 base %08x%08x rem %08x init %08x hw fault %08x int %08x sqe %08x\n",
++		    pipe == 1 ? "BR" : "BV", gr(CP_IB1_BASE_PIPE + 1), gr(CP_IB1_BASE_PIPE),
++		    gr(CP_IB1_REM_SIZE_PIPE), gr(CP_IB1_INIT_SIZE_PIPE), gr(CP_HW_FAULT_STATUS_PIPE),
++		    gr(CP_INTERRUPT_STATUS_PIPE), gr(CP_SQE_STATUS_PIPE));
++	}
++	gw(CP_APERTURE_CNTL_HOST, 0);
++	for (uint32_t k = 0; k < GPU_HIST; k++) {
++		const struct gpu_hist *h = &gpu_hist[(gpu_seqno + 1 + k) % GPU_HIST];
++		if (h->seq) {
++			printf("PANDORA GPU HANG: fence %u%s client %d thread %u ibs %u first %08x ib0 %llx+%u ibn %llx+%u\n",
++			    h->seq, (int32_t)(h->seq - ring) > 0 ? " (pending)" : "", h->client, h->thread, h->n,
++			    h->first, (unsigned long long)h->ib0, h->dw0, (unsigned long long)h->ibn, h->dwn);
++		}
++	}
++}
++
+ /*
+  * Patch 0189, with pandora_gpu_metal=1: every 5 s for 10 minutes (0190), what each client has done
+  * (allocations, imports, mappings, frees, submissions, its last fence), the ring timestamp, and
+@@ -2889,8 +2930,8 @@ static void
+ gpu_watch(void)
+ {
+ 	char last[GPU_MAX_CLIENTS][96] = {};
+-	uint32_t last_ring = ~0u, last_fsr = 0;
+-	for (unsigned t = 0; t < 120; t++) {   /* 10 minutes: shader compiling can take minutes */
++	uint32_t last_ring = ~0u, last_fsr = 0, dumped = ~0u;
++	for (unsigned t = 0; ; t++) {   /* 0193: as long as the system runs (lines only on change) */
+ 		gpu_sleep(5000);
+ 		lck_mtx_lock(&gpu_lock);
+ 		for (unsigned i = 0; i < GPU_MAX_CLIENTS; i++) {
+@@ -2915,6 +2956,9 @@ gpu_watch(void)
+ 			    (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(CP_INTERRUPT_STATUS_GLOBAL),
+ 			    gr(CP_RB_RPTR), ring_wptr);
+ 			last_ring = ring;
++		} else if ((int32_t)(gpu_seqno - ring) > 0 && ring != dumped) {
++			gpu_hang_dump(ring);   /* 5 s and more without progress, work pending */
++			dumped = ring;
+ 		}
+ 		if (fsr && fsr != last_fsr) {
+ 			printf("PANDORA GPU WATCH: SMMU fault fsr %08x far %08x%08x fsynr0 %08x\n", fsr,
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index 1f14947..ded9dd2 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -380,7 +380,14 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	if (ret == kIOReturnSuccess && out_len) {
+ 		memcpy(args->structureOutput, out, out_len);
+ 	}
+-	if (ret != kIOReturnSuccess) {
++	if (ret == kIOReturnTimeout && m == NativeAdrenoMethodWaitFence) {
++		/* Turnip polls fences with short timeouts: counted, a line per 1000 (0193; bb19 filled the
++		 * log ring with them while the GPU was stuck). */
++		static uint32_t timeouts;
++		if ((++timeouts % 1000) == 1) {
++			IOLog("PANDORA GPU UC: client %d fence waits timed out %u times\n", client_, timeouts);
++		}
++	} else if (ret != kIOReturnSuccess) {
+ 		IOLog("PANDORA GPU UC: client %d method %u in %u out %u -> 0x%x\n", client_, m, in_len, out_len, ret);
+ 	}
+ 	return ret;

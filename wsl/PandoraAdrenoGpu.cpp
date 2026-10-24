@@ -380,7 +380,14 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	if (ret == kIOReturnSuccess && out_len) {
 		memcpy(args->structureOutput, out, out_len);
 	}
-	if (ret != kIOReturnSuccess) {
+	if (ret == kIOReturnTimeout && m == NativeAdrenoMethodWaitFence) {
+		/* Turnip polls fences with short timeouts: counted, a line per 1000 (0193; bb19 filled the
+		 * log ring with them while the GPU was stuck). */
+		static uint32_t timeouts;
+		if ((++timeouts % 1000) == 1) {
+			IOLog("PANDORA GPU UC: client %d fence waits timed out %u times\n", client_, timeouts);
+		}
+	} else if (ret != kIOReturnSuccess) {
 		IOLog("PANDORA GPU UC: client %d method %u in %u out %u -> 0x%x\n", client_, m, in_len, out_len, ret);
 	}
 	return ret;
