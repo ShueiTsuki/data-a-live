@@ -387,3 +387,74 @@ edit('NativeBridgeMetalFrontend.mm',
    } else
    [texture replaceRegion:MTLRegionMake2D(0,0,d.width,d.height) mipmapLevel:0 withBytes:bytes bytesPerRow:rowBytes];
    if(deallocator) {""")
+
+# ---- ios-pandora: App Library readback, same boot-arg (bb32) --------------------------------------------------
+# bb32: with the left halves of both ASTC images red, no red reached the screen at all; the user saw the App
+# Library as always. So after the upload something is lost. With pandora_astc_probe=1 the render target a large
+# ASTC texture is drawn into is now read back when that command buffer completes (off the completion thread) and
+# logged as an 8x8 grid of average colours (RGBA hex): red there = the draw works and the compositing loses it.
+edit('NativeBridgeMetalFrontend.mm',
+     """#include <sys/sysctl.h>
+""",
+     """#include <sys/sysctl.h>
+static bool pandoraAstcProbe() {   // ios-pandora: boot-arg pandora_astc_probe=1 (tools/metal/adapt_ios16.py)
+ static const bool on=[]{char args[1024]={};size_t size=sizeof args-1;
+  return sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && strstr(args,"pandora_astc_probe=1")!=nullptr;}();
+ return on;
+}
+static char gProbePassTargetKey,gProbeReadbackKey;
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];""",
+     """ id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(made && pandoraAstcProbe() && d.colorAttachments[0].texture)   // ios-pandora: the pass's target, for the readback
+  objc_setAssociatedObject(made,&gProbePassTargetKey,d.colorAttachments[0].texture,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ return made;""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ [self check:nmb_encoder_set_texture""",
+     """ if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && pandoraAstcProbe() && texture.pixelFormat==MTLPixelFormatASTC_4x4_LDR && texture.width>=512) {
+  id target=objc_getAssociatedObject(self,&gProbePassTargetKey);   // ios-pandora: read it back at completion
+  if(target) {
+   NSMutableSet *targets=objc_getAssociatedObject(_commandBuffer,&gProbeReadbackKey);
+   if(!targets){targets=[NSMutableSet set];objc_setAssociatedObject(_commandBuffer,&gProbeReadbackKey,targets,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+   [targets addObject:target];
+  }
+ }
+ [self check:nmb_encoder_set_texture""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ @synchronized(gInFlight){[gInFlight removeObject:self];}
+ NSArray *completedHandlers;""",
+     """ @synchronized(gInFlight){[gInFlight removeObject:self];}
+ if(NSSet *targets=objc_getAssociatedObject(self,&gProbeReadbackKey)) {   // ios-pandora: the App Library readback
+  static std::atomic<int> readbacks{0};
+  for(id<MTLTexture> target in [targets copy]) {
+   if(readbacks.fetch_add(1)>=8)break;
+   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+    const NSUInteger w=target.width,h=target.height,format=target.pixelFormat;
+    if(format!=MTLPixelFormatBGRA8Unorm && format!=MTLPixelFormatBGRA8Unorm_sRGB && format!=MTLPixelFormatRGBA8Unorm) {
+     NSLog(@"pandora-metal astc readback: target %lux%lu format %lu, not read",(unsigned long)w,(unsigned long)h,(unsigned long)format);return;
+    }
+    std::vector<uint8_t> pixels(w*h*4,0xa5);
+    [target getBytes:pixels.data() bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+    const bool bgra=format!=MTLPixelFormatRGBA8Unorm;
+    NSLog(@"pandora-metal astc readback: target %lux%lu format %lu storage %lu%s",(unsigned long)w,(unsigned long)h,(unsigned long)format,
+          (unsigned long)target.storageMode,[(NBTexture *)target surface]?" surface":"");
+    for(unsigned gy=0;gy<8;gy++) {
+     NSMutableString *line=[NSMutableString string];
+     for(unsigned gx=0;gx<8;gx++) {
+      uint64_t sum[4]={},n=0;
+      for(NSUInteger y=gy*h/8;y<(gy+1)*h/8;y+=4)for(NSUInteger x=gx*w/8;x<(gx+1)*w/8;x+=4) {
+       const uint8_t *p=&pixels[(y*w+x)*4];
+       sum[0]+=p[bgra?2:0];sum[1]+=p[1];sum[2]+=p[bgra?0:2];sum[3]+=p[3];n++;
+      }
+      if(!n)n=1;
+      [line appendFormat:@" %02x%02x%02x%02x",(unsigned)(sum[0]/n),(unsigned)(sum[1]/n),(unsigned)(sum[2]/n),(unsigned)(sum[3]/n)];
+     }
+     NSLog(@"pandora-metal astc readback r%u:%@",gy,line);
+    }
+   });
+  }
+ }
+ NSArray *completedHandlers;""")
