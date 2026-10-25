@@ -6,7 +6,7 @@
 - 喇叭后端 `TDM-LPAIF-RX-PRIMARY`（LPASS 主 I2S0，GPIO122 SCK、123 data0、124 data1、125 WS）：48 kHz，每槽 32 位，一帧 2 槽，位时钟 3.072 MHz。功放的帧格式 `0x4004` = DSP_A、时钟不反相、功放是从机（DeepSeek 把反相解错了，见 VERIFY.md）。
 - 上面那颗（T，0x42）收槽 0，下面那颗（B，0x40）收槽 1；两颗的 ASPTX1 也用槽 0/1，回送给 DSP 当参考。
 - 功放跑自己的扬声器保护固件：`/odm/firmware/cs35l43-dsp1-spk-prot.wmfw`，加两颗各自的 `T-/B-cs35l43-dsp1-spk-prot.bin`，再加按场景切换的调音 `T-/B-cs35l43-delta-{music,movie,video,navigation,voice}-spk-prot.bin`，默认 music。
-- 出厂校准：`/mnt/vendor/persist/audio/crus_calr.bin`，T 9181、B 7967，由用户空间的 `libcrussp.so` 写进各自的 `DSP Set CAL_R`。
+- 出厂校准：`/mnt/vendor/persist/audio/crus_calr.bin`（每台手机不同，两颗各一个值），由用户空间的 `libcrussp.so` 写进各自的 `DSP Set CAL_R`。
 - 喇叭路径的功放设置：`PCM Source = DSP`、`ASPTX Ref = Ref`、`AMP Enable = 1`、`Noise Gate = 16245`、`Amp Gain = 18`。
 - DSP 上的流程：共享内存端点 → PCM 解码 → PCM 转换 → SPR（扬声器保护）→ TDM 端点（模块 0x0700100E），48 kHz / 32 位 / 2 声道。设备 KV 是 `0xA2000000 = 0xA2000001`、`0xAC000000 = 0xAC000100`。另外还开了一条回声参考的发送图。
 - 放音时安卓的内核会向 DSP 发 PRM 的硬件资源申请和释放（0x0100100F / 0x01001010），多半是 TDM 位时钟。内容还没查到。
