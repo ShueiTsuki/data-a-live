@@ -1741,11 +1741,98 @@ gpu_level12(void)
 
 /* Map [iova, iova + bytes) to pa in a live context's tables, 4K leaves in the ArmSmmu4K format
  * (normal non-cacheable, outer shareable, as NativeAdreno maps user buffers), table pages taken
- * from the rest of the context's pool, then TLBIALL for the bank. Refuses pages already mapped. */
+ * from the rest of the context's pool. Refuses pages already mapped.
+ *
+ * 0224: TLB maintenance as Linux's arm-smmu driver with io-pgtable-arm does it. A map only fills
+ * leaves and table entries that were empty, and the SMMU caches no entry that faults, so a map
+ * invalidates nothing (arm-smmu has no iotlb_sync_map); its table writes are cleaned to memory
+ * and a dsb orders them before the GPU may walk them. An unmap invalidates each page it cleared
+ * by VA and ASID, leaf only (CB_TLBIVAL, arm_smmu_tlb_add_page_s1), then waits once for TLBSYNC
+ * (arm_smmu_tlb_sync_context); past SMMU_TLBI_PAGES pages the whole ASID instead (TLBIASID,
+ * arm_smmu_tlb_inv_context_s1). Before, each map and unmap took ArmSmmu4KInvalidateAllOwnedContext:
+ * TLBIALL with the bank's registers read back before and after (about 26 SMMU reads; r2k: read32
+ * under it was 29% of backboardd's kernel samples). Written leaves are cleaned a run at a time, and
+ * a run of pages in one 2 MiB block walks the tables once. Boot-arg pandora_smmu_legacy=1 keeps the
+ * earlier TLB maintenance, to measure the two under the same load. */
 static bool
 smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *pages, uint64_t bytes,
     unsigned perm);
 static void smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes);
+
+#define SMMU_TLBI_PAGES   512u      /* Linux arm-smmu-v3's CMDQ_MAX_TLBI_OPS: more pages, the whole ASID */
+#define SMMU_CB_TLBIVAL   0x620u
+#define SMMU_CB_TLBSYNC   0x7f0u
+#define SMMU_CB_TLBSTATUS 0x7f4u
+
+/* Table entries [lo, hi) (physical, within one page) to memory, for the SMMU's non-coherent walk. */
+static void
+smmu_clean_run(uint64_t lo, uint64_t hi)
+{
+	if (hi > lo) {
+		clean_dcache64((addr64_t)lo, (unsigned)(hi - lo), TRUE);
+	}
+}
+
+static int smmu_legacy = -1;            /* boot-arg pandora_smmu_legacy, read on first use */
+
+static bool
+smmu_legacy_on(void)
+{
+	if (smmu_legacy < 0) {
+		int v = 0;
+		(void)PE_parse_boot_argn("pandora_smmu_legacy", &v, sizeof(v));
+		smmu_legacy = v != 0;
+		printf("PANDORA GPU: SMMU TLB maintenance %s\n", smmu_legacy ? "as before 0224 (legacy)" :
+		    "as Linux arm-smmu (0224)");
+	}
+	return smmu_legacy;
+}
+
+/* Before 0224: TLBIALL with the bank read back before and after. */
+static bool
+smmu_tlb_legacy(struct smmu_ctx *c)
+{
+	ArmSmmu4KProgramResult r;
+	ArmSmmu4KStatus st = ArmSmmu4KInvalidateAllOwnedContext(&smmu_io, c->bank, &c->ctx, 1000, &r);
+	if (st != ArmSmmu4KSuccess) {
+		printf("PANDORA GPU: TLB invalidate for bank %u: status %d\n", c->bank, st);
+	}
+	return st == ArmSmmu4KSuccess;
+}
+
+/* Invalidate [iova, iova + bytes) of context C in the SMMU's TLB and wait for it. */
+static bool
+smmu_tlb_inv(struct smmu_ctx *c, uint64_t iova, uint64_t bytes)
+{
+	const uint64_t pages = bytes >> 12;
+	ArmSmmu4KProgramResult r;
+	if (smmu_legacy_on()) {
+		return smmu_tlb_legacy(c);
+	}
+	if (pages > SMMU_TLBI_PAGES) {
+		ArmSmmu4KStatus st = ArmSmmu4KSyncContextTlb(&smmu_io, c->cb, c->ctx.asid, 0, 1000, &r);
+		if (st != ArmSmmu4KSuccess) {
+			printf("PANDORA GPU: TLB invalidate (ASID %u) for bank %u: status %d\n", c->ctx.asid, c->bank, st);
+		}
+		return st == ArmSmmu4KSuccess;
+	}
+	const uint64_t asid = (uint64_t)c->ctx.asid << 48;
+	for (uint64_t p = 0; p < pages; p++) {
+		(void)smmu_io.write64(smmu_io.cookie, c->cb + SMMU_CB_TLBIVAL, asid | ((iova >> 12) + p));
+	}
+	(void)smmu_io.barrier(smmu_io.cookie);
+	(void)smmu_io.write32(smmu_io.cookie, c->cb + SMMU_CB_TLBSYNC, UINT32_MAX);
+	(void)smmu_io.barrier(smmu_io.cookie);
+	for (unsigned i = 0; i < 1000; i++) {
+		uint32_t status = 1;
+		if (smmu_io.read32(smmu_io.cookie, c->cb + SMMU_CB_TLBSTATUS, &status) == 0 && !(status & 1)) {
+			(void)smmu_io.barrier(smmu_io.cookie);
+			return true;
+		}
+	}
+	printf("PANDORA GPU: TLB sync for bank %u did not finish (%llu pages at %#llx)\n", c->bank, pages, iova);
+	return false;
+}
 
 static bool
 smmu_map(struct smmu_ctx *c, uint64_t iova, uint64_t pa, uint64_t bytes, unsigned perm)
@@ -1771,23 +1858,28 @@ smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *p
 	if (!(perm & ArmSmmu4KWrite)) {
 		attr |= 1u << 7;
 	}
+	uint64_t *t = NULL, block = UINT64_MAX;  /* the leaf table of the 2 MiB block being filled */
+	uint64_t run = 0, run_end = 0;          /* leaves written, not yet cleaned (physical) */
 	for (uint64_t off = 0; off < bytes; off += 0x1000) {
 		uint64_t va = iova + off, page = pages ? pages[off >> 12] : pa + off;
-		uint64_t *t = (uint64_t *)c->tva;      /* root page */
 		bool ok = (page & 0xfff) == 0;
-		for (unsigned level = start; level < 3 && ok; level++) {
-			unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
-			uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
-			if (!*e) {
-				if (c->tnext >= c->tpages) {
-					printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
-					ok = false;
-					break;
+		if (ok && (va >> 21) != block) {
+			t = (uint64_t *)c->tva;          /* root page */
+			for (unsigned level = start; level < 3 && ok; level++) {
+				unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+				uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
+				if (!*e) {
+					if (c->tnext >= c->tpages) {
+						printf("PANDORA GPU: SMMU table pool full at iova %#llx\n", va);
+						ok = false;
+						break;
+					}
+					*e = (pool + 0x1000ull * c->tnext++) | 3;
+					clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - c->tva)), 8, TRUE);
 				}
-				*e = (pool + 0x1000ull * c->tnext++) | 3;
-				clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - c->tva)), 8, TRUE);
+				t = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
 			}
-			t = (uint64_t *)(c->tva + ((*e & 0xfffffffff000ull) - pool));
+			block = ok ? va >> 21 : UINT64_MAX;
 		}
 		uint64_t *leaf = ok ? &t[(va >> 12) & 511] : NULL;
 		if (leaf && *leaf) {
@@ -1795,22 +1887,23 @@ smmu_map_pages(struct smmu_ctx *c, uint64_t iova, uint64_t pa, const uint64_t *p
 			ok = false;
 		}
 		if (!ok) {
+			smmu_clean_run(run, run_end);
 			if (off) {
 				smmu_unmap(c, iova, off);
 			}
 			return false;
 		}
 		*leaf = page | attr;
-		clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - c->tva)), 8, TRUE);
+		const uint64_t lpa = pool + ((vm_offset_t)leaf - c->tva);
+		if (lpa != run_end || (lpa & 0xfff) == 0) {
+			smmu_clean_run(run, run_end);
+			run = lpa;
+		}
+		run_end = lpa + 8;
 	}
+	smmu_clean_run(run, run_end);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	ArmSmmu4KProgramResult r;
-	ArmSmmu4KStatus st = ArmSmmu4KInvalidateAllOwnedContext(&smmu_io, c->bank, &c->ctx, 1000, &r);
-	if (st != ArmSmmu4KSuccess) {
-		printf("PANDORA GPU: TLB invalidate for bank %u: status %d\n", c->bank, st);
-		return false;
-	}
-	return true;
+	return !smmu_legacy_on() || smmu_tlb_legacy(c);
 }
 
 /* The buffer pool: physically contiguous, 1 GiB asked (myron: big, before anything else runs),
@@ -2271,28 +2364,40 @@ pandora_gpu_chip_id(void)
 	return gpu_chip_id;
 }
 
-/* Clear the leaves of [iova, iova + bytes) and TLBIALL; table pages stay. */
+/* Clear the leaves of [iova, iova + bytes), then invalidate them in the TLB (0224: smmu_tlb_inv);
+ * table pages stay. */
 static void
 smmu_unmap(struct smmu_ctx *c, uint64_t iova, uint64_t bytes)
 {
 	uint64_t pool = c->tables.root_physical;
 	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
+	uint64_t *t = NULL, block = UINT64_MAX;  /* the leaf table of the 2 MiB block (NULL: none) */
+	uint64_t run = 0, run_end = 0;          /* leaves cleared, not yet cleaned (physical) */
 	for (uint64_t off = 0; off < bytes; off += 0x1000) {
-		uint64_t va = iova + off, *t = (uint64_t *)c->tva;
-		for (unsigned level = start; level < 3 && t; level++) {
-			unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
-			uint64_t e = t[(va >> shift) & ((1u << width) - 1)];
-			t = e ? (uint64_t *)(c->tva + ((e & 0xfffffffff000ull) - pool)) : NULL;
+		uint64_t va = iova + off;
+		if ((va >> 21) != block) {
+			t = (uint64_t *)c->tva;
+			for (unsigned level = start; level < 3 && t; level++) {
+				unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+				uint64_t e = t[(va >> shift) & ((1u << width) - 1)];
+				t = e ? (uint64_t *)(c->tva + ((e & 0xfffffffff000ull) - pool)) : NULL;
+			}
+			block = va >> 21;
 		}
 		if (t) {
 			uint64_t *leaf = &t[(va >> 12) & 511];
 			*leaf = 0;
-			clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - c->tva)), 8, TRUE);
+			const uint64_t lpa = pool + ((vm_offset_t)leaf - c->tva);
+			if (lpa != run_end || (lpa & 0xfff) == 0) {
+				smmu_clean_run(run, run_end);
+				run = lpa;
+			}
+			run_end = lpa + 8;
 		}
 	}
+	smmu_clean_run(run, run_end);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	ArmSmmu4KProgramResult r;
-	(void)ArmSmmu4KInvalidateAllOwnedContext(&smmu_io, c->bank, &c->ctx, 1000, &r);
+	(void)smmu_tlb_inv(c, iova, bytes);
 }
 
 static struct gpu_bo *
