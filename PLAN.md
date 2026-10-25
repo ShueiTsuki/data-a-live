@@ -225,10 +225,11 @@
 
 ## 扬声器路线（调查结果，2026-10-22；2026-10-26 开始）
 - 用户定的目标（2026-10-26）：音质做到和安卓原生一样、不额外损失，同时按 iOS 的方式接好。上游 sheng 的做法、两边的差别、安卓上实测的做法见 `docs/SPEAKER_RESEARCH.md`（安卓那部分由 DeepSeek 在手机上查，我已核实）。
-- 分步（2026-10-26 按安卓实测重排）：
-  1. 先出声，证明整条路是通的：两颗功放按安卓的 TDM 设置（32 位槽、T 槽 0 / B 槽 1、DSP_A、功放做从机），功放先用直通、不加载固件、低增益；DSP 上搭"共享内存端点 → PCM 解码 → PCM 转换 → TDM 端点"，48 kHz / 32 位 / 2 声道。还要补查两件事：安卓放音时发给 DSP 的 PRM 时钟请求是什么内容；给 DSP 用的共享缓冲放在哪、SMMU 怎么配。
-  2. 和安卓一致：功放加载扬声器保护固件、两颗各自的系数、出厂校准和 music 调音，`PCM Source = DSP`，DSP 流程里加 SPR，增益 18，噪声门照安卓设。功放的这些文件在 odm 分区（不是 FAT），先放进固定固件包。
-  3. 接 iOS：音频插件和内核接口，CoreAudio 的主机时钟问题（sheng 修过），喇叭 / 听筒切换（GPIO174），音量放在主处理器这侧。
+- 用户转告上游开发者的话（2026-10-26）：「上游是模拟speaker，开发者希望我们有更好的方案做doc」，接着「希望我们不要用这个speaker的方案」。上游音频指南（UniXNU `docs/porting/power.md` §3）照的是 sheng 的做法：功放直通、不跑保护固件和校准、增益固定 18，16 位 I2S，手写的最小 DSP 图；iOS 那侧是音频服务器插件造出来的设备，不是 iOS 原生的接口。**所以不用 sheng 的喇叭方案**：它的功放程序（`ShengCs35l43`）、搭图（`ShengAudioReach`）、插件和音频服务都不拿；通信库（SMEM、SMP2P、GLINK、GPR）不属于喇叭方案，照旧用。做通以后写成上游文档（指南加 pandora 设备页），只写真机核实过的。
+- 分步（2026-10-26 按上面改过）：
+  1. 硬件准备，和做法无关：apps SMMU 给两个音频数据流加透传表项（最后一个上下文 80 设成不翻译），4 GiB 以下固定留一块 DSP 缓冲（写进 ADT），DSP 登记这块内存；TDM 引脚（GPIO 122–125）；PRM 时钟申请和释放（内容照安卓实测，`D:\DeepSeekHarness\prmcheck\VERIFY.md`）；I2C 驱动从 `pandora_amp.c` 扩出来。
+  2. 第一次出声就按安卓：两颗功放加载扬声器保护固件、各自的系数、出厂校准（运行时从手机 persist 分区读，不进仓库）和 music 调音，`PCM Source = DSP`，寄存器照安卓放音时的实际值（`D:\DeepSeekHarness\speakercheck\raw\during\`，注意文件名 T/B 标反了）；DSP 图照安卓：共享内存端点 → PCM 解码 → PCM 转换 → SPR → TDM 端点，48 kHz / 32 位 / 2 声道，ASPTX 反馈接回 SPR。不做"先直通出声"这一步。功放的文件在 odm 分区（不是 FAT），放进固定固件包。
+  3. 接 iOS，照真 iPhone 的方式：先查 iOS 16（iPhone X）自己的音频驱动栈怎么认设备，让 iOS 自己的音频软件直接驱动我们的设备，不另做音频服务器插件。喇叭 / 听筒切换（GPIO174）、音量都按 iOS 的做法。
   4. 做不到的：安卓主处理器这侧的 Dolby DAP 是闭源的用户空间音效，搬不过来。从 HAL 往下（DSP 流程、TDM、功放固件、校准、增益）能做到和安卓一样。
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
 1. 固件：/vendor/firmware_mnt/image/adsp.mdt + adsp.b00–b40（约 30 MB）和 adsp_dtb.mdt，装进 pinned 文件，内核按扩展区读入保留内存（adspslpi_region@0xa1400000、q6_adsp_dtb_region@0xa1380000）。

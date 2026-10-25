@@ -44,6 +44,10 @@ HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
+# The audio DSP's buffer: the DSP takes 32-bit addresses (the stream index rides in the upper word,
+# pandora_adsp.c), and XNU's RAM is all above 0x8c0000000. Free DRAM in the phone's live DT: inside
+# /memory 0xa6980000-0xc3dd0000, no fixed reserved-memory region (the dynamic pools there are Linux's).
+DSP_SHM, DSP_SHM_SIZE = 0xb0000000, 0x100000
 GICD, GICD_SIZE = 0x17000000, 0x10000
 GICR, GICR_SIZE = 0x17080000, 0x200000   # 8 redistributors, stride 0x40000
 FB, FB_SIZE = 0xfc800000, 0x2b00000      # splash_region; ARGB8888, measured by shim/hello
@@ -167,6 +171,8 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         assert gpu_pool % 0x100000 == 0 and gpu_pool < mem_size // 2, 'gpu pool size'
         mem_size -= gpu_pool
         root_props = list(root_props) + [('pandora-gpu-pool', u64(phys_base + mem_size) + u64(gpu_pool))]
+    if not qemu:
+        root_props = list(root_props) + [('pandora-dsp-shm', u64(DSP_SHM) + u64(DSP_SHM_SIZE))]
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu or qemu_gic else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))

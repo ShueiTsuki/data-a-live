@@ -1,0 +1,1076 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 9e57457..3a98dc6 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -43,6 +43,7 @@
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
+@@ -1340,6 +1341,8 @@ gpr_outcome(int result)
+ 	}
+ }
+ 
++static void spk_receive(const uint8_t *data, uint32_t len);
++
+ /* Channel state, the packets that came in, the timers, the query waiting to go out. */
+ static void
+ gpr_step(void)
+@@ -1367,6 +1370,8 @@ gpr_step(void)
+ 		}
+ 		if (ad_gpr_up && !ad_spf_done) {
+ 			gpr_outcome(gpr_spf_receive(&ad_spf, ad_gpr_in.m[i].data, ad_gpr_in.m[i].len));
++		} else if (ad_spf_done) {
++			spk_receive(ad_gpr_in.m[i].data, ad_gpr_in.m[i].len);
+ 		}
+ 	}
+ 	ad_gpr_in.n = 0;
+@@ -1391,66 +1396,308 @@ gpr_step(void)
+ 	}
+ }
+ 
+-/* ---- the battery: the SOCCP's battery manager over PMIC GLINK ------------------------- */
++/* ---- speaker groundwork: our memory as the DSP sees it, and the TDM bit clock ------------ */
++
++/*
++ * Pieces the speakers need whatever plays through them, run once after the APM is ready, with
++ * boot-arg pandora_spk=LEVEL:
++ *  1: the buffer the loader keeps below 4 GiB (ADT /chosen pandora-dsp-shm, mapped write-combined at
++ *     boot) is mapped for the DSP (APM_CMD_SHARED_MEM_MAP_REGIONS, pool SHMEM8_4K, one region, as
++ *     Linux's audioreach_map_memory_regions) and unmapped again. The DSP takes it as a 32-bit address
++ *     with the stream index in the upper word (DT msm-audio-ion 0x1001, qcom,smmu-sid-mask 0xf); the
++ *     apps SMMU passes those streams through (smmu_audio_passthrough). Skipped when either is missing.
++ *  2: the TDM0 pins (GPIO 122-125 i2s0_sck/data0/data1/ws, function 1 in Linux's
++ *     pinctrl-kaanapali.c, 8 mA, no pull: DT tdm0 pin groups) and the primary TDM bit clock as
++ *     Android asks the PRM for it (machine_dlkm msm_common_snd_hw_params, D:\DeepSeekHarness\prmcheck:
++ *     PARAM_ID_RSC_AUDIO_HW_CLK, clock 0x200 at 48 kHz x 2 slots x 32 bits, attribute 4 from the DT's
++ *     tdm-clk-attribute, root 0), held 2 s and released.
++ * Nothing plays: the amplifiers are not configured.
++ */
++#define SPK_APM_PORT          GPR_PORT_APM
++#define SPK_PRM_PORT          2u        /* the PRM instance (Linux q6prm GPR_PRM_MODULE_IID) */
++#define APM_CMD_MEM_MAP       0x0100100Cu
++#define APM_CMD_MEM_UNMAP     0x0100100Du
++#define APM_RSP_MEM_MAP       0x02001001u
++#define APM_POOL_SHMEM8_4K    3u
++#define PRM_CMD_REQUEST       0x0100100Fu
++#define PRM_CMD_RELEASE       0x01001010u
++#define PRM_RSP_REQUEST       0x02001002u
++#define PRM_RSP_RELEASE       0x02001003u
++#define PRM_PARAM_HW_CLK      0x0800102Cu
++#define PRM_CLK_PRI_TDM_IBIT  0x200u
++#define PRM_CLK_ATTR          4u        /* invert, couple no */
++#define SPK_TDM_HZ            (48000u * 2u * 32u)
++#define SPK_SID_INDEX         1u
++#define SPK_TLMM_PA           0x0f100000u
++#define SPK_TDM_GPIO0         122u
++#define SPK_ANSWER_MS         1000u
++#define SPK_HOLD_MS           2000u
++
++enum {SpkOff, SpkWait, SpkMap, SpkUnmap, SpkClock, SpkHold, SpkRelease, SpkDone};
++
++static vm_offset_t ad_shm_va;            /* the DSP buffer (smmu_survey) */
++static uint64_t ad_shm_pa, ad_shm_size;
++static bool ad_smmu_audio;               /* the audio streams pass the apps SMMU */
++
++static struct {
++	int level;
++	unsigned state;
++	uint8_t tx[128];
++	uint32_t tx_len, token, handle, others;
++	uint64_t answer_by, hold_until, t0;
++} spk;
++
++static void
++spk_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t
++spk_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* One command to the APM or the PRM; the answer is expected within SPK_ANSWER_MS. */
++static void
++spk_send(uint32_t port, uint32_t opcode, const uint8_t *payload, uint32_t n, unsigned state)
++{
++	GprPacket p;
++	bzero(&p, sizeof(p));
++	p.dst_domain = GPR_DOMAIN_ADSP;
++	p.src_domain = GPR_DOMAIN_APPS;
++	p.src_port = port;
++	p.dst_port = port;
++	p.token = 0x5300u + ++spk.token;
++	p.opcode = opcode;
++	spk.tx_len = gpr_encode(spk.tx, sizeof(spk.tx), &p, payload, n);
++	spk.state = state;
++	clock_interval_to_deadline(SPK_ANSWER_MS, NSEC_PER_MSEC, &spk.answer_by);
++}
++
++/* The PRM's audio hardware clock resource: request (hz) or release (hz 0) the primary TDM bit clock. */
++static void
++spk_clock(uint32_t hz)
++{
++	uint8_t pl[52];
++	bzero(pl, sizeof(pl));
++	/* apm_cmd_header {payload address lsw, msw, mem map handle, payload size}; then one parameter */
++	spk_put32(pl + 12, hz ? 36u : 24u);
++	spk_put32(pl + 16, SPK_PRM_PORT);          /* module instance */
++	spk_put32(pl + 20, PRM_PARAM_HW_CLK);
++	spk_put32(pl + 24, hz ? 20u : 8u);
++	spk_put32(pl + 32, 1);                     /* one clock */
++	spk_put32(pl + 36, PRM_CLK_PRI_TDM_IBIT);
++	if (hz) {
++		spk_put32(pl + 40, hz);
++		spk_put32(pl + 44, PRM_CLK_ATTR);
++		spk_put32(pl + 48, 0);                 /* default root */
++	}
++	spk_send(SPK_PRM_PORT, hz ? PRM_CMD_REQUEST : PRM_CMD_RELEASE, pl, hz ? 52u : 40u, hz ? SpkClock : SpkRelease);
++}
++
++/* TDM0's four pins to the I2S function, as the DT's tdm0 groups. */
++static void
++spk_pins(void)
++{
++	vm_offset_t t = ad_map(SPK_TLMM_PA + SPK_TDM_GPIO0 * 0x1000ull, 4 * 0x1000ull, VM_WIMG_IO);
++	if (!t) {
++		printf("PANDORA SPK: TLMM not mapped\n");
++		return;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		volatile uint32_t *ctl = (volatile uint32_t *)(t + i * 0x1000u);
++		uint32_t old = *ctl;
++		/* pull 1:0 none, function 5:2 = 1, drive 8:6 = 8 mA, output enable 9 off (the function drives) */
++		uint32_t v = (old & ~0x3ffu) | (1u << 2) | ((8u / 2u - 1u) << 6);
++		if (v & (1u << 11)) {
++			v |= 1u << 12;                     /* an eGPIO: claim it for the TLMM, as pinctrl-msm does */
++		}
++		*ctl = v;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("PANDORA SPK: GPIO %u control %#x -> %#x (reads %#x)\n", SPK_TDM_GPIO0 + i, old, v, *ctl);
++	}
++	ml_io_unmap(t, 4 * 0x1000u);
++}
++
++static void
++spk_level2(void)
++{
++	if (spk.level < 2) {
++		spk.state = SpkDone;
++		return;
++	}
++	spk_pins();
++	spk_clock(SPK_TDM_HZ);
++}
++
++static void
++spk_receive(const uint8_t *data, uint32_t len)
++{
++	GprPacket p;
++	if (gpr_decode(data, len, &p) != GprOk) {
++		return;
++	}
++	const uint32_t w0 = p.payload_bytes >= 4 ? spk_le32(p.payload) : 0;
++	const uint32_t w1 = p.payload_bytes >= 8 ? spk_le32(p.payload + 4) : 0;
++	if (spk.state == SpkOff || spk.state == SpkDone || p.token != 0x5300u + spk.token) {
++		if (spk.others++ < 8) {
++			printf("PANDORA SPK: GPR in: opcode %#x token %#x from port %#x, %u bytes, words %#x %#x\n", p.opcode,
++			    p.token, p.src_port, p.size, w0, w1);
++		}
++		return;
++	}
++	spk.answer_by = 0;
++	switch (spk.state) {
++	case SpkMap:
++		if (p.opcode == APM_RSP_MEM_MAP && p.payload_bytes >= 4) {
++			spk.handle = w0;
++			printf("PANDORA SPK: the APM mapped %#llx + %#llx (address word %#x) as handle %#x after %llu ms\n",
++			    ad_shm_pa, ad_shm_size, SPK_SID_INDEX, spk.handle, ad_ms(spk.t0));
++			uint8_t pl[4];
++			spk_put32(pl, spk.handle);
++			spk_send(SPK_APM_PORT, APM_CMD_MEM_UNMAP, pl, 4, SpkUnmap);
++		} else {
++			printf("PANDORA SPK: memory map refused: opcode %#x words %#x %#x\n", p.opcode, w0, w1);
++			spk_level2();
++		}
++		break;
++	case SpkUnmap:
++		printf("PANDORA SPK: unmap answer opcode %#x: command %#x status %#x\n", p.opcode, w0, w1);
++		spk_level2();
++		break;
++	case SpkClock:
++		printf("PANDORA SPK: PRM clock request (%u Hz, attribute %u) answer opcode %#x: command %#x status %#x\n",
++		    SPK_TDM_HZ, PRM_CLK_ATTR, p.opcode, w0, w1);
++		if (p.opcode == PRM_RSP_REQUEST && w1 == 0) {
++			spk.state = SpkHold;
++			clock_interval_to_deadline(SPK_HOLD_MS, NSEC_PER_MSEC, &spk.hold_until);
++		} else {
++			spk.state = SpkDone;
++		}
++		break;
++	case SpkRelease:
++		printf("PANDORA SPK: PRM clock release answer opcode %#x: command %#x status %#x\n", p.opcode, w0, w1);
++		spk.state = SpkDone;
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++spk_step(void)
++{
++	if (spk.state == SpkOff || spk.state == SpkDone || !ad_gpr) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (spk.state == SpkWait) {
++		if (!ad_spf_done) {
++			return;
++		}
++		if (ad_spf.state != SpfReady) {
++			printf("PANDORA SPK: the APM never got ready: nothing to do\n");
++			spk.state = SpkDone;
++			return;
++		}
++		spk.t0 = now;
++		if (ad_shm_va && ad_smmu_audio) {
++			uint8_t pl[20];
++			bzero(pl, sizeof(pl));
++			pl[0] = APM_POOL_SHMEM8_4K;            /* u16 pool, u16 regions, u32 flags, then {lsw, msw, bytes} */
++			pl[2] = 1;
++			spk_put32(pl + 8, (uint32_t)ad_shm_pa);
++			spk_put32(pl + 12, SPK_SID_INDEX | (uint32_t)(ad_shm_pa >> 32));
++			spk_put32(pl + 16, (uint32_t)ad_shm_size);
++			spk_send(SPK_APM_PORT, APM_CMD_MEM_MAP, pl, sizeof(pl), SpkMap);
++		} else {
++			printf("PANDORA SPK: no %s: memory map skipped\n", ad_shm_va ? "SMMU pass-through" : "DSP buffer");
++			spk_level2();
++		}
++	}
++	if (spk.state == SpkHold && now >= spk.hold_until) {
++		spk_clock(0);
++	}
++	if (spk.answer_by && now >= spk.answer_by) {
++		spk.answer_by = 0;
++		spk.tx_len = 0;
++		printf("PANDORA SPK: no answer in state %u\n", spk.state);
++		if (spk.state == SpkMap || spk.state == SpkUnmap) {
++			spk_level2();
++		} else if (spk.state == SpkClock) {
++			spk_clock(0);                          /* in case it was taken */
++		} else {
++			spk.state = SpkDone;
++		}
++	}
++	if (spk.tx_len && qcom_glink_send(&ed_adsp.gl, ad_gpr, spk.tx, spk.tx_len) == QcomGlinkOk) {
++		spk.tx_len = 0;
++	}
++}
++
++/* ---- the battery: the SOCCP's side of Xiaomi's battery manager over PMIC GLINK --------- */
+ 
+ /*
+- * Channel "PMIC_RTR_SOCCP_APPS" (DT pmic-glink, qcom,subsys-name "soccp"). Messages as Linux's
+- * pmic_glink and qcom_battmgr (and UniXNU-sheng's ShengBattmgr.c): a 12-byte header {owner, type,
+- * opcode}, owner 32778 the battery manager, type 1 request or answer, 2 notification; a property
+- * read {header, battery 0, property, 0} (opcode 0x30 battery, 0x32 USB) is answered {header,
+- * property, value, result}. Xiaomi's MCA (mca_adsp_glink.ko) shares the owner with opcode 1 and
+- * 280-byte answers; nothing here sends those, and charging stays the SOCCP's: only reads go out.
+- * The first pass after the channel comes up reads battery properties 0-23 and USB properties 0-7
+- * once each and logs them, to settle the numbering against Android's readings; then the battery
+- * service's fields are read every 20 s. Until the log settles it, the numbering is Xiaomi's
+- * downstream list as in ShengBattmgr.c, and a value outside what a battery can show is not used.
++ * Channel "PMIC_RTR_SOCCP_APPS" (DT pmic-glink, qcom,subsys-name "soccp"). The battery client Android
++ * runs on this phone is Xiaomi's MCA (mca_adsp_glink.ko under DT mca,adsp_glink; the classic
++ * qti_battery_charger node is disabled), so its messages are the ones sent: a read is 276 bytes
++ * {owner 0x800a, type 1, opcode 1, property, sequence, 256 bytes of zeros} (mca_adsp_glink_read_prop)
++ * and is answered with exactly 280 bytes {owner, type 1, opcode 1, property, result, sequence, 256
++ * bytes of data} (mca_adsp_glink_callback: length 0x118, result 0, sequence as sent); type 2 is a
++ * notification {header, number, 256 bytes}. bat2 asked with the classic 24-byte opcode 0x30 reads:
++ * each came back as a 280-byte answer the old code did not take. The properties are the 4-byte ones
++ * mca_qcom_subpmic_proxy reads. The percentage is not among them: Android reads the bq27z561 gauge on
++ * the shared I2C bus (DT i2c@a94000) itself. Until the units are settled against Android's readings
++ * and the gauge is read, the values are only logged, not handed to the battery service: a pass after
++ * the channel comes up, then every 20 s and after each notification. Only reads go out; charging
++ * stays the SOCCP's.
+  */
+-#define BM_OWNER         32778u
++#define BM_OWNER         0x800au
+ #define BM_TYPE_REQUEST  1u
+ #define BM_TYPE_NOTIFY   2u
+-#define BM_OP_BATT_GET   0x30u
+-#define BM_OP_USB_GET    0x32u
+-#define BM_OP_NOTIFY     0x07u
++#define BM_OP_READ       1u
++#define BM_REQUEST_LEN   0x114u
++#define BM_ANSWER_LEN    0x118u
+ #define BM_ANSWER_MS     1000u
+ #define BM_REFRESH_MS    20000u
+ #define BM_INTENT        1024u
+ #define BM_INTENTS       8u
+ 
+-enum {
+-	BmfStatus, BmfPresent, BmfCapacity, BmfVoltage, BmfCurrent, BmfTemperature, BmfCharge, BmfCycles, BmfDesign,
+-	BmfFull, BmfToFull, BmfToEmpty, BmfUsbOnline, BmfCount
+-};
++/* mca_qcom_subpmic_proxy: the getter that reads each one. */
+ static const struct {
+-	uint8_t op, prop;
+-} bm_fields[BmfCount] = {
+-	[BmfStatus] = {BM_OP_BATT_GET, 0}, [BmfPresent] = {BM_OP_BATT_GET, 2}, [BmfCapacity] = {BM_OP_BATT_GET, 4},
+-	[BmfVoltage] = {BM_OP_BATT_GET, 7}, [BmfCurrent] = {BM_OP_BATT_GET, 9}, [BmfTemperature] = {BM_OP_BATT_GET, 13},
+-	[BmfCharge] = {BM_OP_BATT_GET, 15}, [BmfCycles] = {BM_OP_BATT_GET, 16}, [BmfDesign] = {BM_OP_BATT_GET, 17},
+-	[BmfFull] = {BM_OP_BATT_GET, 18}, [BmfToFull] = {BM_OP_BATT_GET, 20}, [BmfToEmpty] = {BM_OP_BATT_GET, 21},
+-	[BmfUsbOnline] = {BM_OP_USB_GET, 0},
++	uint32_t prop;
++	const char *name;
++} bm_props[] = {
++	{0x2027, "pack_vbat"}, {0x2028, "pack_ibat"}, {0x202b, "pack_tbat"}, {0x2001, "chg_status"},
++	{0x2002, "chg_type"}, {0x0001, "usb_type"}, {0x20002, "bus_volt"}, {0x0004, "bus_curr"},
++	{0x0003, "usb_sns_volt"}, {0x200c, "vsys_volt"}, {0x2008, "input_current_limit"},
+ };
+-#define BM_SURVEY_BATT   24u
+-#define BM_SURVEY_USB    8u
++#define BM_PROPS (sizeof(bm_props) / sizeof(bm_props[0]))
+ 
+ static struct {
+ 	QcomGlinkChannel *ch;
+ 	bool up, changed, open_forced;
+ 	uint8_t storage[BM_INTENT * BM_INTENTS];
+ 	struct inbox in;
+-	uint8_t tx[24];
++	uint8_t tx[BM_REQUEST_LEN];
+ 	bool pending, inflight;                /* a request built and not sent yet; sent, no answer yet */
+-	uint32_t op, prop;                     /* that request */
+-	unsigned step;                         /* survey: 0 .. BATT + USB, then refresh fields */
+-	bool surveying, refreshing;
++	uint32_t prop, seq;                    /* that request */
++	unsigned step;                         /* index into bm_props */
++	bool reading;                          /* a pass is under way */
+ 	uint64_t answer_by, refresh_at, open_by;
+-	int32_t value[BmfCount];
+-	uint32_t have, answers, timeouts, notes, others, unusable;
+-	char line[2][640];                     /* the survey's answers, battery and USB */
++	int32_t value[BM_PROPS];
++	uint32_t passes, answers, timeouts, notes, others;
++	char line[640];
+ } bm;
+ 
+ LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
+ LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
+-static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out */
++static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
+ 
+ static void
+ bm_state(void *ctx, QcomGlinkChannel *ch, int up)
+@@ -1484,128 +1731,73 @@ bm_put32(uint8_t *p, uint32_t v)
+ 	p[3] = (uint8_t)(v >> 24);
+ }
+ 
+-/* The next request of the survey or of the refresh; false when the pass is over. */
++/* The next read of the pass; false when the pass is over. */
+ static bool
+ bm_next(void)
+ {
+-	uint32_t op, prop;
+-	if (bm.surveying) {
+-		if (bm.step >= BM_SURVEY_BATT + BM_SURVEY_USB) {
+-			return false;
+-		}
+-		op = bm.step < BM_SURVEY_BATT ? BM_OP_BATT_GET : BM_OP_USB_GET;
+-		prop = bm.step < BM_SURVEY_BATT ? bm.step : bm.step - BM_SURVEY_BATT;
+-	} else {
+-		if (bm.step >= BmfCount) {
+-			return false;
+-		}
+-		op = bm_fields[bm.step].op;
+-		prop = bm_fields[bm.step].prop;
++	if (bm.step >= BM_PROPS) {
++		return false;
+ 	}
++	bzero(bm.tx, sizeof(bm.tx));
++	bm.prop = bm_props[bm.step].prop;
++	bm.seq++;
+ 	bm_put32(bm.tx, BM_OWNER);
+ 	bm_put32(bm.tx + 4, BM_TYPE_REQUEST);
+-	bm_put32(bm.tx + 8, op);
+-	bm_put32(bm.tx + 12, 0);               /* battery 0 */
+-	bm_put32(bm.tx + 16, prop);
+-	bm_put32(bm.tx + 20, 0);
++	bm_put32(bm.tx + 8, BM_OP_READ);
++	bm_put32(bm.tx + 12, bm.prop);
++	bm_put32(bm.tx + 16, bm.seq);
+ 	bm.pending = true;
+ 	bm.inflight = false;
+-	bm.op = op;
+-	bm.prop = prop;
+ 	clock_interval_to_deadline(BM_ANSWER_MS, NSEC_PER_MSEC, &bm.answer_by);
+ 	return true;
+ }
+ 
+-/* From the fields of the last pass, what the battery service shows; a value no battery can have is not taken. */
+ static void
+-bm_publish(void)
+-{
+-	struct pandora_battery b;
+-	bzero(&b, sizeof(b));
+-	b.time_to_full_min = b.time_to_empty_min = -1;
+-#define HAVE(f) ((bm.have >> (f)) & 1u)
+-#define V(f) (bm.value[f])
+-	int status = HAVE(BmfStatus) ? V(BmfStatus) : 0;   /* POWER_SUPPLY_STATUS: 1 charging, 2 discharging, 3 not, 4 full */
+-	b.present = HAVE(BmfPresent) ? V(BmfPresent) != 0 : 1;
+-	b.external = HAVE(BmfUsbOnline) && V(BmfUsbOnline) != 0;
+-	bool cap_ok = HAVE(BmfCapacity) && V(BmfCapacity) >= 0 && V(BmfCapacity) <= 10000;    /* hundredths of a percent */
+-	bool mv_ok = HAVE(BmfVoltage) && V(BmfVoltage) >= 2500000 && V(BmfVoltage) <= 5000000;  /* uV */
+-	b.percent = cap_ok ? (V(BmfCapacity) + 50) / 100 : 0;
+-	b.voltage_mv = mv_ok ? V(BmfVoltage) / 1000 : 0;
+-	/* The firmware counts discharge positive (ShengBattmgr.c); the power source counts charge positive. */
+-	b.current_ma = HAVE(BmfCurrent) ? -(V(BmfCurrent) / 1000) : 0;
+-	b.temperature_ok = HAVE(BmfTemperature) && V(BmfTemperature) > -4000 && V(BmfTemperature) < 9000;
+-	b.temperature = b.temperature_ok ? V(BmfTemperature) : 0;
+-	if (HAVE(BmfCharge) && V(BmfCharge) > 0 && V(BmfCharge) < 30000000) {
+-		b.raw_mah = V(BmfCharge) / 1000;
+-	}
+-	if (HAVE(BmfFull) && V(BmfFull) > 100000 && V(BmfFull) < 30000000) {
+-		b.full_mah = V(BmfFull) / 1000;
+-	}
+-	if (HAVE(BmfDesign) && V(BmfDesign) > 100000 && V(BmfDesign) < 30000000) {
+-		b.design_mah = V(BmfDesign) / 1000;
+-	}
+-	if (HAVE(BmfCycles) && V(BmfCycles) >= 0 && V(BmfCycles) < 20000) {
+-		b.cycles = V(BmfCycles);
+-	}
+-	if (HAVE(BmfToFull) && V(BmfToFull) > 0 && V(BmfToFull) < 86400 * 2) {
+-		b.time_to_full_min = V(BmfToFull) / 60;
+-	}
+-	if (HAVE(BmfToEmpty) && V(BmfToEmpty) > 0 && V(BmfToEmpty) < 86400 * 30) {
+-		b.time_to_empty_min = V(BmfToEmpty) / 60;
+-	}
+-	b.charging = b.external && status == 1;
+-	b.fully_charged = b.external && (status == 4 || b.percent == 100);
+-	b.valid = cap_ok && mv_ok;
+-#undef HAVE
+-#undef V
+-	lck_mtx_lock(&ad_batt_lock);
+-	bool was = ad_batt.valid;
+-	ad_batt = b;
+-	lck_mtx_unlock(&ad_batt_lock);
+-	if (b.valid != was || (!b.valid && bm.unusable++ < 3)) {
+-		printf("PANDORA SOCCP: battery %s: %d%% %d mV %d mA, %d.%02d C, status %d, external %d, charge %d/%d mAh "
+-		    "(design %d), %d cycles\n", b.valid ? "readings in use" : "readings NOT usable", b.percent, b.voltage_mv,
+-		    b.current_ma, b.temperature / 100, (b.temperature < 0 ? -b.temperature : b.temperature) % 100, status,
+-		    b.external, b.raw_mah, b.full_mah, b.design_mah, b.cycles);
+-	}
++bm_pass_start(void)
++{
++	bm.reading = true;
++	bm.step = 0;
++	bm.line[0] = 0;
++	(void)bm_next();
+ }
+ 
+-/* One answer {header, property, value, result} or a notification. */
++/* One answer or a notification. */
+ static void
+ bm_handle(const uint8_t *m, uint32_t len)
+ {
+-	if (len < 12) {
++	if (len < 16) {
+ 		bm.others++;
+ 		return;
+ 	}
+ 	uint32_t owner = bm_le32(m), type = bm_le32(m + 4), op = bm_le32(m + 8);
+-	if (type == BM_TYPE_NOTIFY) {
++	if (owner == BM_OWNER && type == BM_TYPE_NOTIFY) {
+ 		if (bm.notes++ < 8) {
+-			printf("PANDORA SOCCP: notification owner %u opcode %#x code %#x (%u bytes)\n", owner, op,
+-			    len >= 16 ? bm_le32(m + 12) : 0, len);
++			printf("PANDORA SOCCP: notification opcode %#x number %#x first word %#x (%u bytes)\n", op, bm_le32(m + 12),
++			    len >= 20 ? bm_le32(m + 16) : 0, len);
+ 		}
+ 		bm.refresh_at = mach_absolute_time();  /* something changed: read again now */
+ 		return;
+ 	}
+-	if (owner != BM_OWNER || len < 24 || !(bm.pending || bm.inflight) || op != bm.op || bm_le32(m + 12) != bm.prop) {
++	if (owner != BM_OWNER || type != BM_TYPE_REQUEST || len != BM_ANSWER_LEN || !(bm.pending || bm.inflight) ||
++	    bm_le32(m + 12) != bm.prop || bm_le32(m + 20) != bm.seq) {
+ 		if (bm.others++ < 8) {
+-			printf("PANDORA SOCCP: message owner %u type %u opcode %#x, %u bytes, word3 %#x\n", owner, type, op, len,
+-			    len >= 16 ? bm_le32(m + 12) : 0);
++			printf("PANDORA SOCCP: message owner %#x type %u opcode %#x, %u bytes, property %#x result %#x sequence %u "
++			    "(waiting for %#x, %u)\n", owner, type, op, len, bm_le32(m + 12), len >= 20 ? bm_le32(m + 16) : 0,
++			    len >= 24 ? bm_le32(m + 20) : 0, bm.prop, bm.seq);
+ 		}
+ 		return;
+ 	}
+-	int32_t value = (int32_t)bm_le32(m + 16);
+-	uint32_t result = bm_le32(m + 20);
++	uint32_t result = bm_le32(m + 16);
++	int32_t value = (int32_t)bm_le32(m + 24);
++	char one[48];
+ 	bm.answers++;
+-	if (bm.surveying) {
+-		char one[40];
+-		snprintf(one, sizeof(one), " %u=%d%s", bm.prop, value, result ? "(err)" : "");
+-		strlcat(bm.line[op == BM_OP_BATT_GET ? 0 : 1], one, sizeof(bm.line[0]));
+-	} else if (!result) {
+-		bm.value[bm.step] = value;
+-		bm.have |= 1u << bm.step;
++	bm.value[bm.step] = value;
++	if (result) {
++		snprintf(one, sizeof(one), " %s=err%#x", bm_props[bm.step].name, result);
++	} else {
++		snprintf(one, sizeof(one), " %s=%d", bm_props[bm.step].name, value);
+ 	}
++	strlcat(bm.line, one, sizeof(bm.line));
+ 	bm.pending = bm.inflight = false;
+ 	bm.answer_by = 0;
+ 	bm.step++;
+@@ -1622,15 +1814,10 @@ bm_step(void)
+ 		bm.changed = false;
+ 		printf("PANDORA SOCCP: channel PMIC_RTR_SOCCP_APPS %s after %llu ms\n", bm.up ? "up" : "down",
+ 		    ad_ms(ed_soccp.t0));
+-		bm.pending = bm.inflight = false;
+-		bm.answer_by = 0;
++		bm.pending = bm.inflight = bm.reading = false;
++		bm.answer_by = bm.refresh_at = 0;
+ 		if (bm.up) {
+-			/* A survey once, then the refresh. */
+-			bm.surveying = bm.line[0][0] == 0;
+-			bm.refreshing = !bm.surveying;
+-			bm.step = 0;
+-			bm.have = 0;
+-			(void)bm_next();
++			bm_pass_start();
+ 		}
+ 	}
+ 	/* Nobody opened the channel: open it ourselves (the library's own fields for an initiator). */
+@@ -1649,37 +1836,24 @@ bm_step(void)
+ 		return;
+ 	}
+ 	if (bm.answer_by && now >= bm.answer_by) {
++		char one[40];
+ 		bm.timeouts++;
+-		if (bm.surveying) {
+-			char one[16];
+-			snprintf(one, sizeof(one), " %u=?", bm.prop);
+-			strlcat(bm.line[bm.op == BM_OP_BATT_GET ? 0 : 1], one, sizeof(bm.line[0]));
+-		}
++		snprintf(one, sizeof(one), " %s=?", bm_props[bm.step].name);
++		strlcat(bm.line, one, sizeof(bm.line));
+ 		bm.pending = bm.inflight = false;
+ 		bm.answer_by = 0;
+ 		bm.step++;
+ 	}
+-	if (!bm.pending && !bm.inflight && (bm.surveying || bm.refreshing) && !bm_next()) {
+-		/* The pass is over. */
+-		if (bm.surveying) {
+-			printf("PANDORA SOCCP: battery properties:%s\n", bm.line[0]);
+-			printf("PANDORA SOCCP: USB properties:%s\n", bm.line[1]);
+-			bm.surveying = false;
+-			bm.refreshing = true;
+-			bm.step = 0;
+-			(void)bm_next();
+-		} else {
+-			bm.refreshing = false;
+-			bm_publish();
+-			clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
+-		}
++	if (bm.reading && !bm.pending && !bm.inflight && !bm_next()) {
++		bm.reading = false;
++		bm.passes++;
++		printf("PANDORA SOCCP: MCA pass %u at %llu ms:%s (answers %u, timeouts %u)\n", bm.passes, ad_ms(ed_soccp.t0),
++		    bm.line, bm.answers, bm.timeouts);
++		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
+ 	}
+-	if (!bm.surveying && !bm.refreshing && bm.refresh_at && now >= bm.refresh_at) {
++	if (!bm.reading && bm.refresh_at && now >= bm.refresh_at) {
+ 		bm.refresh_at = 0;
+-		bm.refreshing = true;
+-		bm.step = 0;
+-		bm.have = 0;
+-		(void)bm_next();
++		bm_pass_start();
+ 	}
+ 	if (bm.pending && qcom_glink_send(&ed_soccp.gl, bm.ch, bm.tx, sizeof(bm.tx)) == QcomGlinkOk) {
+ 		/* Sent; the answer timer has run since the request was built (waiting for an intent counts). */
+@@ -1863,22 +2037,125 @@ adsp_boot(void)
+ 	(void)b_dtb;
+ }
+ 
+-/* ---- the apps SMMU, as the audio DSP's shared buffers will meet it (read only) -------------- */
++/* ---- the apps SMMU and the buffer the audio DSP reads ------------------------------------ */
+ 
+ /*
+- * 0233: the DSP reads the PCM periods from memory the apps hand it, through the apps SMMU (DT
+- * apps-smmu@15000000) on its audio streams: qcom,msm-audio-ion iommus <0x1001 0x80> and <0x1041 0x20>,
+- * so 0x1001/0x1081 and 0x1041/0x1061 (msm_audio_ion gives the DSP the address with the stream index,
+- * SID & qcom,smmu-sid-mask 0xf, in the upper word). UniXNU-sheng maps such streams to the last context
+- * bank left untranslated (SmmuBypass.h: SCTLR 0, CBAR S1_TRANS_S2_BYPASS, CBA2R VA64; a BYPASS S2CR reads
+- * back as FAULT there). Before any write here, what the boot loaders left: the stream-match groups and
+- * S2CRs (global space 0, read by pandora_dpu.c already), the context banks' CBAR/CBA2R (global space 1),
+- * and only the SCTLR of the banks those streams and the last bank use.
++ * The DSP reads what the apps hand it through the apps SMMU (DT apps-smmu@15000000) on its audio
++ * streams: qcom,msm-audio-ion iommus <0x1001 0x80> and <0x1041 0x20>, so 0x1001/0x1081 and
++ * 0x1041/0x1061. bat2 (0233, read only): unmatched streams fault (CR0 USFCFG), none of these streams
++ * has a group, 109 of 116 groups are free, the last bank (80) is unconfigured. First the groups the
++ * boot loaders left, each logged; then, with pandora_spk, smmu_audio_passthrough; then the buffer.
+  */
+-static vm_offset_t ad_dsp_buf;           /* 64 KiB below 4 GiB, for the audio periods later */
++
++/*
++ * The audio streams through the SMMU without translation, as Linux's arm-smmu-qcom.c does for bypass
++ * streams: qcom_smmu_cfg_probe asks whether this firmware keeps a BYPASS S2CR (written to the last
++ * S2CR, read back; here put back as well); where the firmware turns bypass into fault, the last context
++ * bank becomes a bypass bank (SCTLR 0: translation off; CBAR type stage 1 translation with stage 2
++ * bypass) and qcom_smmu_write_s2cr sends bypass streams to it as translated ones. One group per DT
++ * entry, on free groups, S2CR before SMR (arm_smmu_write_sme). Nothing is written when a group in use
++ * overlaps these streams, points at the last bank, or the last group is in use.
++ */
++static bool
++smmu_audio_passthrough(vm_offset_t s, unsigned nsmr, unsigned nbanks, uint32_t page, uint32_t numpage)
++{
++#define SR(o) (*(volatile uint32_t *)(s + (o)))
++	static const uint16_t ids[2] = {0x1001, 0x1041}, masks[2] = {0x80, 0x20};
++	const unsigned last = nbanks - 1, probe = nsmr - 1;
++	for (unsigned i = 0; i < nsmr; i++) {
++		const uint32_t smr = SR(0x800 + 4 * i), s2cr = SR(0xc00 + 4 * i);
++		if (!(smr & 0x80000000u)) {
++			continue;
++		}
++		const uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		for (unsigned k = 0; k < 2; k++) {
++			if (((id ^ ids[k]) & ~(mask | masks[k]) & 0x7fff) == 0) {
++				printf("PANDORA SMMU: group %u (id %#x mask %#x) overlaps the audio streams %#x/%#x: not written\n", i, id,
++				    mask, ids[k], masks[k]);
++				return false;
++			}
++		}
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == last) {
++			printf("PANDORA SMMU: group %u uses the last bank: not written\n", i);
++			return false;
++		}
++	}
++	if (SR(0x800 + 4 * probe) & 0x80000000u) {
++		printf("PANDORA SMMU: the last group is in use: not written\n");
++		return false;
++	}
++	const uint32_t was = SR(0xc00 + 4 * probe);
++	SR(0xc00 + 4 * probe) = (1u << 16) | 0xffu;                /* type bypass */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	const uint32_t back = SR(0xc00 + 4 * probe);
++	SR(0xc00 + 4 * probe) = was;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	const bool quirk = ((back >> 16) & 3) != 1;
++	printf("PANDORA SMMU: a bypass S2CR reads back %08x: %s (S2CR %u back to %08x, reads %08x)\n", back,
++	    quirk ? "the firmware turns bypass into something else, so the last bank passes the streams" : "bypass is kept",
++	    probe, was, SR(0xc00 + 4 * probe));
++	uint32_t s2cr = (1u << 16) | 0xffu;
++	if (quirk) {
++		const uint32_t cb = (numpage + last) * page;
++		SR(cb) = 0;                                            /* SCTLR: no translation */
++		SR(page + 4 * last) = 1u << 16;                        /* CBAR: stage 1 translation, stage 2 bypass */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("PANDORA SMMU: bank %u: sctlr %08x CBAR %08x CBA2R %08x\n", last, SR(cb), SR(page + 4 * last),
++		    SR(page + 0x800 + 4 * last));
++		s2cr = last;                                           /* type translate, that bank */
++	}
++	unsigned i = 0, done = 0;
++	for (unsigned k = 0; k < 2; k++) {
++		while (i < probe && (SR(0x800 + 4 * i) & 0x80000000u)) {
++			i++;
++		}
++		if (i >= probe) {
++			printf("PANDORA SMMU: no free group for %#x\n", ids[k]);
++			break;
++		}
++		SR(0xc00 + 4 * i) = s2cr;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		SR(0x800 + 4 * i) = 0x80000000u | (uint32_t)masks[k] << 16 | ids[k];
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("PANDORA SMMU: group %u for streams %#x mask %#x: SMR %08x S2CR %08x\n", i, ids[k], masks[k],
++		    SR(0x800 + 4 * i), SR(0xc00 + 4 * i));
++		done++;
++		i++;
++	}
++	return done == 2;
++#undef SR
++}
++
++/* The buffer the loader keeps below 4 GiB for the DSP (mkadt_pandora.py: /chosen pandora-dsp-shm). */
++static void
++ad_shm_setup(void)
++{
++	DTEntry chosen;
++	const uint64_t *r;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "pandora-dsp-shm", (void const **)&r, &size) != kSuccess || size != 16) {
++		printf("PANDORA SMMU: no pandora-dsp-shm in the ADT: no DSP buffer\n");
++		return;
++	}
++	if (!r[1] || (r[0] | r[1]) & 0xfff || r[0] + r[1] > (1ull << 32)) {
++		printf("PANDORA SMMU: pandora-dsp-shm %#llx + %#llx is not 4 KiB pages below 4 GiB: no DSP buffer\n", r[0], r[1]);
++		return;
++	}
++	vm_offset_t va = ad_map(r[0], r[1], VM_WIMG_WCOMB);
++	if (!va) {
++		printf("PANDORA SMMU: DSP buffer %#llx + %#llx not mapped\n", r[0], r[1]);
++		return;
++	}
++	bzero((void *)va, (size_t)r[1]);
++	ad_shm_va = va;
++	ad_shm_pa = r[0];
++	ad_shm_size = r[1];
++	printf("PANDORA SMMU: DSP buffer %#llx + %#llx, mapped write-combined\n", ad_shm_pa, ad_shm_size);
++}
+ 
+ static void
+-smmu_survey(void)
++smmu_survey(bool write)
+ {
+ 	vm_offset_t s = ad_map(0x15000000u, 0x100000u, VM_WIMG_IO);
+ 	if (!s) {
+@@ -1892,58 +2169,34 @@ smmu_survey(void)
+ 	printf("PANDORA SMMU: cr0 %08x (client port faults unmatched streams: %s) idr0 %08x idr1 %08x idr2 %08x: %u "
+ 	    "stream groups, %u banks, page %#x, %u global pages\n", cr0, (cr0 & (1u << 10)) ? "yes" : "no", id0, id1, id2,
+ 	    nsmr, nbanks, page, numpage);
+-	if ((numpage + nbanks) * page > 0x100000u || nsmr > 128 || !nbanks) {
++	if ((numpage + nbanks) * page > 0x100000u || nsmr > 128 || nsmr < 2 || !nbanks) {
+ 		printf("PANDORA SMMU: geometry outside the window: no more reads\n");
+ 		ml_io_unmap(s, 0x100000u);
+ 		return;
+ 	}
+-	static const uint16_t sids[4] = {0x1001, 0x1081, 0x1041, 0x1061};
+ 	unsigned free_groups = 0;
+-	uint32_t banks_seen[8];
+-	unsigned nseen = 0;
+ 	for (unsigned i = 0; i < nsmr; i++) {
+ 		const uint32_t smr = SR(0x800 + 4 * i);
+ 		if (!(smr & 0x80000000u)) {
+ 			free_groups++;
+ 			continue;
+ 		}
+-		const uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff, s2cr = SR(0xc00 + 4 * i);
+-		for (unsigned k = 0; k < 4; k++) {
+-			if (((sids[k] ^ id) & ~mask & 0x7fff) != 0) {
+-				continue;
+-			}
+-			const unsigned bank = s2cr & 0xff;
+-			printf("PANDORA SMMU: stream %#x matches group %u (id %#x mask %#x): S2CR %08x type %u bank %u, CBAR %08x "
+-			    "CBA2R %08x\n", sids[k], i, id, mask, s2cr, (s2cr >> 16) & 3, bank, SR(page + 4 * bank),
+-			    SR(page + 0x800 + 4 * bank));
+-			if (((s2cr >> 16) & 3) == 0 && bank < nbanks && nseen < 8) {
+-				bool dup = false;
+-				for (unsigned j = 0; j < nseen; j++) {
+-					dup |= banks_seen[j] == bank;
+-				}
+-				if (!dup) {
+-					banks_seen[nseen++] = bank;
+-				}
+-			}
+-		}
++		const uint32_t s2cr = SR(0xc00 + 4 * i), bank = s2cr & 0xff;
++		const bool cb = ((s2cr >> 16) & 3) == 0 && bank < nbanks;
++		/* The bank's registers only for a translating S2CR (0 otherwise). */
++		printf("PANDORA SMMU: group %u: id %#x mask %#x, S2CR %08x type %u bank %u: sctlr %08x CBAR %08x CBA2R %08x\n", i,
++		    smr & 0x7fff, (smr >> 16) & 0x7fff, s2cr, (s2cr >> 16) & 3, bank, cb ? SR((numpage + bank) * page) : 0,
++		    cb ? SR(page + 4 * bank) : 0, cb ? SR(page + 0x800 + 4 * bank) : 0);
+ 	}
+ 	const unsigned last = nbanks - 1;
+-	banks_seen[nseen < 8 ? nseen++ : 7] = last;
+-	for (unsigned j = 0; j < nseen; j++) {
+-		const unsigned b = banks_seen[j];
+-		printf("PANDORA SMMU: bank %u%s: sctlr %08x, CBAR %08x CBA2R %08x\n", b, b == last ? " (the last)" : "",
+-		    SR((numpage + b) * page), SR(page + 4 * b), SR(page + 0x800 + 4 * b));
+-	}
+-	printf("PANDORA SMMU: %u of %u stream groups free\n", free_groups, nsmr);
++	printf("PANDORA SMMU: %u of %u groups free; bank %u (the last): sctlr %08x CBAR %08x CBA2R %08x\n", free_groups, nsmr,
++	    last, SR((numpage + last) * page), SR(page + 4 * last), SR(page + 0x800 + 4 * last));
+ #undef SR
++	if (write) {
++		ad_smmu_audio = smmu_audio_passthrough(s, nsmr, nbanks, page, numpage);
++	}
+ 	ml_io_unmap(s, 0x100000u);
+-	/* The DSP takes 32-bit buffer addresses: is there a 64 KiB run below 4 GiB? Kept for the audio periods. */
+-	vm_offset_t va = 0;
+-	kern_return_t kr = kmem_alloc_contig(kernel_map, &va, 0x10000, 0xffff, (ppnum_t)(atop_64(1ull << 32) - 1), 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+-	printf("PANDORA SMMU: a 64 KiB buffer below 4 GiB for the DSP: %s %#llx\n", kr == KERN_SUCCESS ? "at" : "none, kr",
+-	    kr == KERN_SUCCESS ? ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) : (unsigned long long)kr);
+-	ad_dsp_buf = kr == KERN_SUCCESS ? va : 0;
++	ad_shm_setup();
+ }
+ 
+ /* ---- the thread ------------------------------------------------------------------------- */
+@@ -1951,8 +2204,10 @@ smmu_survey(void)
+ /*
+  * Boot-args: pandora_adsp (1 TrustZone queries, 2 also start the DSP pandora_adsp_delay s after
+  * the thread starts, default 20) and pandora_battery=1 (attach to the SOCCP and read the battery,
+- * pandora_battery_delay s after the start, default 5). The links are serviced every 1 ms for 30 s
+- * after a link starts, then every 50 ms (no IPCC interrupt yet).
++ * pandora_battery_delay s after the start, default 5), pandora_spk=LEVEL (the speaker groundwork
++ * above, after the APM is ready; level 1 also writes the apps SMMU's audio pass-through at the
++ * start). The links are serviced every 1 ms for 30 s after a link starts, then every 50 ms; with the
++ * IPCC interrupt the thread sleeps until a doorbell or a timer.
+  */
+ static void
+ adsp_thread(void *arg, wait_result_t result)
+@@ -1966,6 +2221,11 @@ adsp_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("pandora_adsp_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("pandora_battery", &battery, sizeof(battery));
+ 	(void)PE_parse_boot_argn("pandora_battery_delay", &bdelay_s, sizeof(bdelay_s));
++	(void)PE_parse_boot_argn("pandora_spk", &spk.level, sizeof(spk.level));
++	if (mode < 2) {
++		spk.level = 0;                     /* the speakers need the DSP */
++	}
++	spk.state = spk.level > 0 ? SpkWait : SpkOff;
+ 	if (mode) {
+ 		printf("PANDORA ADSP: SCM probe\n");
+ 		(void)scm_call_avail(2, 1);
+@@ -1994,7 +2254,7 @@ adsp_thread(void *arg, wait_result_t result)
+ 		adsp_done = batt_done = true;
+ 	} else {
+ 		ad_irq_start();
+-		smmu_survey();
++		smmu_survey(spk.level > 0);
+ 	}
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time();
+@@ -2014,6 +2274,7 @@ adsp_thread(void *arg, wait_result_t result)
+ 			gl_service(ad_edges[i]);
+ 		}
+ 		gpr_step();
++		spk_step();
+ 		bm_step();
+ 		now = mach_absolute_time();
+ 		for (unsigned i = 0; i < 2; i++) {
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index fca9a59..6383bda 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -1,9 +1,12 @@
+ /*
+  * PANDORA speaker amplifiers: Cirrus CS35L43 at 0x40 ("B", bottom) and 0x42 ("T", top) on
+- * QUPv3 wrapper 3 SE0 I2C (0x01980000, Android i2c-13). Probe only: release the amps from
+- * reset (GPIO 10 / 54 high, as the DT's cirrus_reset_default pins), read DEVID (0x0) and
+- * REVID (0x4) of each over I2C, print. Audio itself goes over TDM0 (GPIO 122-125,
+- * LPASS I2S0) from the audio DSP; nothing here plays sound.
++ * QUPv3 wrapper 3 SE0 I2C (0x01980000, Android i2c-13). Releases the amps from reset (GPIO
++ * 10 / 54 high, as the DT's cirrus_reset_default pins) and carries the I2C transfers the
++ * amplifier driver will need: block reads and writes of the CS35L43's 32-bit registers (the
++ * address and the values big endian, the address stepping by 4 per value). The probe reads DEVID
++ * (0x0) and REVID (0x4), a block of the serial-port registers, writes the three interrupt masks
++ * (all masked; nothing listens to the amps' interrupt lines) and reads them back. Audio itself goes
++ * over TDM0 (GPIO 122-125, LPASS I2S0) from the audio DSP; nothing here plays sound.
+  * SDA GPIO 64, SCL GPIO 65 (function 1, qup3_se0, pull-up). GCC (gcc-kaanapali.c):
+  * wrapper 3 votes 0x52018 bits 8-12, SE0 RCG 0xa8014. I2C FIFO transfers as
+  * bsd/dev/sweet_touch.c (Linux i2c-qcom-geni.c), 100 kHz from XO.
+@@ -18,9 +21,11 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ void pandora_amp_init(void);
+ 
+ #define PA_GCC_PA   0x00100000u
+@@ -49,7 +54,9 @@ void pandora_amp_init(void);
+ #define SE_TX_COUNT 0x800u
+ #define SE_RX_COUNT 0x804u
+ #define SE_TX_WM    0x80cu
++#define SE_HW_TX    0xe24u
+ #define SE_HW_RX    0xe28u
++#define PA_MAX      64u     /* bytes in one I2C message here */
+ #define SE_DONE     (1u << 0)
+ #define SE_NACK     (1u << 10)
+ #define SE_ERRORS   (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | \
+@@ -61,6 +68,7 @@ void pandora_amp_init(void);
+ 
+ static vm_offset_t pa_gcc, pa_se, pa_tlmm;
+ static int pa_chan;
++static unsigned pa_txw = 1;   /* TX FIFO words per watermark interrupt (depth - 1, as i2c-qcom-geni) */
+ 
+ static uint32_t
+ pa_rd(vm_offset_t b, uint32_t o)
+@@ -153,11 +161,11 @@ pa_abort(void)
+ 	pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
+ }
+ 
+-/* One I2C message: write up to 4 bytes or read up to 8. stretch: no STOP (repeated start). */
++/* One I2C message: write or read up to PA_MAX bytes. stretch: no STOP (repeated start). */
+ static int
+ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+ {
+-	if (nt > 4 || nr > 8 || (nt && nr) || (!nt && !nr)) {
++	if (nt > PA_MAX || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
+ 		return EINVAL;
+ 	}
+ 	for (unsigned i = 0; i < 5000 && (pa_rd(pa_se, SE_STATUS) & 1u); i++) {
+@@ -170,8 +178,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 	pa_wr(pa_se, SE_TX_WM, nt ? 1u : 0u);
+ 	pa_wr(pa_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+ 	pa_wr(pa_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	unsigned got = 0;
+-	bool sent = nt == 0;
++	unsigned got = 0, put = 0;
+ 	for (unsigned i = 0; i < 20000; i++) {
+ 		uint32_t irq = pa_rd(pa_se, SE_IRQ);
+ 		if (irq & SE_ERRORS) {
+@@ -186,14 +193,18 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 			pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
+ 			return err;
+ 		}
+-		if (!sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t w = 0;
+-			for (unsigned j = 0; j < nt; j++) {
+-				w |= (uint32_t)tx[j] << (8u * j);
++		if (put < nt && (irq & SE_TX_WM_IRQ)) {
++			/* Bytes go LSB first in each FIFO word (the packing set up in pa_thread). */
++			for (unsigned k = 0; k < pa_txw && put < nt; k++) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4 && put < nt; j++, put++) {
++					w |= (uint32_t)tx[put] << (8u * j);
++				}
++				pa_wr(pa_se, SE_TX, w);
++			}
++			if (put == nt) {
++				pa_wr(pa_se, SE_TX_WM, 0);
+ 			}
+-			pa_wr(pa_se, SE_TX, w);
+-			pa_wr(pa_se, SE_TX_WM, 0);
+-			sent = true;
+ 		}
+ 		uint32_t wc = pa_rd(pa_se, SE_RX_COUNT) & 0x1ffffffu;
+ 		while (wc--) {
+@@ -204,7 +215,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 		}
+ 		if (irq & SE_DONE) {
+ 			pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
+-			return (got == nr && sent) ? 0 : EIO;
++			return (got == nr && put == nt) ? 0 : EIO;
+ 		}
+ 		pa_wr(pa_se, SE_IRQ_CLR, irq & ((1u << 26) | (1u << 27) | SE_TX_WM_IRQ));
+ 		delay(1);
+@@ -213,29 +224,64 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 	return ETIMEDOUT;
+ }
+ 
+-/* CS35L43 register read: 32-bit address, 32-bit value, both big endian. */
++static void
++pa_be32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++/* CS35L43 registers reg, reg + 4, ...: the 32-bit address, then the values (all big endian). */
+ static int
+-pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
++pa_read_regs(uint8_t addr, uint32_t reg, uint32_t *val, unsigned n)
+ {
+-	uint8_t a[4] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg};
+-	uint8_t v[4] = {0, 0, 0, 0};
++	uint8_t a[4], v[PA_MAX];
++	if (!n || n * 4 > PA_MAX) {
++		return EINVAL;
++	}
++	pa_be32(a, reg);
++	bzero(v, sizeof(v));
+ 	int err = pa_msg(addr, a, 4, NULL, 0, true);
+ 	if (!err) {
+-		err = pa_msg(addr, NULL, 0, v, 4, false);
++		err = pa_msg(addr, NULL, 0, v, n * 4, false);
++	}
++	for (unsigned i = 0; i < n; i++) {
++		val[i] = ((uint32_t)v[4 * i] << 24) | ((uint32_t)v[4 * i + 1] << 16) | ((uint32_t)v[4 * i + 2] << 8) | v[4 * i + 3];
+ 	}
+-	*val = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) | ((uint32_t)v[2] << 8) | v[3];
+ 	return err;
+ }
+ 
++static int
++pa_write_regs(uint8_t addr, uint32_t reg, const uint32_t *val, unsigned n)
++{
++	uint8_t b[PA_MAX];
++	if (!n || 4 + n * 4 > PA_MAX) {
++		return EINVAL;
++	}
++	pa_be32(b, reg);
++	for (unsigned i = 0; i < n; i++) {
++		pa_be32(b + 4 + 4 * i, val[i]);
++	}
++	return pa_msg(addr, b, 4 + n * 4, NULL, 0, false);
++}
++
++static int
++pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
++{
++	return pa_read_regs(addr, reg, val, 1);
++}
++
+ static void
+ pa_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+ 	(void)result;
+ 	pa_sleep(8000);
+-	pa_gcc = ml_io_map(PA_GCC_PA, 0x1f0000);
+-	pa_se = ml_io_map(PA_SE_PA, 0x4000);
+-	pa_tlmm = ml_io_map(PA_TLMM_PA, 0xa0000);
++	pa_gcc = ml_io_map_unmappable(PA_GCC_PA, 0x1f0000, VM_WIMG_IO);
++	pa_se = ml_io_map_unmappable(PA_SE_PA, 0x4000, VM_WIMG_IO);
++	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xa0000, VM_WIMG_IO);
+ 	if (!pa_gcc || !pa_se || !pa_tlmm) {
+ 		goto out;
+ 	}
+@@ -247,9 +293,10 @@ pa_thread(void *arg, wait_result_t result)
+ 	if (pa_clocks(&level)) {
+ 		goto out;
+ 	}
+-	uint32_t fw = pa_rd(pa_se, SE_FW), rxp = pa_rd(pa_se, SE_HW_RX);
+-	printf("PANDORA AMP: SE fw=%#x if_disable=%#x status=%#x hw_rx=%#x level=%u\n", fw,
+-	    pa_rd(pa_se, SE_IF_DIS), pa_rd(pa_se, SE_STATUS), rxp, level);
++	uint32_t fw = pa_rd(pa_se, SE_FW), rxp = pa_rd(pa_se, SE_HW_RX), txp = pa_rd(pa_se, SE_HW_TX);
++	pa_txw = ((txp >> 16) & 0x3fu) > 1 ? ((txp >> 16) & 0x3fu) - 1u : 1u;
++	printf("PANDORA AMP: SE fw=%#x if_disable=%#x status=%#x hw_tx=%#x hw_rx=%#x level=%u, %u TX words per refill\n", fw,
++	    pa_rd(pa_se, SE_IF_DIS), pa_rd(pa_se, SE_STATUS), txp, rxp, level, pa_txw);
+ 	if (((fw >> 8) & 0xff) != 3 || (pa_rd(pa_se, SE_IF_DIS) & 1u)) {
+ 		printf("PANDORA AMP: SE0 is not FIFO I2C\n");
+ 		goto out;
+@@ -291,6 +338,19 @@ pa_thread(void *arg, wait_result_t result)
+ 		int e2 = pa_reg(amps[i], 0x4, &revid);
+ 		printf("PANDORA AMP: %#x (%s): DEVID err=%d %#x REVID err=%d %#x\n", amps[i],
+ 		    i ? "top" : "bottom", e1, devid, e2, revid);
++		/* A block read: the serial port, 0x4800-0x4840 (17 registers). */
++		uint32_t sp[17];
++		bzero(sp, sizeof(sp));
++		int e3 = pa_read_regs(amps[i], 0x4800, sp, 17);
++		printf("PANDORA AMP: %#x serial port err=%d: 4800 %08x 4804 %08x 4808 %08x 480c %08x 4810 %08x 4820 %08x "
++		    "4830 %08x 4840 %08x\n", amps[i], e3, sp[0], sp[1], sp[2], sp[3], sp[4], sp[8], sp[12], sp[16]);
++		/* A block write and its read-back: IRQ1_MASK_1..3 all masked. */
++		static const uint32_t masks[3] = {0xffffffffu, 0xffffffffu, 0xffffffffu};
++		uint32_t back[3] = {0, 0, 0};
++		int e4 = pa_write_regs(amps[i], 0x10110, masks, 3);
++		int e5 = pa_read_regs(amps[i], 0x10110, back, 3);
++		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
++		    back[0], back[1], back[2]);
+ 	}
+ out:
+ 	printf("PANDORA AMP: done\n");

@@ -13,6 +13,9 @@
 # 3. pushes the slot and writes it (phone/update_helper.sh: header cleared first, written
 #    last; read back; everything outside the slot must hash as before)
 set -euo pipefail
+# Phone paths (/data/...) must reach adb as they are; the Windows python gets Windows paths (winp).
+export MSYS_NO_PATHCONV=1
+winp() { cygpath -w "$1"; }
 B="$(cd "$(dirname "$0")" && pwd)"
 PT=/d/Android/platform-tools
 ADB="$PT/adb.exe"
@@ -46,9 +49,9 @@ for f in iosroot ioslog adspfw; do
 done
 
 echo "== slot from $(basename "$loader") ($(date -r "$loader" '+%m-%d %H:%M'))"
-python -I "$B/slot.py" "$loader" "$T/slot.img" "${keep[@]}" \
+python -I "$(winp "$B/slot.py")" "$(winp "$loader")" "$(winp "$T/slot.img")" "${keep[@]}" \
 	--label "$(basename "$loader") $(date -r "$loader" +%Y%m%d-%H%M%S)" \
-	--extents "$T/iosroot.json" "$T/ioslog.json" "$T/adspfw.json"
+	--extents "$(winp "$T/iosroot.json")" "$(winp "$T/ioslog.json")" "$(winp "$T/adspfw.json")"
 size=$(stat -c %s "$T/slot.img")
 [ "$size" -le "$max" ] || { echo "refused: slot $size bytes, room for $max (compress the Image)"; exit 1; }
 echo "fits: $size of $max bytes"

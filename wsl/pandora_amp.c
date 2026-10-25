@@ -1,9 +1,12 @@
 /*
  * PANDORA speaker amplifiers: Cirrus CS35L43 at 0x40 ("B", bottom) and 0x42 ("T", top) on
- * QUPv3 wrapper 3 SE0 I2C (0x01980000, Android i2c-13). Probe only: release the amps from
- * reset (GPIO 10 / 54 high, as the DT's cirrus_reset_default pins), read DEVID (0x0) and
- * REVID (0x4) of each over I2C, print. Audio itself goes over TDM0 (GPIO 122-125,
- * LPASS I2S0) from the audio DSP; nothing here plays sound.
+ * QUPv3 wrapper 3 SE0 I2C (0x01980000, Android i2c-13). Releases the amps from reset (GPIO
+ * 10 / 54 high, as the DT's cirrus_reset_default pins) and carries the I2C transfers the
+ * amplifier driver will need: block reads and writes of the CS35L43's 32-bit registers (the
+ * address and the values big endian, the address stepping by 4 per value). The probe reads DEVID
+ * (0x0) and REVID (0x4), a block of the serial-port registers, writes the three interrupt masks
+ * (all masked; nothing listens to the amps' interrupt lines) and reads them back. Audio itself goes
+ * over TDM0 (GPIO 122-125, LPASS I2S0) from the audio DSP; nothing here plays sound.
  * SDA GPIO 64, SCL GPIO 65 (function 1, qup3_se0, pull-up). GCC (gcc-kaanapali.c):
  * wrapper 3 votes 0x52018 bits 8-12, SE0 RCG 0xa8014. I2C FIFO transfers as
  * bsd/dev/sweet_touch.c (Linux i2c-qcom-geni.c), 100 kHz from XO.
@@ -18,9 +21,11 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <vm/vm_kern.h>
+#include <vm/pmap.h>
 
-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 void pandora_amp_init(void);
 
 #define PA_GCC_PA   0x00100000u
@@ -49,7 +54,9 @@ void pandora_amp_init(void);
 #define SE_TX_COUNT 0x800u
 #define SE_RX_COUNT 0x804u
 #define SE_TX_WM    0x80cu
+#define SE_HW_TX    0xe24u
 #define SE_HW_RX    0xe28u
+#define PA_MAX      64u     /* bytes in one I2C message here */
 #define SE_DONE     (1u << 0)
 #define SE_NACK     (1u << 10)
 #define SE_ERRORS   (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | \
@@ -61,6 +68,7 @@ void pandora_amp_init(void);
 
 static vm_offset_t pa_gcc, pa_se, pa_tlmm;
 static int pa_chan;
+static unsigned pa_txw = 1;   /* TX FIFO words per watermark interrupt (depth - 1, as i2c-qcom-geni) */
 
 static uint32_t
 pa_rd(vm_offset_t b, uint32_t o)
@@ -153,11 +161,11 @@ pa_abort(void)
 	pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
 }
 
-/* One I2C message: write up to 4 bytes or read up to 8. stretch: no STOP (repeated start). */
+/* One I2C message: write or read up to PA_MAX bytes. stretch: no STOP (repeated start). */
 static int
 pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 {
-	if (nt > 4 || nr > 8 || (nt && nr) || (!nt && !nr)) {
+	if (nt > PA_MAX || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
 		return EINVAL;
 	}
 	for (unsigned i = 0; i < 5000 && (pa_rd(pa_se, SE_STATUS) & 1u); i++) {
@@ -170,8 +178,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 	pa_wr(pa_se, SE_TX_WM, nt ? 1u : 0u);
 	pa_wr(pa_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
 	pa_wr(pa_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
-	unsigned got = 0;
-	bool sent = nt == 0;
+	unsigned got = 0, put = 0;
 	for (unsigned i = 0; i < 20000; i++) {
 		uint32_t irq = pa_rd(pa_se, SE_IRQ);
 		if (irq & SE_ERRORS) {
@@ -186,14 +193,18 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 			pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
 			return err;
 		}
-		if (!sent && (irq & SE_TX_WM_IRQ)) {
-			uint32_t w = 0;
-			for (unsigned j = 0; j < nt; j++) {
-				w |= (uint32_t)tx[j] << (8u * j);
+		if (put < nt && (irq & SE_TX_WM_IRQ)) {
+			/* Bytes go LSB first in each FIFO word (the packing set up in pa_thread). */
+			for (unsigned k = 0; k < pa_txw && put < nt; k++) {
+				uint32_t w = 0;
+				for (unsigned j = 0; j < 4 && put < nt; j++, put++) {
+					w |= (uint32_t)tx[put] << (8u * j);
+				}
+				pa_wr(pa_se, SE_TX, w);
 			}
-			pa_wr(pa_se, SE_TX, w);
-			pa_wr(pa_se, SE_TX_WM, 0);
-			sent = true;
+			if (put == nt) {
+				pa_wr(pa_se, SE_TX_WM, 0);
+			}
 		}
 		uint32_t wc = pa_rd(pa_se, SE_RX_COUNT) & 0x1ffffffu;
 		while (wc--) {
@@ -204,7 +215,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 		}
 		if (irq & SE_DONE) {
 			pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
-			return (got == nr && sent) ? 0 : EIO;
+			return (got == nr && put == nt) ? 0 : EIO;
 		}
 		pa_wr(pa_se, SE_IRQ_CLR, irq & ((1u << 26) | (1u << 27) | SE_TX_WM_IRQ));
 		delay(1);
@@ -213,18 +224,53 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 	return ETIMEDOUT;
 }
 
-/* CS35L43 register read: 32-bit address, 32-bit value, both big endian. */
+static void
+pa_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
+}
+
+/* CS35L43 registers reg, reg + 4, ...: the 32-bit address, then the values (all big endian). */
+static int
+pa_read_regs(uint8_t addr, uint32_t reg, uint32_t *val, unsigned n)
+{
+	uint8_t a[4], v[PA_MAX];
+	if (!n || n * 4 > PA_MAX) {
+		return EINVAL;
+	}
+	pa_be32(a, reg);
+	bzero(v, sizeof(v));
+	int err = pa_msg(addr, a, 4, NULL, 0, true);
+	if (!err) {
+		err = pa_msg(addr, NULL, 0, v, n * 4, false);
+	}
+	for (unsigned i = 0; i < n; i++) {
+		val[i] = ((uint32_t)v[4 * i] << 24) | ((uint32_t)v[4 * i + 1] << 16) | ((uint32_t)v[4 * i + 2] << 8) | v[4 * i + 3];
+	}
+	return err;
+}
+
+static int
+pa_write_regs(uint8_t addr, uint32_t reg, const uint32_t *val, unsigned n)
+{
+	uint8_t b[PA_MAX];
+	if (!n || 4 + n * 4 > PA_MAX) {
+		return EINVAL;
+	}
+	pa_be32(b, reg);
+	for (unsigned i = 0; i < n; i++) {
+		pa_be32(b + 4 + 4 * i, val[i]);
+	}
+	return pa_msg(addr, b, 4 + n * 4, NULL, 0, false);
+}
+
 static int
 pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
 {
-	uint8_t a[4] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg};
-	uint8_t v[4] = {0, 0, 0, 0};
-	int err = pa_msg(addr, a, 4, NULL, 0, true);
-	if (!err) {
-		err = pa_msg(addr, NULL, 0, v, 4, false);
-	}
-	*val = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) | ((uint32_t)v[2] << 8) | v[3];
-	return err;
+	return pa_read_regs(addr, reg, val, 1);
 }
 
 static void
@@ -233,9 +279,9 @@ pa_thread(void *arg, wait_result_t result)
 	(void)arg;
 	(void)result;
 	pa_sleep(8000);
-	pa_gcc = ml_io_map(PA_GCC_PA, 0x1f0000);
-	pa_se = ml_io_map(PA_SE_PA, 0x4000);
-	pa_tlmm = ml_io_map(PA_TLMM_PA, 0xa0000);
+	pa_gcc = ml_io_map_unmappable(PA_GCC_PA, 0x1f0000, VM_WIMG_IO);
+	pa_se = ml_io_map_unmappable(PA_SE_PA, 0x4000, VM_WIMG_IO);
+	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xa0000, VM_WIMG_IO);
 	if (!pa_gcc || !pa_se || !pa_tlmm) {
 		goto out;
 	}
@@ -247,9 +293,10 @@ pa_thread(void *arg, wait_result_t result)
 	if (pa_clocks(&level)) {
 		goto out;
 	}
-	uint32_t fw = pa_rd(pa_se, SE_FW), rxp = pa_rd(pa_se, SE_HW_RX);
-	printf("PANDORA AMP: SE fw=%#x if_disable=%#x status=%#x hw_rx=%#x level=%u\n", fw,
-	    pa_rd(pa_se, SE_IF_DIS), pa_rd(pa_se, SE_STATUS), rxp, level);
+	uint32_t fw = pa_rd(pa_se, SE_FW), rxp = pa_rd(pa_se, SE_HW_RX), txp = pa_rd(pa_se, SE_HW_TX);
+	pa_txw = ((txp >> 16) & 0x3fu) > 1 ? ((txp >> 16) & 0x3fu) - 1u : 1u;
+	printf("PANDORA AMP: SE fw=%#x if_disable=%#x status=%#x hw_tx=%#x hw_rx=%#x level=%u, %u TX words per refill\n", fw,
+	    pa_rd(pa_se, SE_IF_DIS), pa_rd(pa_se, SE_STATUS), txp, rxp, level, pa_txw);
 	if (((fw >> 8) & 0xff) != 3 || (pa_rd(pa_se, SE_IF_DIS) & 1u)) {
 		printf("PANDORA AMP: SE0 is not FIFO I2C\n");
 		goto out;
@@ -291,6 +338,19 @@ pa_thread(void *arg, wait_result_t result)
 		int e2 = pa_reg(amps[i], 0x4, &revid);
 		printf("PANDORA AMP: %#x (%s): DEVID err=%d %#x REVID err=%d %#x\n", amps[i],
 		    i ? "top" : "bottom", e1, devid, e2, revid);
+		/* A block read: the serial port, 0x4800-0x4840 (17 registers). */
+		uint32_t sp[17];
+		bzero(sp, sizeof(sp));
+		int e3 = pa_read_regs(amps[i], 0x4800, sp, 17);
+		printf("PANDORA AMP: %#x serial port err=%d: 4800 %08x 4804 %08x 4808 %08x 480c %08x 4810 %08x 4820 %08x "
+		    "4830 %08x 4840 %08x\n", amps[i], e3, sp[0], sp[1], sp[2], sp[3], sp[4], sp[8], sp[12], sp[16]);
+		/* A block write and its read-back: IRQ1_MASK_1..3 all masked. */
+		static const uint32_t masks[3] = {0xffffffffu, 0xffffffffu, 0xffffffffu};
+		uint32_t back[3] = {0, 0, 0};
+		int e4 = pa_write_regs(amps[i], 0x10110, masks, 3);
+		int e5 = pa_read_regs(amps[i], 0x10110, back, 3);
+		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
+		    back[0], back[1], back[2]);
 	}
 out:
 	printf("PANDORA AMP: done\n");
