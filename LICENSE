@@ -27,9 +27,9 @@ files that keep their own terms.
      (wsl/adreno/LICENSE.NativeAdreno)
    - tools/native_prelink/: UniXNU, BSD-2-Clause-Patent
      (tools/native_prelink/LICENSE)
-   - wsl/qcom/ (SMEM, SMP2P, GLINK and GPR code from UniXNU-sheng, unchanged;
-     the copies under bsd/dev/qcom/ in xnu/patches/0226-adsp-glink-gpr.patch
-     are the same files): BSD-2-Clause-Patent (wsl/qcom/LICENSE.UniXNU,
+   - wsl/qcom/ (SMEM, SMP2P, GLINK, GPR and FAT code from UniXNU-sheng,
+     unchanged; the copies under bsd/dev/qcom/ in xnu/patches/0226-* and
+     0229-* are the same files): BSD-2-Clause-Patent (wsl/qcom/LICENSE.UniXNU,
      wsl/qcom/SOURCE.txt)
    - shim/*/font.h: the 8x16 console font table from ios-sweet's shim
      (generated from the cp850-8x16 PSF console font)
