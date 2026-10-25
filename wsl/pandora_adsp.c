@@ -1863,6 +1863,89 @@ adsp_boot(void)
 	(void)b_dtb;
 }
 
+/* ---- the apps SMMU, as the audio DSP's shared buffers will meet it (read only) -------------- */
+
+/*
+ * 0233: the DSP reads the PCM periods from memory the apps hand it, through the apps SMMU (DT
+ * apps-smmu@15000000) on its audio streams: qcom,msm-audio-ion iommus <0x1001 0x80> and <0x1041 0x20>,
+ * so 0x1001/0x1081 and 0x1041/0x1061 (msm_audio_ion gives the DSP the address with the stream index,
+ * SID & qcom,smmu-sid-mask 0xf, in the upper word). UniXNU-sheng maps such streams to the last context
+ * bank left untranslated (SmmuBypass.h: SCTLR 0, CBAR S1_TRANS_S2_BYPASS, CBA2R VA64; a BYPASS S2CR reads
+ * back as FAULT there). Before any write here, what the boot loaders left: the stream-match groups and
+ * S2CRs (global space 0, read by pandora_dpu.c already), the context banks' CBAR/CBA2R (global space 1),
+ * and only the SCTLR of the banks those streams and the last bank use.
+ */
+static vm_offset_t ad_dsp_buf;           /* 64 KiB below 4 GiB, for the audio periods later */
+
+static void
+smmu_survey(void)
+{
+	vm_offset_t s = ad_map(0x15000000u, 0x100000u, VM_WIMG_IO);
+	if (!s) {
+		printf("PANDORA SMMU: not mapped\n");
+		return;
+	}
+#define SR(o) (*(volatile uint32_t *)(s + (o)))
+	const uint32_t cr0 = SR(0), id0 = SR(0x20), id1 = SR(0x24), id2 = SR(0x28);
+	const unsigned nsmr = id0 & 0xff, nbanks = id1 & 0xff;
+	const uint32_t page = (id1 & (1u << 31)) ? 0x10000u : 0x1000u, numpage = 1u << (((id1 >> 28) & 7) + 1);
+	printf("PANDORA SMMU: cr0 %08x (client port faults unmatched streams: %s) idr0 %08x idr1 %08x idr2 %08x: %u "
+	    "stream groups, %u banks, page %#x, %u global pages\n", cr0, (cr0 & (1u << 10)) ? "yes" : "no", id0, id1, id2,
+	    nsmr, nbanks, page, numpage);
+	if ((numpage + nbanks) * page > 0x100000u || nsmr > 128 || !nbanks) {
+		printf("PANDORA SMMU: geometry outside the window: no more reads\n");
+		ml_io_unmap(s, 0x100000u);
+		return;
+	}
+	static const uint16_t sids[4] = {0x1001, 0x1081, 0x1041, 0x1061};
+	unsigned free_groups = 0;
+	uint32_t banks_seen[8];
+	unsigned nseen = 0;
+	for (unsigned i = 0; i < nsmr; i++) {
+		const uint32_t smr = SR(0x800 + 4 * i);
+		if (!(smr & 0x80000000u)) {
+			free_groups++;
+			continue;
+		}
+		const uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff, s2cr = SR(0xc00 + 4 * i);
+		for (unsigned k = 0; k < 4; k++) {
+			if (((sids[k] ^ id) & ~mask & 0x7fff) != 0) {
+				continue;
+			}
+			const unsigned bank = s2cr & 0xff;
+			printf("PANDORA SMMU: stream %#x matches group %u (id %#x mask %#x): S2CR %08x type %u bank %u, CBAR %08x "
+			    "CBA2R %08x\n", sids[k], i, id, mask, s2cr, (s2cr >> 16) & 3, bank, SR(page + 4 * bank),
+			    SR(page + 0x800 + 4 * bank));
+			if (((s2cr >> 16) & 3) == 0 && bank < nbanks && nseen < 8) {
+				bool dup = false;
+				for (unsigned j = 0; j < nseen; j++) {
+					dup |= banks_seen[j] == bank;
+				}
+				if (!dup) {
+					banks_seen[nseen++] = bank;
+				}
+			}
+		}
+	}
+	const unsigned last = nbanks - 1;
+	banks_seen[nseen < 8 ? nseen++ : 7] = last;
+	for (unsigned j = 0; j < nseen; j++) {
+		const unsigned b = banks_seen[j];
+		printf("PANDORA SMMU: bank %u%s: sctlr %08x, CBAR %08x CBA2R %08x\n", b, b == last ? " (the last)" : "",
+		    SR((numpage + b) * page), SR(page + 4 * b), SR(page + 0x800 + 4 * b));
+	}
+	printf("PANDORA SMMU: %u of %u stream groups free\n", free_groups, nsmr);
+#undef SR
+	ml_io_unmap(s, 0x100000u);
+	/* The DSP takes 32-bit buffer addresses: is there a 64 KiB run below 4 GiB? Kept for the audio periods. */
+	vm_offset_t va = 0;
+	kern_return_t kr = kmem_alloc_contig(kernel_map, &va, 0x10000, 0xffff, (ppnum_t)(atop_64(1ull << 32) - 1), 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+	printf("PANDORA SMMU: a 64 KiB buffer below 4 GiB for the DSP: %s %#llx\n", kr == KERN_SUCCESS ? "at" : "none, kr",
+	    kr == KERN_SUCCESS ? ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) : (unsigned long long)kr);
+	ad_dsp_buf = kr == KERN_SUCCESS ? va : 0;
+}
+
 /* ---- the thread ------------------------------------------------------------------------- */
 
 /*
@@ -1911,6 +1994,7 @@ adsp_thread(void *arg, wait_result_t result)
 		adsp_done = batt_done = true;
 	} else {
 		ad_irq_start();
+		smmu_survey();
 	}
 	for (;;) {
 		uint64_t now = mach_absolute_time();
