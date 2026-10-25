@@ -323,3 +323,9 @@
 - **内存**：iOS 用 5 GiB 那块内存里的约 4 GiB（扣 1 MiB 崩溃日志、1 GiB GPU 内存池）；高地址那块约 3.9 GiB 还没给 iOS。
 - **帧率**：屏幕 120 Hz 刷新，iOS 按 iPhone X 的 60 Hz 画；要 120 帧得让 iOS 把屏幕当高刷屏，另做。
 - **未解决**：mtltest 第 9 部分（9a–9c，填充三角形 992/4096 像素没画到）在 r2f、r2g、r2h 一样失败，不是这轮改出来的，待查；r1c 照片小组件"无可用内容"一段时间乱码：用户说之后可能已不再出现，没再看到就不追（GMEM 测试已排除 GMEM）。
+
+### iOS 显示接口调查（2026-10-25，QuartzCore + IOMobileFramebuffer 反汇编，原版 iPhone X 内核）
+- **帧节奏**：CA 的 `CADeviceUseVBL` 按 MobileGestalt `ChipID` 决定用不用硬件垂直同步，只有 0x7000、0x8000–0x8004、0x8010（A8–A10）用；A11（iPhone X，0x8015）不用，CA 自己开定时器（EAGLServer 里 0x30d 标志第 1 位为 0 → add_vsync_source 走定时器）。所以 CA 不需要我们的垂直同步通知；显示中断只给我们自己的上屏线程用。
+- **刷新率**：CA 的 AppleDisplay 从显示服务属性 `IOMFBDisplayRefresh` 读刷新能力；做 120 帧要照真机格式发布它。CA 读的其他属性：IOMFBScalingLimits、color-accuracy-index、FFR_raw_index、PanelLayout、DisplayPipeStrideRequirements、DisplayPipePlaneBaseAlignment、IOMFBMaxSrcPixels、maxAverageBpp、maxPeakBpp、PCCCabalEnable、W40a_Blending_OK、IOMFBSupportsICC、Brightness_Scale、SupportsRotation、IOMFBUUID、DisplayContainerID、DisplayAttributes、Transport。
+- **被忽略但有用的接口**：55 SetMatrix 和 69 SwapSetColorMatrix（夜览、色彩滤镜、反转、降低白点），78/79 数据块 0x4d/0x4e（色域映射），84 SetContrast，50 SetBrightnessCorrection；作用待查：68 SetParameter（参数 3、6、7、8，值 1），79 数据块 0x48/0x4a，29 GetDisplayArea（回 0），74 SupportedFrameInfo（回 0 = 不支持帧信息）。
+- **SwapWait 选项**（0218 已实现）：第 31 位不等待；0 离开屏幕、1 已上屏、2 全部完成、3/4 显示是否就绪；无超时 5 s 后清交换。
