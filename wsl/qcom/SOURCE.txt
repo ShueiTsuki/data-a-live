@@ -1,2 +1,3 @@
-From UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng) package/, commit 0e1f6e52638137db15905db8d775ad73757f39fa,
-copied unchanged: QcomSmem.{c,h}, QcomSmp2p.{c,h}, QcomGlink.{c,h}, ShengGpr.{c,h}. BSD-2-Clause-Patent (LICENSE.UniXNU).
+From UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng) package/, copied unchanged, BSD-2-Clause-Patent (LICENSE.UniXNU):
+- QcomSmem.{c,h}, QcomSmp2p.{c,h}, ShengGpr.{c,h}: commit 0e1f6e52638137db15905db8d775ad73757f39fa
+- QcomGlink.{c,h}, FatVolume.{c,h}: commit d76556b8909e380961309e970d87b919a74e411e

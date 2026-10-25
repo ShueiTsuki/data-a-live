@@ -1,0 +1,753 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e01305d..5004d8a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/qcom/QcomSmem.c			standard
+ bsd/dev/qcom/QcomSmp2p.c		standard
+ bsd/dev/qcom/QcomGlink.c		standard
+ bsd/dev/qcom/ShengGpr.c			standard
++bsd/dev/qcom/FatVolume.c		standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index cd27c47..c74699d 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -14,7 +14,7 @@
+  * PAS_MEM_SETUP when relocatable, segments copied to the carveout (relocated to the
+  * lowest segment address, qcom_mdt_load_no_init), PAS_AUTH_AND_RESET. Carveouts from the
+  * DT: adspslpi 0xa1400000 + 0x5580000, q6_adsp_dtb 0xa1380000 + 0x80000. Firmware comes
+- * from the pinned firmware pack (tools/mkfwpack.py, pandora_fw_read in sweet_ufs.c).
++ * from the device's firmware partition, else the pinned pack ("firmware files" below).
+  *
+  * Talking to the started DSP, as UniXNU-sheng's AdspProbe.cpp and AudioProbe.cpp (their SMEM,
+  * SMP2P, GLINK and GPR code in bsd/dev/qcom/, unchanged): before the start, our SMP2P item 429
+@@ -48,6 +48,7 @@
+ #include "qcom/QcomSmp2p.h"
+ #include "qcom/QcomGlink.h"
+ #include "qcom/ShengGpr.h"
++#include "qcom/FatVolume.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -450,7 +451,20 @@ bcm_vote(const char *res, uint32_t peak)
+ 	return err;
+ }
+ 
+-/* ---- firmware pack and MDT --------------------------------------------------------- */
++/* ---- firmware files and MDT ---------------------------------------------------------- */
++
++/*
++ * The ADSP images come from the device's own firmware partition, as Android and UniXNU-sheng
++ * take them: /image of modem_<slot> (Android's /vendor/firmware_mnt), a FAT volume read in place
++ * through sweet_ufs.c (pandora_part_find, pandora_part_pread; read only) with UniXNU-sheng's
++ * FatVolume.c. The slot is boot-arg pandora_slot=a|b (tools/boot_ios.sh passes Android's
++ * ro.boot.slot_suffix): after an update the other slot's partition may hold another build.
++ * pandora_adsp_fw=pack, or no usable partition: the pinned pack (tools/mkfwpack.py,
++ * pandora_fw_read in sweet_ufs.c), which also carries the GPU's files (their vendor partition is
++ * not FAT).
++ */
++extern int pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
++extern int pandora_part_pread(uint64_t off, void *dst, uint64_t len);
+ 
+ struct fw_ent {
+ 	char name[48];
+@@ -458,6 +472,15 @@ struct fw_ent {
+ };
+ static struct fw_ent ad_dir[63];
+ static unsigned ad_nfiles;
++static FatVolume ad_fat;
++static int ad_fat_state;                 /* 0 not tried, 1 mounted, -1 not usable */
++
++/* One file: in the firmware partition's FAT, or in the pack. */
++struct fw_file {
++	uint64_t size, pack_off;
++	FatFile fat;
++	bool in_fat;
++};
+ 
+ static int
+ fw_dir(void)
+@@ -492,6 +515,81 @@ fw_find(const char *name)
+ 	return NULL;
+ }
+ 
++static int
++fat_part_read(void *ctx, uint64_t off, void *to, size_t len)
++{
++	(void)ctx;
++	return pandora_part_pread(off, to, len);
++}
++
++/* The firmware partition's FAT, once. */
++static int
++fw_mount(void)
++{
++	if (ad_fat_state) {
++		return ad_fat_state > 0 ? 0 : ENOENT;
++	}
++	ad_fat_state = -1;
++	char slot[4] = "", part[16];
++	if (!PE_parse_boot_arg_str("pandora_slot", slot, sizeof(slot)) || (slot[0] != 'a' && slot[0] != 'b') ||
++	    slot[1]) {
++		printf("PANDORA ADSP: no boot-arg pandora_slot=a|b: the firmware partition is not read\n");
++		return ENOENT;
++	}
++	snprintf(part, sizeof(part), "modem_%c", slot[0]);
++	uint32_t lun = 0;
++	uint64_t first = 0, blocks = 0;
++	int err = pandora_part_find(part, &lun, &first, &blocks);
++	if (err) {
++		printf("PANDORA ADSP: partition %s not found: %d\n", part, err);
++		return err;
++	}
++	int rc = fat_mount(&ad_fat, blocks * 4096, fat_part_read, NULL);
++	printf("PANDORA ADSP: %s: LUN %u blocks %#llx+%#llx, FAT mount -> %d (FAT%s, %u-byte clusters)\n", part, lun,
++	    first, blocks, rc, ad_fat.fat32 ? "32" : "16", ad_fat.cluster_bytes);
++	if (rc) {
++		return EFTYPE;
++	}
++	ad_fat_state = 1;
++	return 0;
++}
++
++static int
++fw_open(const char *name, bool part, struct fw_file *f)
++{
++	bzero(f, sizeof(*f));
++	if (part) {
++		char path[64];
++		snprintf(path, sizeof(path), "image/%s", name);
++		int rc = fat_open(&ad_fat, path, &f->fat);
++		if (rc || f->fat.directory) {
++			return rc == FatNotFound ? ENOENT : EIO;
++		}
++		f->size = f->fat.size;
++		f->in_fat = true;
++		return 0;
++	}
++	struct fw_ent *e = fw_find(name);
++	if (!e) {
++		return ENOENT;
++	}
++	f->size = e->size;
++	f->pack_off = e->off;
++	return 0;
++}
++
++static int
++fw_pread(const struct fw_file *f, uint64_t off, void *dst, uint64_t len)
++{
++	if (off + len < off || off + len > f->size) {
++		return EINVAL;
++	}
++	if (f->in_fat) {
++		return fat_read(&ad_fat, &f->fat, off, dst, (size_t)len) ? EIO : 0;
++	}
++	return pandora_fw_read(f->pack_off + off, dst, len);
++}
++
+ struct elf32_phdr {
+ 	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
+ };
+@@ -507,21 +605,21 @@ mdt_loadable(const struct elf32_phdr *p)
+ 
+ /* Read segment i of base.mdt: from base.bNN (split images) or from the .mdt itself. */
+ static int
+-mdt_segment(const char *base, const struct fw_ent *mdt, const struct elf32_phdr *p, unsigned i,
++mdt_segment(const char *base, bool part, const struct fw_file *mdt, const struct elf32_phdr *p, unsigned i,
+     void *dst)
+ {
+ 	char name[48];
++	struct fw_file seg;
+ 	snprintf(name, sizeof(name), "%s.b%02u", base, i);
+-	struct fw_ent *seg = fw_find(name);
+-	if (seg) {
+-		if (seg->size != p->p_filesz) {
+-			printf("PANDORA ADSP: %s is %llu bytes, segment wants %u\n", name, seg->size, p->p_filesz);
++	if (!fw_open(name, part, &seg)) {
++		if (seg.size != p->p_filesz) {
++			printf("PANDORA ADSP: %s is %llu bytes, segment wants %u\n", name, seg.size, p->p_filesz);
+ 			return EINVAL;
+ 		}
+-		return pandora_fw_read(seg->off, dst, p->p_filesz);
++		return fw_pread(&seg, 0, dst, p->p_filesz);
+ 	}
+ 	if ((uint64_t)p->p_offset + p->p_filesz <= mdt->size) {
+-		return pandora_fw_read(mdt->off + p->p_offset, dst, p->p_filesz);
++		return fw_pread(mdt, p->p_offset, dst, p->p_filesz);
+ 	}
+ 	printf("PANDORA ADSP: segment %u of %s missing\n", i, base);
+ 	return ENOENT;
+@@ -532,7 +630,7 @@ mdt_segment(const char *base, const struct fw_ent *mdt, const struct elf32_phdr
+  * the carveout. The bridge handle is returned for deletion after the reset.
+  */
+ static int
+-pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
++pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
+ {
+ 	char name[48];
+ 	if (strchr(base, '.')) {
+@@ -540,13 +638,13 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
+ 	} else {
+ 		snprintf(name, sizeof(name), "%s.mdt", base);
+ 	}
+-	struct fw_ent *mdt = fw_find(name);
+-	if (!mdt || mdt->size < 52 || mdt->size > 0x10000) {
+-		printf("PANDORA ADSP: %s missing\n", name);
++	struct fw_file mdt;
++	if (fw_open(name, part, &mdt) || mdt.size < 52 || mdt.size > 0x10000) {
++		printf("PANDORA ADSP: %s missing in the %s\n", name, part ? "firmware partition" : "pack");
+ 		return ENOENT;
+ 	}
+ 	static uint8_t hdr[0x10000];
+-	int err = pandora_fw_read(mdt->off, hdr, mdt->size);
++	int err = fw_pread(&mdt, 0, hdr, mdt.size);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -554,7 +652,7 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
+ 	memcpy(&phoff, hdr + 28, 4);
+ 	phnum = hdr[44] | (hdr[45] << 8);
+ 	if (memcmp(hdr, "\177ELF", 4) || hdr[4] != 1 || phnum < 2 || phnum > 128 ||
+-	    phoff + phnum * sizeof(struct elf32_phdr) > mdt->size) {
++	    phoff + phnum * sizeof(struct elf32_phdr) > mdt.size) {
+ 		printf("PANDORA ADSP: %s is not a 32-bit ELF header\n", name);
+ 		return EINVAL;
+ 	}
+@@ -579,8 +677,8 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
+ 	}
+ 	uint32_t ehdr_size = ph[0].p_filesz, hash_size = ph[hash].p_filesz;
+ 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
+-	printf("PANDORA ADSP: %s: %u segments, hash %u (%u bytes), load %#llx-%#llx%s\n", name, phnum,
+-	    hash, hash_size, min, max, reloc ? " relocatable" : "");
++	printf("PANDORA ADSP: %s (%s): %u segments, hash %u (%u bytes), load %#llx-%#llx%s\n", name,
++	    part ? "firmware partition" : "pack", phnum, hash, hash_size, min, max, reloc ? " relocatable" : "");
+ 	if (max - min > mem_size) {
+ 		printf("PANDORA ADSP: %s does not fit its carveout\n", name);
+ 		return EINVAL;
+@@ -592,11 +690,11 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
+ 	}
+ 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
+ 	memcpy((void *)md, hdr, ehdr_size);
+-	if (ehdr_size + hash_size == mdt->size) {
++	if (ehdr_size + hash_size == mdt.size) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
+-	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt->size) {
++	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt.size) {
+ 		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
+-	} else if ((err = mdt_segment(base, mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
++	} else if ((err = mdt_segment(base, part, &mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
+ 		return err;
+ 	}
+ 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
+@@ -638,7 +736,7 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
+ 			err = EINVAL;
+ 			break;
+ 		}
+-		if (ph[i].p_filesz && (err = mdt_segment(base, mdt, &ph[i], i, (void *)(mem + off)))) {
++		if (ph[i].p_filesz && (err = mdt_segment(base, part, &mdt, &ph[i], i, (void *)(mem + off)))) {
+ 			break;
+ 		}
+ 		if (ph[i].p_memsz > ph[i].p_filesz) {
+@@ -676,7 +774,7 @@ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t
+ 	uint64_t bridge = 0;
+ 	int err = ad_nfiles ? 0 : fw_dir();
+ 	if (!err) {
+-		err = pas_load(file, pas, mem_pa, mem_size, &bridge);
++		err = pas_load(file, false, pas, mem_pa, mem_size, &bridge);
+ 	}
+ 	if (!err) {
+ 		err = pas_auth(pas);
+@@ -1150,7 +1248,16 @@ adsp_boot(void)
+ 	struct scm_res r;
+ 	int open_gpr = 0;
+ 	(void)PE_parse_boot_argn("pandora_adsp_gpr", &open_gpr, sizeof(open_gpr));
+-	if ((err = fw_dir()) || (err = adsp_comms_setup())) {
++	char src[8] = "";
++	(void)PE_parse_boot_arg_str("pandora_adsp_fw", src, sizeof(src));
++	bool part = strcmp(src, "pack") != 0 && fw_mount() == 0;
++	if (!part) {
++		printf("PANDORA ADSP: the ADSP images from the pinned pack\n");
++		if ((err = ad_nfiles ? 0 : fw_dir())) {
++			return;
++		}
++	}
++	if ((err = adsp_comms_setup())) {
+ 		return;
+ 	}
+ 	/* qcom_pas_start's order: qcom_q6v5_prepare (bus vote, load_state), then the proxy power
+@@ -1171,12 +1278,12 @@ adsp_boot(void)
+ 		printf("PANDORA ADSP: pas %#x supported a0 %#llx a1 %#llx, shutdown -> a0 %#llx a1 %#llx\n",
+ 		    stop[i], q.a0, q.a1, s.a0, s.a1);
+ 	}
+-	if ((err = pas_load("adsp_dtb", AD_PAS_DTB, AD_DTB_PA, AD_DTB_SIZE, &b_dtb)) ||
++	if ((err = pas_load("adsp_dtb", part, AD_PAS_DTB, AD_DTB_PA, AD_DTB_SIZE, &b_dtb)) ||
+ 	    (err = pas_auth(AD_PAS_DTB))) {
+ 		/* Go on with the main image anyway: its answer tells more. */
+ 		printf("PANDORA ADSP: DTB image failed %d\n", err);
+ 	}
+-	if ((err = pas_load("adsp", AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main))) {
++	if ((err = pas_load("adsp", part, AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main))) {
+ 		printf("PANDORA ADSP: main image failed %d\n", err);
+ 		return;
+ 	}
+diff --git a/bsd/dev/qcom/FatVolume.c b/bsd/dev/qcom/FatVolume.c
+new file mode 100644
+index 0000000..2afa75f
+--- /dev/null
++++ b/bsd/dev/qcom/FatVolume.c
+@@ -0,0 +1,225 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "FatVolume.h"
++
++static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)le16(p) | (uint32_t)le16(p + 2) << 16;}
++static int fits(uint64_t at, uint64_t length, uint64_t size) {return at <= size && length <= size - at;}
++
++static int vread(FatVolume *v, uint64_t offset, void *to, size_t length)
++{
++    if (!fits(offset, length, v->size)) return FatDamaged;
++    return v->read(v->context, offset, to, length) ? FatReadError : FatOk;
++}
++
++int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context)
++{
++    uint8_t b[512];
++    if (!v || !read) return FatReadError;
++    *v = (FatVolume){0};
++    v->read = read; v->context = context; v->size = size;
++    v->cached_sector = UINT64_MAX;
++    if (size < sizeof b) return FatNotFat;
++    if (vread(v, 0, b, sizeof b)) return FatReadError;
++    const uint32_t bps = le16(b + 11), spc = b[13], reserved = le16(b + 14), fats = b[16], root = le16(b + 17);
++    const uint32_t total = le16(b + 19) ? le16(b + 19) : le32(b + 32);
++    const uint32_t fat_sectors = le16(b + 22) ? le16(b + 22) : le32(b + 36);
++    if (b[510] != 0x55 || b[511] != 0xaa) return FatNotFat;
++    if (bps < 512 || bps > sizeof v->sector || (bps & (bps - 1)) || !spc || (spc & (spc - 1)) || !reserved || !fats || !fat_sectors)
++        return FatNotFat;
++    const uint64_t root_sectors = ((uint64_t)root * 32 + bps - 1) / bps;
++    const uint64_t data_sector = reserved + (uint64_t)fats * fat_sectors + root_sectors;
++    if (total <= data_sector || (uint64_t)total * bps > size) return FatNotFat;
++    const uint64_t clusters = (total - data_sector) / spc;
++    if (clusters < 4085) return FatNotFat;  /* FAT12 */
++    v->fat32 = clusters >= 65525;
++    if (v->fat32 ? root != 0 : root == 0) return FatNotFat;
++    /* the table must hold an entry for every cluster */
++    if ((uint64_t)fat_sectors * bps / (v->fat32 ? 4 : 2) < clusters + 2 || clusters > 0x0ffffff0) return FatNotFat;
++    v->sector_bytes = bps;
++    v->cluster_bytes = bps * spc;
++    v->clusters = (uint32_t)clusters;
++    v->fat_offset = (uint64_t)reserved * bps;
++    v->root_offset = (reserved + (uint64_t)fats * fat_sectors) * bps;
++    v->data_offset = data_sector * bps;
++    v->root_entries = root;
++    v->root_cluster = v->fat32 ? le32(b + 44) & 0x0fffffff : 0;
++    return FatOk;
++}
++
++static int valid(const FatVolume *v, uint32_t cluster) {return cluster >= 2 && cluster - 2 < v->clusters;}
++static uint64_t cluster_offset(const FatVolume *v, uint32_t cluster) {return v->data_offset + (uint64_t)(cluster - 2) * v->cluster_bytes;}
++
++/* The table entry of cluster (valid), through the one-sector cache. */
++static int next_cluster(FatVolume *v, uint32_t cluster, uint32_t *next)
++{
++    const uint64_t at = v->fat_offset + (uint64_t)cluster * (v->fat32 ? 4 : 2);
++    const uint64_t sector = at / v->sector_bytes;
++    if (sector != v->cached_sector) {
++        v->cached_sector = UINT64_MAX;
++        const int rc = vread(v, sector * v->sector_bytes, v->sector, v->sector_bytes);
++        if (rc) return rc;
++        v->cached_sector = sector;
++    }
++    const uint8_t *e = v->sector + at % v->sector_bytes;
++    *next = v->fat32 ? le32(e) & 0x0fffffff : le16(e);
++    return FatOk;
++}
++
++static uint8_t upper(char c) {return (uint8_t)(c >= 'a' && c <= 'z' ? c - 32 : c);}
++
++/* The 11-byte directory form of one path component; 0 when it is no 8.3 name. */
++static int short_name(const char *name, size_t length, uint8_t out[11])
++{
++    size_t dot = length;
++    for (size_t i = 0; i < length; ++i) if (name[i] == '.') {if (dot != length) return 0; dot = i;}
++    const size_t ext = dot < length ? length - dot - 1 : 0;
++    if (!dot || dot > 8 || ext > 3 || (dot < length && !ext)) return 0;
++    for (unsigned i = 0; i < 11; ++i) out[i] = ' ';
++    for (size_t i = 0; i < dot; ++i) out[i] = upper(name[i]);
++    for (size_t i = 0; i < ext; ++i) out[8 + i] = upper(name[dot + 1 + i]);
++    return 1;
++}
++
++/* Long names: up to 20 entries of 13 UCS-2 characters each, before the short entry they belong to (checked by its checksum). */
++#define LFN_ENTRIES 20u
++static const uint8_t lfn_slots[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
++typedef struct {uint16_t text[LFN_ENTRIES * 13]; uint8_t valid, next, sum, count;} LongName;
++
++static uint8_t short_sum(const uint8_t *d)
++{
++    uint8_t sum = 0;
++    for (unsigned i = 0; i < 11; ++i) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + d[i]);
++    return sum;
++}
++
++static void long_part(LongName *l, const uint8_t *d)
++{
++    const unsigned seq = d[0] & 0x1f;
++    if (d[0] & 0x40) {  /* the last part comes first */
++        l->valid = seq >= 1 && seq <= LFN_ENTRIES;
++        l->count = (uint8_t)seq;
++        l->sum = d[13];
++    } else if (!l->valid || seq != l->next - 1u || d[13] != l->sum) {
++        l->valid = 0;
++    }
++    if (!l->valid) return;
++    l->next = (uint8_t)seq;
++    for (unsigned k = 0; k < 13; ++k) l->text[(seq - 1) * 13 + k] = le16(d + lfn_slots[k]);
++}
++
++static int long_matches(const LongName *l, const uint8_t *d, const char *name, size_t length)
++{
++    if (!l->valid || l->next != 1 || short_sum(d) != l->sum) return 0;
++    size_t n = 0;
++    while (n < (size_t)l->count * 13 && l->text[n]) ++n;
++    if (n != length) return 0;
++    for (size_t i = 0; i < n; ++i) if (l->text[i] > 0x7f || upper((char)l->text[i]) != upper(name[i])) return 0;
++    return 1;
++}
++
++/* Looks for a name in a directory (the FAT16 fixed root for cluster 0, else a cluster chain): its long name, or its short name. */
++static int find(FatVolume *v, uint32_t cluster, const char *name, size_t length, FatFile *file)
++{
++    uint8_t chunk[512], want[11];
++    LongName l;
++    l.valid = 0;
++    const int has_short = short_name(name, length, want);
++    const int fixed = cluster == 0;
++    if (fixed && v->fat32) cluster = v->root_cluster;
++    uint64_t at = fixed && !v->fat32 ? v->root_offset : 0;
++    uint64_t left = fixed && !v->fat32 ? (uint64_t)v->root_entries * 32 : 0;
++    for (uint32_t walked = 0;;) {
++        if (!(fixed && !v->fat32)) {
++            if (!valid(v, cluster) || walked++ > v->clusters) return FatDamaged;
++            at = cluster_offset(v, cluster);
++            left = v->cluster_bytes;
++        }
++        while (left) {
++            const size_t n = left < sizeof chunk ? (size_t)left : sizeof chunk;
++            const int rc = vread(v, at, chunk, n);
++            if (rc) return rc;
++            for (size_t e = 0; e + 32 <= n; e += 32) {
++                const uint8_t *d = chunk + e;
++                if (!d[0]) return FatNotFound;
++                if (d[0] == 0xe5) {l.valid = 0; continue;}
++                if ((d[11] & 0x3f) == 0x0f) {long_part(&l, d); continue;}
++                int same = long_matches(&l, d, name, length);
++                l.valid = 0;
++                if (d[11] & 0x08) continue;  /* the volume label */
++                for (unsigned i = 0; i < 11 && has_short && !same; ++i) {
++                    if (upper((char)d[i]) != want[i]) break;
++                    if (i == 10) same = 1;
++                }
++                if (!same) continue;
++                file->first_cluster = (uint32_t)le16(d + 26) | (v->fat32 ? (uint32_t)le16(d + 20) << 16 : 0);
++                file->size = le32(d + 28);
++                file->directory = (d[11] & 0x10) != 0;
++                return FatOk;
++            }
++            at += n;
++            left -= n;
++        }
++        if (fixed && !v->fat32) return FatNotFound;
++        uint32_t next;
++        const int rc = next_cluster(v, cluster, &next);
++        if (rc) return rc;
++        if (!valid(v, next)) return FatNotFound;  /* the end of the directory */
++        cluster = next;
++    }
++}
++
++int fat_open(FatVolume *v, const char *path, FatFile *file)
++{
++    FatFile at = {0, 0, 1};  /* the root */
++    if (!v || !path || !file) return FatNotFound;
++    while (*path) {
++        while (*path == '/') ++path;
++        size_t n = 0;
++        while (path[n] && path[n] != '/') ++n;
++        if (!n) break;
++        if (!at.directory) return FatNotDirectory;
++        const int rc = find(v, at.first_cluster, path, n, &at);
++        if (rc) return rc;
++        path += n;
++    }
++    *file = at;
++    return FatOk;
++}
++
++int fat_read(FatVolume *v, const FatFile *file, uint64_t offset, void *to, size_t length)
++{
++    uint8_t *out = to;
++    if (!v || !file || !to) return FatReadError;
++    if (file->directory) return FatIsDirectory;
++    if (!fits(offset, length, file->size)) return FatRange;
++    if (!length) return FatOk;
++    uint32_t cluster = file->first_cluster, walked = 0;
++    for (uint64_t skip = offset / v->cluster_bytes; skip; --skip) {
++        if (!valid(v, cluster) || ++walked > v->clusters) return FatDamaged;
++        const int rc = next_cluster(v, cluster, &cluster);
++        if (rc) return rc;
++    }
++    uint64_t within = offset % v->cluster_bytes;
++    while (length) {
++        if (!valid(v, cluster)) return FatDamaged;
++        /* a run of consecutive clusters is one read */
++        uint32_t last = cluster, next = 0;
++        uint64_t span = v->cluster_bytes - within;
++        for (;;) {
++            if (++walked > v->clusters) return FatDamaged;
++            const int rc = next_cluster(v, last, &next);
++            if (rc) return rc;
++            if (span >= length || next != last + 1 || !valid(v, next)) break;
++            last = next;
++            span += v->cluster_bytes;
++        }
++        const size_t take = span < length ? (size_t)span : length;
++        const int rc = vread(v, cluster_offset(v, cluster) + within, out, take);
++        if (rc) return rc;
++        out += take;
++        length -= take;
++        within = 0;
++        cluster = next;
++    }
++    return FatOk;
++}
+diff --git a/bsd/dev/qcom/FatVolume.h b/bsd/dev/qcom/FatVolume.h
+new file mode 100644
+index 0000000..4308316
+--- /dev/null
++++ b/bsd/dev/qcom/FatVolume.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* A read-only FAT16/FAT32 volume over a byte read callback: enough to find a file by its long or short (8.3) name in a directory path and read
++ * any range of it. Used to take the device's own firmware files from its firmware partition in place. No allocation: the one sector of
++ * the allocation table in use is cached in the volume. The volume's metadata is untrusted: every cluster number and chain is bounds
++ * checked and every chain walk is bounded, so a damaged volume gives an error, never a loop or a read outside the partition. */
++#ifndef FAT_VOLUME_H
++#define FAT_VOLUME_H
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Reads length bytes at offset (from the partition start) into to; returns 0 on success. */
++typedef int (*FatRead)(void *context, uint64_t offset, void *to, size_t length);
++
++enum {
++    FatOk = 0,
++    FatReadError = -1,
++    FatNotFat = -2,     /* no boot sector of a FAT16 or FAT32 volume */
++    FatNotFound = -3,
++    FatNotDirectory = -4,
++    FatIsDirectory = -5,
++    FatDamaged = -6,    /* a cluster chain leaves the volume, loops or is shorter than the file */
++    FatRange = -7,      /* the read goes past the end of the file */
++};
++
++typedef struct {
++    FatRead read;
++    void *context;
++    uint64_t size;                                    /* partition bytes */
++    uint8_t fat32;
++    uint32_t sector_bytes, cluster_bytes, clusters;   /* clusters: data clusters, numbered 2 .. clusters + 1 */
++    uint64_t fat_offset, root_offset, data_offset;    /* bytes from the partition start; root_offset is FAT16 only */
++    uint32_t root_entries, root_cluster;              /* root_entries: FAT16 fixed root; root_cluster: FAT32 */
++    uint64_t cached_sector;                           /* UINT64_MAX: nothing cached */
++    uint8_t sector[4096];
++} FatVolume;
++
++typedef struct {
++    uint32_t first_cluster, size;
++    uint8_t directory;
++} FatFile;
++
++int fat_mount(FatVolume *v, uint64_t size, FatRead read, void *context);
++/* path: names separated by '/', each matched in any case against the long name, else the 8.3 name ("image/adsp.b00"). */
++int fat_open(FatVolume *v, const char *path, FatFile *file);
++int fat_read(FatVolume *v, const FatFile *file, uint64_t offset, void *to, size_t length);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/qcom/QcomGlink.c b/bsd/dev/qcom/QcomGlink.c
+index 03fb054..fee7b1f 100644
+--- a/bsd/dev/qcom/QcomGlink.c
++++ b/bsd/dev/qcom/QcomGlink.c
+@@ -337,6 +337,11 @@ static int receive_one(QcomGlink *g)
+             unsigned slot = QCOM_GLINK_MAX_REMOTE_INTENTS;
+             for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
+                 if (!c->remote[k].valid) {slot = k; break;}
++            /* Full: a larger intent (the one a send asked for) replaces the smallest idle one, so it is never lost. */
++            if (slot == QCOM_GLINK_MAX_REMOTE_INTENTS)
++                for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
++                    if (!c->remote[k].busy && c->remote[k].size < le32(pair) &&
++                        (slot == QCOM_GLINK_MAX_REMOTE_INTENTS || c->remote[k].size < c->remote[slot].size)) slot = k;
+             if (slot == QCOM_GLINK_MAX_REMOTE_INTENTS) {g->dropped++; continue;}
+             c->remote[slot].size = le32(pair);
+             c->remote[slot].id = le32(pair + 4);
+diff --git a/bsd/dev/qcom/QcomGlink.h b/bsd/dev/qcom/QcomGlink.h
+index 06975d9..1fb845c 100644
+--- a/bsd/dev/qcom/QcomGlink.h
++++ b/bsd/dev/qcom/QcomGlink.h
+@@ -12,7 +12,7 @@ extern "C" {
+ #endif
+ 
+ #define QCOM_GLINK_MAX_CHANNELS 6u
+-#define QCOM_GLINK_MAX_REMOTE_INTENTS 24u
++#define QCOM_GLINK_MAX_REMOTE_INTENTS 48u   /* the audio DSP offers 24 small intents on adsp_apps before granting a larger one */
+ #define QCOM_GLINK_MAX_LOCAL_INTENTS 24u
+ #define QCOM_GLINK_NAME 32u
+ #define QCOM_GLINK_FEATURE_INTENT_REUSE 1u
+diff --git a/bsd/dev/qcom/SOURCE.txt b/bsd/dev/qcom/SOURCE.txt
+index 296b6c0..b6178f3 100644
+--- a/bsd/dev/qcom/SOURCE.txt
++++ b/bsd/dev/qcom/SOURCE.txt
+@@ -1,2 +1,3 @@
+-From UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng) package/, commit 0e1f6e52638137db15905db8d775ad73757f39fa,
+-copied unchanged: QcomSmem.{c,h}, QcomSmp2p.{c,h}, QcomGlink.{c,h}, ShengGpr.{c,h}. BSD-2-Clause-Patent (LICENSE.UniXNU).
++From UniXNU-sheng (https://github.com/UniXNU/UniXNU-sheng) package/, copied unchanged, BSD-2-Clause-Patent (LICENSE.UniXNU):
++- QcomSmem.{c,h}, QcomSmp2p.{c,h}, ShengGpr.{c,h}: commit 0e1f6e52638137db15905db8d775ad73757f39fa
++- QcomGlink.{c,h}, FatVolume.{c,h}: commit d76556b8909e380961309e970d87b919a74e411e
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9804e60..a0c916e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -627,8 +627,9 @@ ufs_sync_cache(void)
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/* The GPT partition named want on the LUN su.lun, in device blocks (0229: pandora_part_find too). */
+ static int
+-ufs_find_partition(const char *want)
++ufs_gpt_lookup(const char *want, uint64_t *first_out, uint64_t *nblocks_out)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -673,14 +674,23 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_out = first;
++		*nblocks_out = last - first + 1;
+ 		return 0;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+ 
++static int
++ufs_find_partition(const char *want)
++{
++	int error = ufs_gpt_lookup(want, &su.first_block, &su.nblocks);
++	if (error == ENOENT) {
++		printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
++	}
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -2308,5 +2318,86 @@ pandora_fw_read(uint64_t off, void *dst, uint64_t len)
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return error;
+ }
++
++/*
++ * 0229: one more GPT partition, read only, on any LUN, for bsd/dev/pandora_adsp.c: the firmware
++ * partition modem_<slot> (LUN 4; Android's /vendor/firmware_mnt), as UniXNU-sheng's
++ * native_ufs_part_find and native_ufs_part_read. Each call switches su.lun for its commands under
++ * sweet_ufs_lock and sets it back to 0; ufs_scsi's filter passes only TEST UNIT READY and READ(10)
++ * there, and pandora_part_pread stays inside the partition found. LUN 4 is asked first, so on
++ * pandora no other LUN is touched.
++ */
++static struct {
++	uint8_t lun;
++	uint64_t first, blocks;
++} pp;
++
++int pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
++int
++pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	static const uint8_t order[8] = { 4, 0, 1, 2, 3, 5, 6, 7 };
++	int error = ENOENT;
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	pp.blocks = 0;
++	for (unsigned i = 0; i < 8 && error; i++) {
++		int e = 0;
++		uint64_t f = 0, n = 0;
++		su.lun = order[i];
++		/* The first command to a LUN may report a unit attention. */
++		for (int t = 0; t < 3 && (e = ufs_scsi(tur, sizeof(tur), 0, false)); t++) {
++		}
++		if (!e && !ufs_gpt_lookup(name, &f, &n)) {
++			pp.lun = order[i];
++			pp.first = f;
++			pp.blocks = n;
++			error = 0;
++		}
++	}
++	su.lun = 0;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (!error) {
++		*lun = pp.lun;
++		*first = pp.first;
++		*blocks = pp.blocks;
++	}
++	return error;
++}
++
++/* Copy len bytes at byte offset off of that partition into dst. */
++int pandora_part_pread(uint64_t off, void *dst, uint64_t len);
++int
++pandora_part_pread(uint64_t off, void *dst, uint64_t len)
++{
++	if (!pp.blocks || off + len < off || off + len > pp.blocks * UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint8_t *out = dst;
++	int error = 0;
++	lck_mtx_lock(&sweet_ufs_lock);
++	su.lun = pp.lun;
++	while (len && !error) {
++		uint64_t blk = off / UFS_BLOCK;
++		uint32_t in = (uint32_t)(off % UFS_BLOCK);
++		uint64_t need = (in + len + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(need, (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		error = ufs_read_blocks(pp.first + blk, n);
++		if (error) {
++			break;
++		}
++		uint64_t got = MIN((uint64_t)n * UFS_BLOCK - in, len);
++		memcpy(out, (const uint8_t *)(su.dma + DMA_BOUNCE) + in, (size_t)got);
++		out += got;
++		off += got;
++		len -= got;
++	}
++	su.lun = 0;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
+ #endif /* PANDORA */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

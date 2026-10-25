@@ -14,7 +14,7 @@
  * PAS_MEM_SETUP when relocatable, segments copied to the carveout (relocated to the
  * lowest segment address, qcom_mdt_load_no_init), PAS_AUTH_AND_RESET. Carveouts from the
  * DT: adspslpi 0xa1400000 + 0x5580000, q6_adsp_dtb 0xa1380000 + 0x80000. Firmware comes
- * from the pinned firmware pack (tools/mkfwpack.py, pandora_fw_read in sweet_ufs.c).
+ * from the device's firmware partition, else the pinned pack ("firmware files" below).
  *
  * Talking to the started DSP, as UniXNU-sheng's AdspProbe.cpp and AudioProbe.cpp (their SMEM,
  * SMP2P, GLINK and GPR code in bsd/dev/qcom/, unchanged): before the start, our SMP2P item 429
@@ -48,6 +48,7 @@
 #include "qcom/QcomSmp2p.h"
 #include "qcom/QcomGlink.h"
 #include "qcom/ShengGpr.h"
+#include "qcom/FatVolume.h"
 
 extern kern_return_t thread_terminate(thread_t);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
@@ -450,7 +451,20 @@ bcm_vote(const char *res, uint32_t peak)
 	return err;
 }
 
-/* ---- firmware pack and MDT --------------------------------------------------------- */
+/* ---- firmware files and MDT ---------------------------------------------------------- */
+
+/*
+ * The ADSP images come from the device's own firmware partition, as Android and UniXNU-sheng
+ * take them: /image of modem_<slot> (Android's /vendor/firmware_mnt), a FAT volume read in place
+ * through sweet_ufs.c (pandora_part_find, pandora_part_pread; read only) with UniXNU-sheng's
+ * FatVolume.c. The slot is boot-arg pandora_slot=a|b (tools/boot_ios.sh passes Android's
+ * ro.boot.slot_suffix): after an update the other slot's partition may hold another build.
+ * pandora_adsp_fw=pack, or no usable partition: the pinned pack (tools/mkfwpack.py,
+ * pandora_fw_read in sweet_ufs.c), which also carries the GPU's files (their vendor partition is
+ * not FAT).
+ */
+extern int pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
+extern int pandora_part_pread(uint64_t off, void *dst, uint64_t len);
 
 struct fw_ent {
 	char name[48];
@@ -458,6 +472,15 @@ struct fw_ent {
 };
 static struct fw_ent ad_dir[63];
 static unsigned ad_nfiles;
+static FatVolume ad_fat;
+static int ad_fat_state;                 /* 0 not tried, 1 mounted, -1 not usable */
+
+/* One file: in the firmware partition's FAT, or in the pack. */
+struct fw_file {
+	uint64_t size, pack_off;
+	FatFile fat;
+	bool in_fat;
+};
 
 static int
 fw_dir(void)
@@ -492,6 +515,81 @@ fw_find(const char *name)
 	return NULL;
 }
 
+static int
+fat_part_read(void *ctx, uint64_t off, void *to, size_t len)
+{
+	(void)ctx;
+	return pandora_part_pread(off, to, len);
+}
+
+/* The firmware partition's FAT, once. */
+static int
+fw_mount(void)
+{
+	if (ad_fat_state) {
+		return ad_fat_state > 0 ? 0 : ENOENT;
+	}
+	ad_fat_state = -1;
+	char slot[4] = "", part[16];
+	if (!PE_parse_boot_arg_str("pandora_slot", slot, sizeof(slot)) || (slot[0] != 'a' && slot[0] != 'b') ||
+	    slot[1]) {
+		printf("PANDORA ADSP: no boot-arg pandora_slot=a|b: the firmware partition is not read\n");
+		return ENOENT;
+	}
+	snprintf(part, sizeof(part), "modem_%c", slot[0]);
+	uint32_t lun = 0;
+	uint64_t first = 0, blocks = 0;
+	int err = pandora_part_find(part, &lun, &first, &blocks);
+	if (err) {
+		printf("PANDORA ADSP: partition %s not found: %d\n", part, err);
+		return err;
+	}
+	int rc = fat_mount(&ad_fat, blocks * 4096, fat_part_read, NULL);
+	printf("PANDORA ADSP: %s: LUN %u blocks %#llx+%#llx, FAT mount -> %d (FAT%s, %u-byte clusters)\n", part, lun,
+	    first, blocks, rc, ad_fat.fat32 ? "32" : "16", ad_fat.cluster_bytes);
+	if (rc) {
+		return EFTYPE;
+	}
+	ad_fat_state = 1;
+	return 0;
+}
+
+static int
+fw_open(const char *name, bool part, struct fw_file *f)
+{
+	bzero(f, sizeof(*f));
+	if (part) {
+		char path[64];
+		snprintf(path, sizeof(path), "image/%s", name);
+		int rc = fat_open(&ad_fat, path, &f->fat);
+		if (rc || f->fat.directory) {
+			return rc == FatNotFound ? ENOENT : EIO;
+		}
+		f->size = f->fat.size;
+		f->in_fat = true;
+		return 0;
+	}
+	struct fw_ent *e = fw_find(name);
+	if (!e) {
+		return ENOENT;
+	}
+	f->size = e->size;
+	f->pack_off = e->off;
+	return 0;
+}
+
+static int
+fw_pread(const struct fw_file *f, uint64_t off, void *dst, uint64_t len)
+{
+	if (off + len < off || off + len > f->size) {
+		return EINVAL;
+	}
+	if (f->in_fat) {
+		return fat_read(&ad_fat, &f->fat, off, dst, (size_t)len) ? EIO : 0;
+	}
+	return pandora_fw_read(f->pack_off + off, dst, len);
+}
+
 struct elf32_phdr {
 	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
 };
@@ -507,21 +605,21 @@ mdt_loadable(const struct elf32_phdr *p)
 
 /* Read segment i of base.mdt: from base.bNN (split images) or from the .mdt itself. */
 static int
-mdt_segment(const char *base, const struct fw_ent *mdt, const struct elf32_phdr *p, unsigned i,
+mdt_segment(const char *base, bool part, const struct fw_file *mdt, const struct elf32_phdr *p, unsigned i,
     void *dst)
 {
 	char name[48];
+	struct fw_file seg;
 	snprintf(name, sizeof(name), "%s.b%02u", base, i);
-	struct fw_ent *seg = fw_find(name);
-	if (seg) {
-		if (seg->size != p->p_filesz) {
-			printf("PANDORA ADSP: %s is %llu bytes, segment wants %u\n", name, seg->size, p->p_filesz);
+	if (!fw_open(name, part, &seg)) {
+		if (seg.size != p->p_filesz) {
+			printf("PANDORA ADSP: %s is %llu bytes, segment wants %u\n", name, seg.size, p->p_filesz);
 			return EINVAL;
 		}
-		return pandora_fw_read(seg->off, dst, p->p_filesz);
+		return fw_pread(&seg, 0, dst, p->p_filesz);
 	}
 	if ((uint64_t)p->p_offset + p->p_filesz <= mdt->size) {
-		return pandora_fw_read(mdt->off + p->p_offset, dst, p->p_filesz);
+		return fw_pread(mdt, p->p_offset, dst, p->p_filesz);
 	}
 	printf("PANDORA ADSP: segment %u of %s missing\n", i, base);
 	return ENOENT;
@@ -532,7 +630,7 @@ mdt_segment(const char *base, const struct fw_ent *mdt, const struct elf32_phdr 
  * the carveout. The bridge handle is returned for deletion after the reset.
  */
 static int
-pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
+pas_load(const char *base, bool part, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
 {
 	char name[48];
 	if (strchr(base, '.')) {
@@ -540,13 +638,13 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 	} else {
 		snprintf(name, sizeof(name), "%s.mdt", base);
 	}
-	struct fw_ent *mdt = fw_find(name);
-	if (!mdt || mdt->size < 52 || mdt->size > 0x10000) {
-		printf("PANDORA ADSP: %s missing\n", name);
+	struct fw_file mdt;
+	if (fw_open(name, part, &mdt) || mdt.size < 52 || mdt.size > 0x10000) {
+		printf("PANDORA ADSP: %s missing in the %s\n", name, part ? "firmware partition" : "pack");
 		return ENOENT;
 	}
 	static uint8_t hdr[0x10000];
-	int err = pandora_fw_read(mdt->off, hdr, mdt->size);
+	int err = fw_pread(&mdt, 0, hdr, mdt.size);
 	if (err) {
 		return err;
 	}
@@ -554,7 +652,7 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 	memcpy(&phoff, hdr + 28, 4);
 	phnum = hdr[44] | (hdr[45] << 8);
 	if (memcmp(hdr, "\177ELF", 4) || hdr[4] != 1 || phnum < 2 || phnum > 128 ||
-	    phoff + phnum * sizeof(struct elf32_phdr) > mdt->size) {
+	    phoff + phnum * sizeof(struct elf32_phdr) > mdt.size) {
 		printf("PANDORA ADSP: %s is not a 32-bit ELF header\n", name);
 		return EINVAL;
 	}
@@ -579,8 +677,8 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 	}
 	uint32_t ehdr_size = ph[0].p_filesz, hash_size = ph[hash].p_filesz;
 	uint64_t md_size = ((uint64_t)ehdr_size + hash_size + 0xfff) & ~0xfffull;
-	printf("PANDORA ADSP: %s: %u segments, hash %u (%u bytes), load %#llx-%#llx%s\n", name, phnum,
-	    hash, hash_size, min, max, reloc ? " relocatable" : "");
+	printf("PANDORA ADSP: %s (%s): %u segments, hash %u (%u bytes), load %#llx-%#llx%s\n", name,
+	    part ? "firmware partition" : "pack", phnum, hash, hash_size, min, max, reloc ? " relocatable" : "");
 	if (max - min > mem_size) {
 		printf("PANDORA ADSP: %s does not fit its carveout\n", name);
 		return EINVAL;
@@ -592,11 +690,11 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 	}
 	uint64_t md_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)md));
 	memcpy((void *)md, hdr, ehdr_size);
-	if (ehdr_size + hash_size == mdt->size) {
+	if (ehdr_size + hash_size == mdt.size) {
 		memcpy((void *)(md + ehdr_size), hdr + ehdr_size, hash_size);
-	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt->size) {
+	} else if ((uint64_t)ph[hash].p_offset + hash_size <= mdt.size) {
 		memcpy((void *)(md + ehdr_size), hdr + ph[hash].p_offset, hash_size);
-	} else if ((err = mdt_segment(base, mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
+	} else if ((err = mdt_segment(base, part, &mdt, &ph[hash], hash, (void *)(md + ehdr_size)))) {
 		return err;
 	}
 	flush_dcache64((addr64_t)md_pa, (unsigned)md_size, TRUE);
@@ -638,7 +736,7 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 			err = EINVAL;
 			break;
 		}
-		if (ph[i].p_filesz && (err = mdt_segment(base, mdt, &ph[i], i, (void *)(mem + off)))) {
+		if (ph[i].p_filesz && (err = mdt_segment(base, part, &mdt, &ph[i], i, (void *)(mem + off)))) {
 			break;
 		}
 		if (ph[i].p_memsz > ph[i].p_filesz) {
@@ -676,7 +774,7 @@ pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t 
 	uint64_t bridge = 0;
 	int err = ad_nfiles ? 0 : fw_dir();
 	if (!err) {
-		err = pas_load(file, pas, mem_pa, mem_size, &bridge);
+		err = pas_load(file, false, pas, mem_pa, mem_size, &bridge);
 	}
 	if (!err) {
 		err = pas_auth(pas);
@@ -1150,7 +1248,16 @@ adsp_boot(void)
 	struct scm_res r;
 	int open_gpr = 0;
 	(void)PE_parse_boot_argn("pandora_adsp_gpr", &open_gpr, sizeof(open_gpr));
-	if ((err = fw_dir()) || (err = adsp_comms_setup())) {
+	char src[8] = "";
+	(void)PE_parse_boot_arg_str("pandora_adsp_fw", src, sizeof(src));
+	bool part = strcmp(src, "pack") != 0 && fw_mount() == 0;
+	if (!part) {
+		printf("PANDORA ADSP: the ADSP images from the pinned pack\n");
+		if ((err = ad_nfiles ? 0 : fw_dir())) {
+			return;
+		}
+	}
+	if ((err = adsp_comms_setup())) {
 		return;
 	}
 	/* qcom_pas_start's order: qcom_q6v5_prepare (bus vote, load_state), then the proxy power
@@ -1171,12 +1278,12 @@ adsp_boot(void)
 		printf("PANDORA ADSP: pas %#x supported a0 %#llx a1 %#llx, shutdown -> a0 %#llx a1 %#llx\n",
 		    stop[i], q.a0, q.a1, s.a0, s.a1);
 	}
-	if ((err = pas_load("adsp_dtb", AD_PAS_DTB, AD_DTB_PA, AD_DTB_SIZE, &b_dtb)) ||
+	if ((err = pas_load("adsp_dtb", part, AD_PAS_DTB, AD_DTB_PA, AD_DTB_SIZE, &b_dtb)) ||
 	    (err = pas_auth(AD_PAS_DTB))) {
 		/* Go on with the main image anyway: its answer tells more. */
 		printf("PANDORA ADSP: DTB image failed %d\n", err);
 	}
-	if ((err = pas_load("adsp", AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main))) {
+	if ((err = pas_load("adsp", part, AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main))) {
 		printf("PANDORA ADSP: main image failed %d\n", err);
 		return;
 	}

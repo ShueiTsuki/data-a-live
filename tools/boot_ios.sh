@@ -96,6 +96,13 @@ case "$rtc_count$android_now" in
 	CMDLINE="$CMDLINE pandora_rtc_offset=$((android_now - rtc_count))"
 	echo "rtc: counter $rtc_count, Android $android_now, offset $((android_now - rtc_count))" ;;
 esac
+# The slot Android runs from (patch 0229): the kernel reads the ADSP images from that slot's firmware
+# partition (modem_a or modem_b, Android's /vendor/firmware_mnt).
+slot=$("$ADB" shell getprop ro.boot.slot_suffix | tr -d '\r_')
+case "$slot" in
+a | b) CMDLINE="$CMDLINE pandora_slot=$slot"; echo "slot: $slot" ;;
+*) echo "slot: unknown ($slot), the kernel takes the ADSP images from the pack" ;;
+esac
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
 # KERNEL=/opt/work/plk/kN-amfi.macho (tools/mkprelink.py) and TRUSTCACHE="IPSW trust cache..."

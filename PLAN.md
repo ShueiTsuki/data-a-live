@@ -214,7 +214,12 @@
 - 0228：照 Linux qcom_q6v5_prepare，在启动前给 DSP 到内存的总线（DT "rproc_ddr"）投最大带宽。按主线 kaanapali 总线驱动，这条路上只有 LP0 是 LPASS 专用的，所以只投 LP0（SH0、MC0、ACV 是主处理器自己的内存通路，不动），交接或失败时撤掉。启动顺序改成 Linux 的：总线票、load_state、LCX/LMX；失败时 load_state 关。`pandora_adsp_wait=毫秒` 可以把等就绪的时间拉长，用来分清是起得慢还是没起来。
 - **adsp3（0228）：ADSP 通了。** LP0 总线票一投，DSP 放开复位后 434 ms 建出 SMP2P 项 443，626 ms 报就绪，653 ms 交接（电压和总线票按 Linux 撤掉）。GLINK 版本协商成功，DSP 打开 "adsp_apps"，我们这边 667 ms 通道就绪；问 APM，第一次没回音（1 秒超时），第二次回"框架就绪"，离通道就绪 1001 ms。和 sheng 走到的位置一样。GPU 同时正常（vktest PASS 16，没有失败）。
 - DSP 还打开了 8 个我们没接的通道：glink_ssr、pcie_drv、mhi_sat、IPCRTR（QRTR 路由，安卓上音频服务、传感器都走它）、fastrpcglink-apps-dsp、adsp_apps2、sleepmonglink-apps-adsp，统计里丢掉的 92 条消息是发到这些通道的。
-- 下一步（用户已定）：固件改成正式做法，从手机自己的固件分区读（安卓的 /vendor/firmware_mnt，FAT），不再放进测试包。
+- 0229（2026-10-26）：ADSP 固件改成正式做法，和安卓、sheng 一样从手机自己的固件分区读：当前槽的 modem_a/modem_b（安卓的 /vendor/firmware_mnt，在 LUN 4，FAT16）里的 image/ 目录，就地只读。
+  - UFS 驱动加了只读接口：在任意 LUN 上按名字找分区（先问 LUN 4），按字节读分区内容，读的范围限在找到的分区里；命令过滤照旧，只放行"测试就绪"和"读"。
+  - FAT 读取器用 sheng 的 FatVolume.c，原样拷贝。上游测试（加上手机自己的 adsp、adsp_dtb 固件）在 FAT16 和 FAT32 上都通过；Linux 上要关掉泄漏检查，泄漏的是测试程序自己，不是读取器。
+  - 槽由 `tools/boot_ios.sh` 从安卓的 ro.boot.slot_suffix 读出，作为 `pandora_slot=a|b` 传给内核。拿不到分区时退回测试包；`pandora_adsp_fw=pack` 强制用测试包。
+  - GPU 固件在 vendor 分区，不是 FAT，所以还留在测试包里。
+  - 同时换上 sheng 新版 GLINK：远端接收缓冲表从 24 项扩到 48 项，表满时用大的替换最小的空闲项。DSP 先在 adsp_apps 上发 24 个小缓冲，大的那个以前会被丢掉，adsp3 第一次问 APM 没回音可能就是这个原因。
 
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
