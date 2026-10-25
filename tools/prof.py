@@ -24,9 +24,9 @@ def parse_log(path, last):
     images, reports, cache_slide, cache_base, kernel_slide = {}, [], 0, 0, 0
     cur = None
     for line in open(path, errors='replace'):
-        m = re.search(r'PANDORA PROF IMAGES \d+, shared cache base (0x[0-9a-f]+) slide (0x[0-9a-f]+), kernel slide (0x[0-9a-f]+)', line)
+        m = re.search(r'PANDORA PROF IMAGES \d+, shared cache base (0x[0-9a-f]+) slide (0x[0-9a-f]+), kernel slide (0x[0-9a-f]+|0)', line)
         if m:
-            cache_base, cache_slide, kernel_slide = (int(x, 16) for x in m.groups())
+            cache_base, cache_slide, kernel_slide = (int(x, 0) for x in m.groups())
             continue
         m = re.search(r'PANDORA PROF IMAGE (0x[0-9a-f]+) (\S.*)$', line)
         if m:
@@ -161,6 +161,7 @@ def main():
     for kind, title in (('U', 'in user code'), ('E', 'in the kernel, by the user PC that entered it'),
                         ('K', 'in the kernel, by kernel PC')):
         funcs = collections.Counter()
+        by_img = collections.Counter()
         total = 0
         for (k, pc), c in counts.items():
             if k != kind:
@@ -168,9 +169,11 @@ def main():
             total += c
             img, ad = where[(k, pc)]
             funcs['%s  [%s]' % (short(names.get((img, ad), hex(ad))), os.path.basename(img))] += c
+            by_img[os.path.basename(img)] += c
         if not total:
             continue
         print('\n== %s: %d samples' % (title, total))
+        print('  by image: ' + ', '.join('%s %.1f%%' % (i, 100.0 * c / total) for i, c in by_img.most_common(12)))
         for f, c in funcs.most_common(a.top):
             print('  %5.1f%%  %6d  %s' % (100.0 * c / total, c, f))
 
