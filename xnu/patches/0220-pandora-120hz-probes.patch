@@ -1,0 +1,334 @@
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+index be3681e..94a1fd2 100644
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -462,6 +462,8 @@ sc_flush_idle(void)
+ 	return false;
+ }
+ 
++static void sc_irq_probe(void);
++
+ int pandora_scanout_init(void);
+ int
+ pandora_scanout_init(void)
+@@ -598,6 +600,7 @@ pandora_scanout_init(void)
+ 	sc.on_panel = true;
+ 	sc.ready = true;
+ 	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
++	sc_irq_probe();
+ 	return 0;
+ }
+ 
+@@ -747,6 +750,65 @@ pandora_scanout_current(uint32_t addr)
+ 	return dpu_rd(sc_rec[0] + SC_CURRENT0) == want && dpu_rd(sc_rec[1] + SC_CURRENT0) == want;
+ }
+ 
++/*
++ * 0220: the display's interrupts, looked at without turning them on, for a frame-start interrupt in place of the
++ * present thread's polling later. Mainline's v13 layout (dpu_hw_interrupts.c dpu_intr_set_13xx, dpu_hwio.h,
++ * catalog/dpu_13_0_kaanapali.h, msm_mdss.c): MDP INTR_EN/STATUS/CLEAR at 0x10/0x14/0x18 (INTF1 underrun bit 26,
++ * vsync bit 27), INTR2_EN/STATUS/CLEAR at 0x08/0x0c/0x2c (CTL0 start bit 9), INTF1's own at INTF + 0x1c0/0x1c4/0x1c8,
++ * its tear block at INTF + 0x800 + 0/4/8 (rd_ptr bit 2), MDSS HW_INTR_STATUS at 0x10. Status bits latch whether
++ * enabled or not: for 100 ms, every 0.5 ms, each status register is read and the bits found set are counted and
++ * cleared. Writes go to the clear registers only. Boot-arg pandora_dpu_irqprobe=0 skips it.
++ */
++static void
++sc_irq_probe(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t en, st, clr;
++	} regs[] = {
++		{ "intr", DPU_MDP + 0x10, DPU_MDP + 0x14, DPU_MDP + 0x18 },
++		{ "intr2", DPU_MDP + 0x08, DPU_MDP + 0x0c, DPU_MDP + 0x2c },
++		{ "intf1", DPU_INTF(1) + 0x1c0, DPU_INTF(1) + 0x1c4, DPU_INTF(1) + 0x1c8 },
++		{ "intf1 tear", DPU_TEARI(1) + 0x0, DPU_TEARI(1) + 0x4, DPU_TEARI(1) + 0x8 },
++	};
++	enum { NREG = sizeof(regs) / sizeof(regs[0]) };
++	int on = 1;
++	PE_parse_boot_argn("pandora_dpu_irqprobe", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	uint16_t count[NREG][32] = {};
++	printf("PANDORA SCANOUT: interrupts: mdss status %08x; enables / status: intr %08x %08x, intr2 %08x %08x, "
++	    "intf1 %08x %08x, intf1 tear %08x %08x\n", dpu_rd(0x10), dpu_rd(regs[0].en), dpu_rd(regs[0].st),
++	    dpu_rd(regs[1].en), dpu_rd(regs[1].st), dpu_rd(regs[2].en), dpu_rd(regs[2].st), dpu_rd(regs[3].en),
++	    dpu_rd(regs[3].st));
++	for (unsigned r = 0; r < NREG; r++) {
++		dpu_wr(regs[r].clr, dpu_rd(regs[r].st));
++	}
++	for (unsigned t = 0; t < 200; t++) {
++		delay(500);
++		for (unsigned r = 0; r < NREG; r++) {
++			const uint32_t s = dpu_rd(regs[r].st);
++			if (s) {
++				for (unsigned b = 0; b < 32; b++) {
++					count[r][b] += (s >> b) & 1;
++				}
++				dpu_wr(regs[r].clr, s);
++			}
++		}
++	}
++	for (unsigned r = 0; r < NREG; r++) {
++		char line[256];
++		int at = 0;
++		for (unsigned b = 0; b < 32 && at < (int)sizeof(line); b++) {
++			if (count[r][b]) {
++				at += snprintf(line + at, sizeof(line) - at, " bit %u x%u", b, count[r][b]);
++			}
++		}
++		printf("PANDORA SCANOUT: interrupts in 100 ms, %s:%s\n", regs[r].name, at ? line : " none");
++	}
++}
++
+ /* 0218: whether CTL0 has taken the last flush (its bits clear at the frame that latches them), without waiting. */
+ bool pandora_scanout_flushed(void);
+ bool
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f678a72..983203c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,6 +312,9 @@ public:
+ 	uint32_t      fSwapWaits, fSwapBusy, fSwapSlept, fSwapTimeouts, fSwapLogged;
+ 	uint64_t      fLatchTime, fLatchMax;  /* flush to latch, absolute time */
+ 	uint32_t      fLatchCount, fLatchLate;
++	/* 0220: pacing while animating (swaps under 50 ms apart), and how long a swap takes to reach the screen. */
++	uint64_t      fLastSwapAbs, fPendingAbs, fGapSum, fGapMin, fScreenSum, fScreenMax;
++	uint32_t      fGapCount, fScreenCount;
+ #endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -781,6 +784,31 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++#if defined(PANDORA)
++	/*
++	 * 0220: the panel's refresh for CoreAnimation: "IOMFBDisplayRefresh" {displayMinRefreshInterval: seconds as 32.32
++	 * fixed point, displayRefreshStepMachTime: the variable-refresh step}. AppleDisplay reads it from this service and
++	 * AppleCLCDDisplay::heartbeat_rate makes the shortest interval CoreAnimation's frame period when there is no step.
++	 * Step 0: a fixed rate, and no APT claim (APT would put animations without a range at 60-80 Hz). Boot-arg
++	 * sweetfb_refresh (Hz, default 120; 0 publishes nothing: 60 Hz, as the iPhone X).
++	 */
++	{
++		uint32_t refresh = 120;
++		PE_parse_boot_argn("sweetfb_refresh", &refresh, sizeof(refresh));
++		OSDictionary *d = refresh ? OSDictionary::withCapacity(2) : NULL;
++		OSNumber *interval = d ? OSNumber::withNumber((1ULL << 32) / refresh, 32) : NULL;
++		OSNumber *step = d ? OSNumber::withNumber(0ULL, 32) : NULL;
++		if (interval && step) {
++			d->setObject("displayMinRefreshInterval", interval);
++			d->setObject("displayRefreshStepMachTime", step);
++			setProperty("IOMFBDisplayRefresh", d);
++			IOLog("SWEET FB: IOMFBDisplayRefresh: %u Hz (displayMinRefreshInterval %llu)\n", refresh, (1ULL << 32) / refresh);
++		}
++		OSSafeReleaseNULL(interval);
++		OSSafeReleaseNULL(step);
++		OSSafeReleaseNULL(d);
++	}
++#endif
+ 	registerService();
+ #if defined(PANDORA)
+ 	gSweetCLCD = this;
+@@ -991,6 +1019,19 @@ AppleCLCD::swap(const uint8_t *rec)
+ #if defined(PANDORA)
+ 	fPendingSeq = sweetfb_gpu_frames() ? pandora_gpu_issued() : 0;
+ 	fSwapQueued = get32(rec, 0x50);
++	{
++		const uint64_t now = mach_absolute_time();
++		uint64_t limit;
++		nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
++		if (fLastSwapAbs && now - fLastSwapAbs < limit) {
++			const uint64_t gap = now - fLastSwapAbs;
++			fGapSum += gap;
++			fGapMin = fGapCount ? MIN(fGapMin, gap) : gap;
++			fGapCount++;
++		}
++		fLastSwapAbs = now;
++		fPendingAbs = now;
++	}
+ #endif
+ 	fStatSwaps++;
+ 	if (fDirty) {
+@@ -1239,6 +1280,7 @@ AppleCLCD::presentLoop(void)
+ 		}
+ 		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
+ 		const uint32_t seq = fPendingSeq, id = fSwapQueued;
++		const uint64_t swapAbs = fPendingAbs;
+ 		fDirty = false;
+ 		fCopying = true;
+ 		fSwapActive = id;
+@@ -1254,6 +1296,12 @@ AppleCLCD::presentLoop(void)
+ 		present(rec);
+ 		last = mach_absolute_time();
+ 		(void)scanSettle();
++		if (swapAbs) {
++			const uint64_t took = mach_absolute_time() - swapAbs;
++			fScreenSum += took;
++			fScreenMax = MAX(fScreenMax, took);
++			fScreenCount++;
++		}
+ 		IOLockLock(fLock);
+ 		fCopying = false;
+ 		fSwapActive = 0;
+@@ -1687,6 +1735,23 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    fLatchLate);
+ 		fLatchTime = fLatchMax = 0;
+ 		fLatchCount = fLatchLate = 0;
++		IOLockLock(fLock);
++		const uint64_t gapSum = fGapSum, gapMin = fGapMin;
++		const uint32_t gaps = fGapCount;
++		fGapSum = fGapMin = 0;
++		fGapCount = 0;
++		IOLockUnlock(fLock);
++		uint64_t gapAvg = 0, gapShort = 0, screenAvg = 0, screenMax = 0;
++		absolutetime_to_nanoseconds(gaps ? gapSum / gaps : 0, &gapAvg);
++		absolutetime_to_nanoseconds(gapMin, &gapShort);
++		absolutetime_to_nanoseconds(fScreenCount ? fScreenSum / fScreenCount : 0, &screenAvg);
++		absolutetime_to_nanoseconds(fScreenMax, &screenMax);
++		const uint64_t fps10 = gapAvg ? 10ULL * NSEC_PER_SEC / gapAvg : 0;
++		IOLog("SWEET FB: while animating (swaps under 50 ms apart): %u, avg %llu us = %llu.%llu fps, shortest %llu us; "
++		    "swap to screen avg %llu us max %llu us\n", gaps, gapAvg / 1000, fps10 / 10, fps10 % 10, gapShort / 1000,
++		    screenAvg / 1000, screenMax / 1000);
++		fScreenSum = fScreenMax = 0;
++		fScreenCount = 0;
+ #endif
+ 		uint64_t gpu_ns, cpu_ns;
+ 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
+@@ -1788,6 +1853,9 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++#if defined(PANDORA)
++static uint8_t sweet_fb_arg_logs[96];   /* 0220: calls of each unhandled selector logged with their arguments */
++#endif
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -1872,6 +1940,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ #if defined(PANDORA)
+ 				fFB->fOffDone = false;
+ 				fFB->fSwapQueued = get32(fFB->fPending, 0x50);
++				fFB->fPendingAbs = 0;          /* the redraw is not a new swap: no swap-to-screen time */
+ 				IOLockWakeup(fFB->fLock, &fFB->fDirty, false);
+ 				IOLockWakeup(fFB->fLock, &fFB->fSwapShown, false);
+ #endif
+@@ -1891,6 +1960,33 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBSwapWait:
+ #endif
+ 	default:
++#if defined(PANDORA)
++		/*
++		 * 0220: what iOS passes to the selectors taken without effect (QuartzCore's IOMFBDisplay: 15 SetDebugFlags,
++		 * 17 SetGammaTable, 22 SetDisplayDevice, 29 GetDisplayArea, 33 video power savings, 55 SetMatrix, 57
++		 * GetColorRemapMode, 68 SetParameter, 74 SupportedFrameInfo, 78 SetBlock, 79 GetBlock, 84 SetContrast),
++		 * the first 6 calls of each.
++		 */
++		if (selector < 96 && sweet_fb_arg_logs[selector] < 6) {
++			char in[100];
++			int at = 0;
++			sweet_fb_arg_logs[selector]++;
++			in[0] = 0;
++			if (args->structureInputDescriptor == NULL && args->structureInput != NULL) {
++				const uint8_t *p = (const uint8_t *)args->structureInput;
++				for (uint32_t i = 0; i < args->structureInputSize && i < 48 && at < (int)sizeof(in) - 3; i++) {
++					at += snprintf(in + at, sizeof(in) - at, "%02x", p[i]);
++				}
++			}
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET FB: %s sel %u scalars %u [%llx %llx %llx %llx] struct %u [%s] out %u/%u\n", name, selector,
++			    args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
++			    args->scalarInputCount > 3 ? args->scalarInput[3] : 0, args->structureInputSize, in,
++			    args->scalarOutputCount, args->structureOutputSize);
++		}
++#endif
+ 		break;
+ 	}
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index b4a4f11..c63a848 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -373,6 +373,7 @@ private:
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
++	unsigned fMostDown;            /* PANDORA 0220: the most fingers down at once so far */
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -531,6 +532,14 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		fX[finger] = nx;
+ 		fY[finger] = ny;
+ 	}
++	unsigned downNow = 0;
++	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
++		downNow += fDown[i];
++	}
++	const bool most = downNow > fMostDown;
++	if (most) {
++		fMostDown = downNow;
++	}
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerX, nx);
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerY, ny);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, any);
+@@ -543,6 +552,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
+ 	}
++	if (most) {
++		IOLog("SWEET HID: %u fingers down at once (the most so far)\n", downNow);
++	}
+ 	dispatchEvent(collection);
+ 	collection->release();
+ }
+diff --git a/osfmk/arm/pandora_cpu_idle.c b/osfmk/arm/pandora_cpu_idle.c
+index b422915..9f0bfbf 100644
+--- a/osfmk/arm/pandora_cpu_idle.c
++++ b/osfmk/arm/pandora_cpu_idle.c
+@@ -68,11 +68,42 @@ pidle_cpu_suspend(uint64_t state)
+ 	return (int32_t)x0;
+ }
+ 
++/*
++ * 0220: what the firmware's PSCI offers, asked as Linux's psci_probe and cpuidle-psci-domain ask it, before the cluster
++ * and system states (they need OS-initiated mode): the version, CPU_SUSPEND's feature flags (bit 1 OS-initiated mode,
++ * bit 0 the extended state id format), and whether SET_SUSPEND_MODE and STAT_RESIDENCY exist. Nothing is changed.
++ */
++static int32_t
++pidle_psci(uint64_t fn, uint64_t arg)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = arg;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static void
++pidle_psci_probe(void)
++{
++	const uint32_t version = (uint32_t)pidle_psci(0x84000000u, 0);              /* PSCI_VERSION */
++	const int32_t suspend = pidle_psci(0x8400000au, 0xc4000001u);              /* PSCI_FEATURES(CPU_SUSPEND) */
++	const int32_t set_mode = pidle_psci(0x8400000au, 0x8400000fu);             /* PSCI_FEATURES(SET_SUSPEND_MODE) */
++	const int32_t residency = pidle_psci(0x8400000au, 0xc4000010u);            /* PSCI_FEATURES(STAT_RESIDENCY) */
++	printf("PANDORA IDLE: PSCI %u.%u; CPU_SUSPEND features %#x (OS-initiated mode %s, extended state ids %s); "
++	    "SET_SUSPEND_MODE %d, STAT_RESIDENCY %d\n", version >> 16, version & 0xffff, (uint32_t)suspend,
++	    suspend >= 0 && (suspend & 2) ? "yes" : "no", suspend >= 0 && (suspend & 1) ? "yes" : "no", set_mode, residency);
++}
++
+ void pandora_idle_start(void);
+ void
+ pandora_idle_start(void)
+ {
+ 	int mode = 1;
++	pidle_psci_probe();
+ 	PE_parse_boot_argn("pandora_idle", &mode, sizeof(mode));
+ 	nanoseconds_to_absolutetime(560 * 1000ull, &pidle_res[0]);
+ 	nanoseconds_to_absolutetime(686 * 1000ull, &pidle_res[1]);

@@ -462,6 +462,8 @@ sc_flush_idle(void)
 	return false;
 }
 
+static void sc_irq_probe(void);
+
 int pandora_scanout_init(void);
 int
 pandora_scanout_init(void)
@@ -598,6 +600,7 @@ pandora_scanout_init(void)
 	sc.on_panel = true;
 	sc.ready = true;
 	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
+	sc_irq_probe();
 	return 0;
 }
 
@@ -745,6 +748,65 @@ pandora_scanout_current(uint32_t addr)
 		sc_wr(sc.cb_off + 0x58, fsr);
 	}
 	return dpu_rd(sc_rec[0] + SC_CURRENT0) == want && dpu_rd(sc_rec[1] + SC_CURRENT0) == want;
+}
+
+/*
+ * 0220: the display's interrupts, looked at without turning them on, for a frame-start interrupt in place of the
+ * present thread's polling later. Mainline's v13 layout (dpu_hw_interrupts.c dpu_intr_set_13xx, dpu_hwio.h,
+ * catalog/dpu_13_0_kaanapali.h, msm_mdss.c): MDP INTR_EN/STATUS/CLEAR at 0x10/0x14/0x18 (INTF1 underrun bit 26,
+ * vsync bit 27), INTR2_EN/STATUS/CLEAR at 0x08/0x0c/0x2c (CTL0 start bit 9), INTF1's own at INTF + 0x1c0/0x1c4/0x1c8,
+ * its tear block at INTF + 0x800 + 0/4/8 (rd_ptr bit 2), MDSS HW_INTR_STATUS at 0x10. Status bits latch whether
+ * enabled or not: for 100 ms, every 0.5 ms, each status register is read and the bits found set are counted and
+ * cleared. Writes go to the clear registers only. Boot-arg pandora_dpu_irqprobe=0 skips it.
+ */
+static void
+sc_irq_probe(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t en, st, clr;
+	} regs[] = {
+		{ "intr", DPU_MDP + 0x10, DPU_MDP + 0x14, DPU_MDP + 0x18 },
+		{ "intr2", DPU_MDP + 0x08, DPU_MDP + 0x0c, DPU_MDP + 0x2c },
+		{ "intf1", DPU_INTF(1) + 0x1c0, DPU_INTF(1) + 0x1c4, DPU_INTF(1) + 0x1c8 },
+		{ "intf1 tear", DPU_TEARI(1) + 0x0, DPU_TEARI(1) + 0x4, DPU_TEARI(1) + 0x8 },
+	};
+	enum { NREG = sizeof(regs) / sizeof(regs[0]) };
+	int on = 1;
+	PE_parse_boot_argn("pandora_dpu_irqprobe", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	uint16_t count[NREG][32] = {};
+	printf("PANDORA SCANOUT: interrupts: mdss status %08x; enables / status: intr %08x %08x, intr2 %08x %08x, "
+	    "intf1 %08x %08x, intf1 tear %08x %08x\n", dpu_rd(0x10), dpu_rd(regs[0].en), dpu_rd(regs[0].st),
+	    dpu_rd(regs[1].en), dpu_rd(regs[1].st), dpu_rd(regs[2].en), dpu_rd(regs[2].st), dpu_rd(regs[3].en),
+	    dpu_rd(regs[3].st));
+	for (unsigned r = 0; r < NREG; r++) {
+		dpu_wr(regs[r].clr, dpu_rd(regs[r].st));
+	}
+	for (unsigned t = 0; t < 200; t++) {
+		delay(500);
+		for (unsigned r = 0; r < NREG; r++) {
+			const uint32_t s = dpu_rd(regs[r].st);
+			if (s) {
+				for (unsigned b = 0; b < 32; b++) {
+					count[r][b] += (s >> b) & 1;
+				}
+				dpu_wr(regs[r].clr, s);
+			}
+		}
+	}
+	for (unsigned r = 0; r < NREG; r++) {
+		char line[256];
+		int at = 0;
+		for (unsigned b = 0; b < 32 && at < (int)sizeof(line); b++) {
+			if (count[r][b]) {
+				at += snprintf(line + at, sizeof(line) - at, " bit %u x%u", b, count[r][b]);
+			}
+		}
+		printf("PANDORA SCANOUT: interrupts in 100 ms, %s:%s\n", regs[r].name, at ? line : " none");
+	}
 }
 
 /* 0218: whether CTL0 has taken the last flush (its bits clear at the frame that latches them), without waiting. */

@@ -68,11 +68,42 @@ pidle_cpu_suspend(uint64_t state)
 	return (int32_t)x0;
 }
 
+/*
+ * 0220: what the firmware's PSCI offers, asked as Linux's psci_probe and cpuidle-psci-domain ask it, before the cluster
+ * and system states (they need OS-initiated mode): the version, CPU_SUSPEND's feature flags (bit 1 OS-initiated mode,
+ * bit 0 the extended state id format), and whether SET_SUSPEND_MODE and STAT_RESIDENCY exist. Nothing is changed.
+ */
+static int32_t
+pidle_psci(uint64_t fn, uint64_t arg)
+{
+	register uint64_t x0 __asm__("x0") = fn;
+	register uint64_t x1 __asm__("x1") = arg;
+	register uint64_t x2 __asm__("x2") = 0;
+	register uint64_t x3 __asm__("x3") = 0;
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+	    "x14", "x15", "x16", "x17", "cc", "memory");
+	return (int32_t)x0;
+}
+
+static void
+pidle_psci_probe(void)
+{
+	const uint32_t version = (uint32_t)pidle_psci(0x84000000u, 0);              /* PSCI_VERSION */
+	const int32_t suspend = pidle_psci(0x8400000au, 0xc4000001u);              /* PSCI_FEATURES(CPU_SUSPEND) */
+	const int32_t set_mode = pidle_psci(0x8400000au, 0x8400000fu);             /* PSCI_FEATURES(SET_SUSPEND_MODE) */
+	const int32_t residency = pidle_psci(0x8400000au, 0xc4000010u);            /* PSCI_FEATURES(STAT_RESIDENCY) */
+	printf("PANDORA IDLE: PSCI %u.%u; CPU_SUSPEND features %#x (OS-initiated mode %s, extended state ids %s); "
+	    "SET_SUSPEND_MODE %d, STAT_RESIDENCY %d\n", version >> 16, version & 0xffff, (uint32_t)suspend,
+	    suspend >= 0 && (suspend & 2) ? "yes" : "no", suspend >= 0 && (suspend & 1) ? "yes" : "no", set_mode, residency);
+}
+
 void pandora_idle_start(void);
 void
 pandora_idle_start(void)
 {
 	int mode = 1;
+	pidle_psci_probe();
 	PE_parse_boot_argn("pandora_idle", &mode, sizeof(mode));
 	nanoseconds_to_absolutetime(560 * 1000ull, &pidle_res[0]);
 	nanoseconds_to_absolutetime(686 * 1000ull, &pidle_res[1]);
