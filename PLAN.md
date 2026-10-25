@@ -220,6 +220,8 @@
   - 槽由 `tools/boot_ios.sh` 从安卓的 ro.boot.slot_suffix 读出，作为 `pandora_slot=a|b` 传给内核。拿不到分区时退回测试包；`pandora_adsp_fw=pack` 强制用测试包。
   - GPU 固件在 vendor 分区，不是 FAT，所以还留在测试包里。
   - 同时换上 sheng 新版 GLINK：远端接收缓冲表从 24 项扩到 48 项，表满时用大的替换最小的空闲项。DSP 先在 adsp_apps 上发 24 个小缓冲，大的那个以前会被丢掉，adsp3 第一次问 APM 没回音可能就是这个原因。
+- **fw1（0229，完整 GPU 包 + ADSP 从分区读）：都正常。** 内核在 LUN 4 找到 modem_b（FAT16，16 KiB 簇），33.8 MB 主镜像从分区读进固件区约 70 ms；DSP 409 ms 建 SMP2P 项，602 ms 就绪，628 ms 交接；APM 就绪。GPU 同一次开机里正常：vktest PASS 17，没有失败，没有重启。GLINK 丢弃的消息从 92 条降到 16 条（新版 GLINK 不再丢 DSP 的接收缓冲）。第一次问 APM 仍然没回音，第二次（1 秒后）回"就绪"，猜测是 DSP 那边的服务还没注册好；重试能处理，暂不追。
+- 测试包从此只装 GPU 的东西，`tools/adsp_test.sh` 只在要强制用测试包里的 ADSP 固件时才用。
 
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
