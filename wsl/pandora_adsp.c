@@ -15,7 +15,20 @@
  * lowest segment address, qcom_mdt_load_no_init), PAS_AUTH_AND_RESET. Carveouts from the
  * DT: adspslpi 0xa1400000 + 0x5580000, q6_adsp_dtb 0xa1380000 + 0x80000. Firmware comes
  * from the pinned firmware pack (tools/mkfwpack.py, pandora_fw_read in sweet_ufs.c).
- * Not done yet: interconnect votes, SMP2P ready/handover, GLINK. PLAN.md "扬声器路线".
+ *
+ * Talking to the started DSP, as UniXNU-sheng's AdspProbe.cpp and AudioProbe.cpp (their SMEM,
+ * SMP2P, GLINK and GPR code in bsd/dev/qcom/, unchanged): before the start, our SMP2P item 429
+ * (SMEM partition apps-ADSP, allocated under TCSR mutex 3) with the entry "master-kernel";
+ * after it, the DSP's item 443 entry "slave-kernel" (bit 0 fatal, 1 ready, 2 handover) within
+ * 5 s; at handover the LCX/LMX votes go back to 0 (the DSP holds its own). Then GLINK on SMEM
+ * items 478 (descriptor), 479 (our FIFO, 16 KiB) and 480 (the DSP's FIFO), the GPR channel
+ * "adsp_apps" (DT qcom,gpr: 20 intents of 512 bytes) and the question to the DSP's audio
+ * framework manager (APM) whether the framework is ready (1 s for an answer, 100 ms between
+ * tries, 100 tries). Doorbells are IPCC (DT qcom,ipcc@1106000): LPASS client 3 signal 2 for
+ * SMP2P and 0 for GLINK. No interrupt yet (a plain BSD file has no SPI attach): this thread
+ * reads IPCC RECV_ID every 1 ms (every 20 ms after the first 30 s) and services SMP2P and
+ * GLINK on every pass. pandora_adsp_gpr=2: we open "adsp_apps" (default: the DSP opens it).
+ * Not done yet: interconnect votes, the IPCRTR router channel. PLAN.md "扬声器路线".
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -29,10 +42,14 @@
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 #include <arm/caches_internal.h>
+#include "qcom/QcomSmem.h"
+#include "qcom/QcomSmp2p.h"
+#include "qcom/QcomGlink.h"
+#include "qcom/ShengGpr.h"
 
 extern kern_return_t thread_terminate(thread_t);
-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 void pandora_adsp_init(void);
@@ -48,8 +65,47 @@ void pandora_adsp_init(void);
 #define AD_RSC_PA        0x18920000u
 #define AD_CMDDB_PA      0x81c60000u
 #define AD_CMDDB_SIZE    0x20000u
+#define AD_SMEM_PA       0x81d00000u     /* DT smem_region@81d00000, hwlocks <&tcsr_mutex 3> */
+#define AD_SMEM_SIZE     0x200000u
+#define AD_MUTEX_PA      0x01f43000u     /* syscon@1f40000 + lock 3 * stride 0x1000 */
+#define AD_PID           2u              /* the ADSP's remote pid: SMP2P, GLINK, SMEM partition */
+#define AD_ITEM_CRASH    423u
+#define AD_ITEM_P2P_OUT  429u            /* DT qcom,smp2p-adsp qcom,smem = <443 429> */
+#define AD_ITEM_P2P_IN   443u
+#define AD_ITEM_GL_DESC  478u
+#define AD_ITEM_GL_TX    479u
+#define AD_ITEM_GL_RX    480u
+#define AD_GL_FIFO       0x4000u
+
+/* IPCC (drivers/mailbox/qcom-ipcc.c): id = client << 16 | signal. */
+#define IPCC_SEND        0x0cu
+#define IPCC_RECV_ID     0x10u
+#define IPCC_RECV_ENABLE 0x14u
+#define IPCC_RECV_CLEAR  0x1cu
+#define IPCC_NONE        0xffffffffu
+#define IPCC_AOP_QMP     ((0u << 16) | 0u)
+#define IPCC_LPASS_GLINK ((3u << 16) | 0u)
+#define IPCC_LPASS_SMP2P ((3u << 16) | 2u)
+
+#define SLAVE_FATAL      1u
+#define SLAVE_READY      2u
+#define SLAVE_HANDOVER   4u
 
 static int ad_chan;
+
+static vm_offset_t
+ad_map(uint64_t pa, uint64_t len, uint32_t wimg)
+{
+	return ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)((len + 0xfff) & ~0xfffull), wimg);
+}
+
+static uint64_t
+ad_ms(uint64_t since)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+	return ns / 1000000;
+}
 
 static void
 ad_sleep(unsigned ms)
@@ -112,6 +168,20 @@ scm_smc(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, ui
 	}
 }
 
+/* For bsd/dev/pandora_gpu.c: an SCM call, results in a0 and a1. */
+void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
+    uint64_t *a1);
+
+void
+pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
+    uint64_t *a1)
+{
+	struct scm_res r;
+	scm_smc(fn, arginfo, x2, x3, 0, 0, &r);
+	*a0 = r.a0;
+	*a1 = r.a1;
+}
+
 #define SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | ((cmd) & 0xff))
 #define SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
 #define SCM_RW            2u
@@ -129,11 +199,12 @@ scm_call_avail(unsigned svc, unsigned cmd)
 /* ---- AOP QMP (drivers/soc/qcom/qcom_aoss.c), doorbell IPCC client 0 signal 0 ------ */
 
 static vm_offset_t ad_qmp, ad_ipcc;
+static bool ad_qmp_open;
 
 static void
 qmp_kick(void)
 {
-	ad_wr(ad_ipcc, 0x0c, 0);         /* IPCC_REG_SEND_ID: client 0 (AOP) << 16 | signal 0 */
+	ad_wr(ad_ipcc, IPCC_SEND, IPCC_AOP_QMP);
 }
 
 static bool
@@ -151,12 +222,7 @@ qmp_wait(uint32_t off, uint32_t want)
 static int
 qmp_send(const char *msg)
 {
-	if (!ad_qmp) {
-		ad_qmp = ml_io_map(AD_QMP_PA, 0x400);
-		ad_ipcc = ml_io_map(AD_IPCC_PA, 0x1000);
-		if (!ad_qmp || !ad_ipcc) {
-			return ENOMEM;
-		}
+	if (!ad_qmp_open) {
 		uint32_t magic = ad_rd(ad_qmp, 0x0), ver = ad_rd(ad_qmp, 0x4);
 		printf("PANDORA ADSP: QMP magic %#x version %u mcore link %#x ch %#x ucore link %#x ch %#x\n",
 		    magic, ver, ad_rd(ad_qmp, 0x24), ad_rd(ad_qmp, 0x2c), ad_rd(ad_qmp, 0xc), ad_rd(ad_qmp, 0x14));
@@ -177,6 +243,7 @@ qmp_send(const char *msg)
 		if (!l || !u || !c) {
 			return ETIMEDOUT;
 		}
+		ad_qmp_open = true;
 	}
 	uint32_t off = ad_rd(ad_qmp, 0x38), size = ad_rd(ad_qmp, 0x34);
 	if (size < 68 || off + 68 > 0x400) {
@@ -394,7 +461,11 @@ static int
 pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uint64_t *bridge)
 {
 	char name[48];
-	snprintf(name, sizeof(name), "%s.mdt", base);
+	if (strchr(base, '.')) {
+		strlcpy(name, base, sizeof(name));      /* a whole image, e.g. gen80200_zap.mbn */
+	} else {
+		snprintf(name, sizeof(name), "%s.mdt", base);
+	}
 	struct fw_ent *mdt = fw_find(name);
 	if (!mdt || mdt->size < 52 || mdt->size > 0x10000) {
 		printf("PANDORA ADSP: %s missing\n", name);
@@ -476,22 +547,25 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 			return EIO;
 		}
 	}
-	vm_offset_t mem = ml_io_map_wcomb((vm_offset_t)mem_pa, (vm_size_t)mem_size);
+	/* The carveout (85 MiB for the ADSP) mapped for the copy only, in kernel_map space. */
+	vm_offset_t mem = ad_map(mem_pa, mem_size, VM_WIMG_WCOMB);
 	if (!mem) {
+		printf("PANDORA ADSP: %s: carveout %#llx+%#llx not mapped\n", name, mem_pa, mem_size);
 		return ENOMEM;
 	}
 	uint64_t reloc_base = reloc ? min : mem_pa, total = 0;
-	for (unsigned i = 0; i < phnum; i++) {
+	for (unsigned i = 0; i < phnum && !err; i++) {
 		if (!mdt_loadable(&ph[i])) {
 			continue;
 		}
 		uint64_t off = (uint64_t)ph[i].p_paddr - reloc_base;
 		if ((int64_t)off < 0 || off + ph[i].p_memsz > mem_size || ph[i].p_filesz > ph[i].p_memsz) {
 			printf("PANDORA ADSP: %s segment %u outside the carveout\n", name, i);
-			return EINVAL;
+			err = EINVAL;
+			break;
 		}
 		if (ph[i].p_filesz && (err = mdt_segment(base, mdt, &ph[i], i, (void *)(mem + off)))) {
-			return err;
+			break;
 		}
 		if (ph[i].p_memsz > ph[i].p_filesz) {
 			bzero((void *)(mem + off + ph[i].p_filesz), ph[i].p_memsz - ph[i].p_filesz);
@@ -499,8 +573,11 @@ pas_load(const char *base, unsigned pas, uint64_t mem_pa, uint64_t mem_size, uin
 		total += ph[i].p_filesz;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	printf("PANDORA ADSP: %s: %llu bytes loaded at %#llx\n", name, total, mem_pa);
-	return 0;
+	ml_io_unmap(mem, (vm_size_t)((mem_size + 0xfff) & ~0xfffull));
+	if (!err) {
+		printf("PANDORA ADSP: %s: %llu bytes loaded at %#llx\n", name, total, mem_pa);
+	}
+	return err;
 }
 
 static int
@@ -515,18 +592,479 @@ pas_auth(unsigned pas)
 	return (r.a0 || r.a1) ? EIO : 0;
 }
 
+/* For bsd/dev/pandora_gpu.c: load FILE from the pinned pack as PAS image PAS into the
+ * carveout, then authenticate and reset it. */
+int pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size);
+
+int
+pandora_pas_load_auth(const char *file, unsigned pas, uint64_t mem_pa, uint64_t mem_size)
+{
+	uint64_t bridge = 0;
+	int err = ad_nfiles ? 0 : fw_dir();
+	if (!err) {
+		err = pas_load(file, pas, mem_pa, mem_size, &bridge);
+	}
+	if (!err) {
+		err = pas_auth(pas);
+	}
+	return err;
+}
+
+/* ---- SMEM items and IPCC doorbells -------------------------------------------------- */
+
+static vm_offset_t ad_smem_va, ad_mutex;
+static QcomSmem ad_smem;
+static QcomSmemPartition ad_part;
+static uint32_t ad_ipcc_n[4];            /* doorbells seen: SMP2P, GLINK, AOP, other */
+static uint32_t ad_ipcc_other;
+
+/* TCSR mutex (drivers/hwspinlock/qcom_hwspinlock.c): write our owner id 1, read it back. */
+static bool
+smem_lock(void)
+{
+	for (int i = 0; i < 1000; i++) {
+		ad_wr(ad_mutex, 0, 1);
+		if (ad_rd(ad_mutex, 0) == 1) {
+			return true;
+		}
+		delay(10);
+	}
+	return false;
+}
+
+static int
+smem_alloc(uint16_t item, uint32_t size)
+{
+	if (!smem_lock()) {
+		return EBUSY;
+	}
+	int rc = qcom_smem_alloc(&ad_smem, &ad_part, item, size);
+	ad_wr(ad_mutex, 0, 0);
+	if (rc && rc != QcomSmemExists) {
+		printf("PANDORA ADSP: SMEM item %u (%u bytes) not allocated: %d\n", item, size, rc);
+		return EIO;
+	}
+	return 0;
+}
+
+static volatile uint8_t *
+smem_item(uint16_t item, uint32_t *size)
+{
+	uint32_t at = 0, bytes = 0;
+	if (qcom_smem_find(&ad_smem, &ad_part, item, &at, &bytes)) {
+		return NULL;
+	}
+	if (size) {
+		*size = bytes;
+	}
+	return (volatile uint8_t *)ad_smem_va + at;
+}
+
+/* The DSP's crash text (global partition item 423, qcom_q6v5.c q6v5_fatal_interrupt). */
+static void
+smem_crash_reason(void)
+{
+	QcomSmemPartition global;
+	uint32_t at = 0, size = 0;
+	if (qcom_smem_partition(&ad_smem, QCOM_SMEM_HOST_GLOBAL, QCOM_SMEM_HOST_GLOBAL, &global) ||
+	    qcom_smem_find(&ad_smem, &global, AD_ITEM_CRASH, &at, &size) || !size) {
+		printf("PANDORA ADSP: no crash reason in SMEM\n");
+		return;
+	}
+	char text[160];
+	unsigned n = 0;
+	for (; n < sizeof(text) - 1 && n < size; n++) {
+		char c = (char)((volatile uint8_t *)ad_smem_va)[at + n];
+		if (!c) {
+			break;
+		}
+		text[n] = (c >= 32 && c < 127) ? c : '.';
+	}
+	text[n] = 0;
+	printf("PANDORA ADSP: crash reason: \"%s\"\n", text);
+}
+
+/* Takes what rang: bit 0 SMP2P, bit 1 GLINK. */
+static unsigned
+ipcc_poll(void)
+{
+	unsigned bits = 0;
+	for (int n = 0; n < 32; n++) {
+		uint32_t id = ad_rd(ad_ipcc, IPCC_RECV_ID);
+		if (id == IPCC_NONE) {
+			break;
+		}
+		ad_wr(ad_ipcc, IPCC_RECV_CLEAR, id);
+		if (id == IPCC_LPASS_SMP2P) {
+			ad_ipcc_n[0]++;
+			bits |= 1;
+		} else if (id == IPCC_LPASS_GLINK) {
+			ad_ipcc_n[1]++;
+			bits |= 2;
+		} else if (id == IPCC_AOP_QMP) {
+			ad_ipcc_n[2]++;
+		} else {
+			ad_ipcc_n[3]++;
+			ad_ipcc_other = id;
+		}
+	}
+	return bits;
+}
+
+/* ---- SMP2P ---------------------------------------------------------------------------- */
+
+static QcomSmp2p ad_p2p;
+static uint32_t ad_slave;
+static bool ad_handed;
+static uint64_t ad_t0;                   /* main image auth_and_reset */
+
+static void
+p2p_kick(void)
+{
+	ad_wr(ad_ipcc, IPCC_SEND, IPCC_LPASS_SMP2P);
+}
+
+static void
+p2p_service(void)
+{
+	if (!ad_p2p.in) {
+		uint32_t size = 0;
+		volatile uint8_t *in = smem_item(AD_ITEM_P2P_IN, &size);
+		if (!in) {
+			return;
+		}
+		ad_p2p.in = (volatile uint32_t *)in;
+		printf("PANDORA ADSP: SMP2P item %u (%u bytes) there after %llu ms: check %d\n", AD_ITEM_P2P_IN, size,
+		    ad_t0 ? ad_ms(ad_t0) : 0, qcom_smp2p_check_in(ad_p2p.in, 0, AD_PID));
+	}
+	uint32_t value = 0, changed = 0;
+	if (qcom_smp2p_service(&ad_p2p, "slave-kernel", &value, &changed)) {
+		p2p_kick();
+	}
+	if (changed) {
+		printf("PANDORA ADSP: slave-kernel %#x (changed %#x) after %llu ms\n", value, changed,
+		    ad_t0 ? ad_ms(ad_t0) : 0);
+	}
+	ad_slave = value;
+	if (changed & value & SLAVE_FATAL) {
+		smem_crash_reason();
+	}
+	if ((value & SLAVE_HANDOVER) && !ad_handed) {
+		/* qcom_pas_handover: the proxy votes go, the DSP holds its own now. */
+		ad_handed = true;
+		(void)arc_vote("lcx.lvl", 0);
+		(void)arc_vote("lmx.lvl", 0);
+	}
+}
+
+/* ---- GLINK and the GPR channel ------------------------------------------------------- */
+
+#define GPR_INTENT       512u            /* DT qcom,gpr qcom,intents = <0x200 0x14> */
+#define GPR_INTENTS      20u
+#define GPR_ANSWER_MS    1000u
+#define GPR_RETRY_MS     100u
+#define GPR_QUERIES      100u
+
+static QcomGlink ad_gl;
+static QcomGlinkChannel *ad_gpr;
+static uint8_t ad_gpr_buf[GPR_INTENT * GPR_INTENTS];
+static GprSpfProbe ad_spf;
+static bool ad_gpr_up, ad_gpr_changed, ad_spf_done;
+static uint64_t ad_gpr_up_at, ad_answer_by, ad_retry_at;
+static uint8_t ad_tx[GPR_HEADER_BYTES];
+static uint32_t ad_tx_len;
+/* Packets from the channel, handled after the poll (the callbacks run inside it). */
+static struct {
+	uint32_t len;
+	uint8_t data[64];
+} ad_inbox[4];
+static unsigned ad_inbox_n, ad_inbox_lost;
+
+static void
+gl_kick(void *ctx)
+{
+	(void)ctx;
+	ad_wr(ad_ipcc, IPCC_SEND, IPCC_LPASS_GLINK);
+}
+
+static void
+gpr_state(void *ctx, QcomGlinkChannel *ch, int up)
+{
+	(void)ctx;
+	(void)ch;
+	ad_gpr_up = up != 0;
+	ad_gpr_changed = true;
+}
+
+static void
+gpr_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *data, uint32_t len)
+{
+	(void)ctx;
+	(void)ch;
+	if (ad_inbox_n == 4) {
+		ad_inbox_lost++;
+		return;
+	}
+	ad_inbox[ad_inbox_n].len = MIN(len, (uint32_t)sizeof(ad_inbox[0].data));
+	memcpy(ad_inbox[ad_inbox_n].data, data, ad_inbox[ad_inbox_n].len);
+	ad_inbox_n++;
+}
+
+static int
+gl_start(int open_gpr)
+{
+	int err = smem_alloc(AD_ITEM_GL_DESC, 32);
+	if (!err) {
+		err = smem_alloc(AD_ITEM_GL_TX, AD_GL_FIFO);
+	}
+	uint32_t dsize = 0, tsize = 0;
+	volatile uint8_t *desc = smem_item(AD_ITEM_GL_DESC, &dsize), *txf = smem_item(AD_ITEM_GL_TX, &tsize);
+	printf("PANDORA ADSP: GLINK items %u (%u bytes) %u (%u bytes) -> %d\n", AD_ITEM_GL_DESC, dsize, AD_ITEM_GL_TX,
+	    tsize, err);
+	if (err || !desc || !txf || dsize < 32) {
+		return err ? err : ENOENT;
+	}
+	/* qcom_glink_smem.c: descriptor words 0/1 our FIFO's tail/head, 2/3 the DSP's. */
+	volatile uint32_t *d = (volatile uint32_t *)desc;
+	QcomGlinkFifo tx = {&d[1], &d[0], txf, tsize}, rx = {&d[3], &d[2], NULL, 0};
+	qcom_glink_init(&ad_gl, tx, rx, gl_kick, NULL);
+	static const QcomGlinkClient client = {gpr_state, gpr_receive};
+	ad_gpr = qcom_glink_channel(&ad_gl, "adsp_apps", GPR_INTENT, GPR_INTENTS, ad_gpr_buf, &client, NULL, open_gpr);
+	return ad_gpr ? 0 : ENOMEM;
+}
+
+static void
+gpr_ask(void)
+{
+	uint32_t n = gpr_spf_next(&ad_spf, ad_tx);
+	if (n) {
+		ad_tx_len = n;
+		clock_interval_to_deadline(GPR_ANSWER_MS, NSEC_PER_MSEC, &ad_answer_by);
+	}
+}
+
+static void
+gpr_outcome(int result)
+{
+	if (result == SpfIsReady) {
+		printf("PANDORA ADSP: APM ready %llu ms after the channel came up (%u queries, %u answers)\n",
+		    ad_ms(ad_gpr_up_at), ad_spf.queries, ad_spf.answers);
+		ad_spf_done = true;
+		ad_answer_by = 0;
+	} else if (result == SpfDone) {
+		printf("PANDORA ADSP: APM never ready: %u queries, %u answers, %u refusals (last status %#x), %u timeouts\n",
+		    ad_spf.queries, ad_spf.answers, ad_spf.errors, ad_spf.last_status, ad_spf.timeouts);
+		ad_spf_done = true;
+		ad_answer_by = 0;
+	} else if (result == SpfNotReady || result == SpfError) {
+		if (ad_spf.answers + ad_spf.errors <= 3) {
+			printf("PANDORA ADSP: APM answer %s status %#x\n", result == SpfError ? "refused" : "not ready",
+			    ad_spf.last_status);
+		}
+		ad_answer_by = 0;
+		clock_interval_to_deadline(GPR_RETRY_MS, NSEC_PER_MSEC, &ad_retry_at);
+	}
+}
+
+/* Channel state, the packets that came in, the timers, the query waiting to go out. */
+static void
+gpr_step(void)
+{
+	uint64_t now = mach_absolute_time();
+	if (ad_gpr_changed) {
+		ad_gpr_changed = false;
+		printf("PANDORA ADSP: channel adsp_apps %s after %llu ms\n", ad_gpr_up ? "up" : "down", ad_ms(ad_t0));
+		ad_answer_by = ad_retry_at = 0;
+		ad_tx_len = 0;
+		if (ad_gpr_up && !ad_spf_done) {
+			ad_gpr_up_at = now;
+			gpr_spf_init(&ad_spf, GPR_PORT_APM, GPR_QUERIES);
+			gpr_ask();
+		}
+	}
+	for (unsigned i = 0; i < ad_inbox_n; i++) {
+		GprPacket p;
+		if (!gpr_decode(ad_inbox[i].data, ad_inbox[i].len, &p) && ad_spf.answers + ad_spf.ignored < 8) {
+			printf("PANDORA ADSP: GPR in: opcode %#x token %u from domain %u port %#x, %u bytes\n", p.opcode, p.token,
+			    p.src_domain, p.src_port, p.size);
+		}
+		if (ad_gpr_up && !ad_spf_done) {
+			gpr_outcome(gpr_spf_receive(&ad_spf, ad_inbox[i].data, ad_inbox[i].len));
+		}
+	}
+	ad_inbox_n = 0;
+	if (!ad_gpr_up || ad_spf_done) {
+		return;
+	}
+	if (ad_answer_by && now >= ad_answer_by) {
+		ad_answer_by = 0;
+		ad_tx_len = 0;
+		if (gpr_spf_timeout(&ad_spf) == SpfDone) {
+			gpr_outcome(SpfDone);
+			return;
+		}
+		gpr_ask();
+	}
+	if (ad_retry_at && now >= ad_retry_at) {
+		ad_retry_at = 0;
+		gpr_ask();
+	}
+	if (ad_tx_len && qcom_glink_send(&ad_gl, ad_gpr, ad_tx, ad_tx_len) == QcomGlinkOk) {
+		ad_tx_len = 0;
+	}
+}
+
+static void
+gl_service(void)
+{
+	if (!ad_gl.rx.data) {
+		uint32_t size = 0;
+		volatile uint8_t *rx = smem_item(AD_ITEM_GL_RX, &size);
+		if (rx) {
+			qcom_glink_set_rx(&ad_gl, rx, size);
+			printf("PANDORA ADSP: GLINK item %u (%u bytes) there after %llu ms\n", AD_ITEM_GL_RX, size, ad_ms(ad_t0));
+		}
+	}
+	(void)qcom_glink_poll(&ad_gl);
+	gpr_step();
+}
+
+/* What changed in the link since the last report. */
+static void
+gl_report(bool force)
+{
+	static uint8_t agreed, broken;
+	static uint32_t unknown, ipcc_sum;
+	uint32_t sum = ad_ipcc_n[0] + ad_ipcc_n[1] + ad_ipcc_n[2] + ad_ipcc_n[3];
+	if (!force && agreed == ad_gl.version_agreed && broken == ad_gl.broken && unknown == ad_gl.unknown_opens &&
+	    ipcc_sum == sum) {
+		return;
+	}
+	agreed = ad_gl.version_agreed;
+	broken = ad_gl.broken;
+	unknown = ad_gl.unknown_opens;
+	ipcc_sum = sum;
+	ad_gl.unknown_names[sizeof(ad_gl.unknown_names) - 1] = 0;
+	printf("PANDORA ADSP: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
+	    "serves %u (%s); doorbells SMP2P %u GLINK %u AOP %u other %u (last %#x); inbox lost %u\n", ad_ms(ad_t0),
+	    agreed ? "agreed" : "not agreed", broken ? ", LINK BROKEN" : "", ad_gl.rx_messages, ad_gl.tx_messages,
+	    ad_gl.rx_data, ad_gl.dropped, unknown, ad_gl.unknown_names, ad_ipcc_n[0], ad_ipcc_n[1], ad_ipcc_n[2],
+	    ad_ipcc_n[3], ad_ipcc_other, ad_inbox_lost);
+}
+
+/* Windows, the SMEM partition, what the boot stages left, our SMP2P item, the doorbells. */
+static int
+adsp_comms_setup(void)
+{
+	ad_qmp = ad_map(AD_QMP_PA, 0x400, VM_WIMG_IO);
+	ad_ipcc = ad_map(AD_IPCC_PA, 0x1000, VM_WIMG_IO);
+	ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
+	ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
+	ad_smem_va = ad_map(AD_SMEM_PA, AD_SMEM_SIZE, VM_WIMG_IO);
+	ad_mutex = ad_map(AD_MUTEX_PA, 0x1000, VM_WIMG_IO);
+	if (!ad_qmp || !ad_ipcc || !ad_rsc || !ad_db || !ad_smem_va || !ad_mutex) {
+		printf("PANDORA ADSP: windows not mapped\n");
+		return ENOMEM;
+	}
+	ad_smem.base = (volatile uint8_t *)ad_smem_va;
+	ad_smem.size = AD_SMEM_SIZE;
+	int rc = qcom_smem_partition(&ad_smem, QCOM_SMEM_HOST_APPS, AD_PID, &ad_part);
+	if (rc) {
+		printf("PANDORA ADSP: no SMEM partition apps-ADSP: %d\n", rc);
+		return ENODEV;
+	}
+	static const uint16_t items[5] = {AD_ITEM_P2P_IN, AD_ITEM_P2P_OUT, AD_ITEM_GL_DESC, AD_ITEM_GL_TX, AD_ITEM_GL_RX};
+	char have[64];
+	have[0] = 0;
+	for (unsigned i = 0; i < 5; i++) {
+		uint32_t size = 0;
+		if (smem_item(items[i], &size)) {
+			char one[16];
+			snprintf(one, sizeof(one), " %u:%u", items[i], size);
+			strlcat(have, one, sizeof(have));
+		}
+	}
+	printf("PANDORA ADSP: SMEM partition at %#x size %#x hosts %u/%u, cacheline %u; items there:%s\n", ad_part.offset,
+	    ad_part.size, ad_part.host0, ad_part.host1, ad_part.cacheline, have[0] ? have : " none");
+	volatile uint8_t *in = smem_item(AD_ITEM_P2P_IN, NULL);
+	if (in) {
+		QcomSmp2p view;
+		bzero(&view, sizeof(view));
+		view.in = (volatile uint32_t *)in;
+		int index = qcom_smp2p_check_in(view.in, 0, AD_PID) ? -1 : qcom_smp2p_find_in(&view, "slave-kernel");
+		printf("PANDORA ADSP: SMP2P from an earlier start: slave-kernel %#x\n",
+		    index >= 0 ? qcom_smp2p_in_value(&view, index) : 0xffffffffu);
+	}
+	/* Our item before the DSP starts: it looks for it when it comes up. */
+	if ((rc = smem_alloc(AD_ITEM_P2P_OUT, QCOM_SMP2P_ITEM_BYTES))) {
+		return rc;
+	}
+	uint32_t osize = 0;
+	volatile uint8_t *out = smem_item(AD_ITEM_P2P_OUT, &osize);
+	if (!out || osize < QCOM_SMP2P_ITEM_BYTES) {
+		printf("PANDORA ADSP: SMP2P item %u is %u bytes\n", AD_ITEM_P2P_OUT, osize);
+		return EIO;
+	}
+	qcom_smp2p_init_out(&ad_p2p, (volatile uint32_t *)out, 0, AD_PID);
+	int stop = qcom_smp2p_add_entry(&ad_p2p, "master-kernel");
+	static const uint32_t ids[3] = {IPCC_LPASS_SMP2P, IPCC_LPASS_GLINK, IPCC_AOP_QMP};
+	for (unsigned i = 0; i < 3; i++) {
+		ad_wr(ad_ipcc, IPCC_RECV_ENABLE, ids[i]);
+	}
+	(void)ipcc_poll();
+	bzero(ad_ipcc_n, sizeof(ad_ipcc_n));
+	p2p_kick();
+	printf("PANDORA ADSP: SMP2P item %u made (entry master-kernel %d), doorbells enabled\n", AD_ITEM_P2P_OUT, stop);
+	return 0;
+}
+
+/* After the main image's reset: ready (or fatal) within 5 s, then GLINK and the APM question. */
+static void
+adsp_talk(int open_gpr)
+{
+	uint64_t until;
+	clock_interval_to_deadline(5000, NSEC_PER_MSEC, &until);
+	while (!(ad_slave & (SLAVE_READY | SLAVE_FATAL)) && mach_absolute_time() < until) {
+		(void)ipcc_poll();
+		p2p_service();
+		ad_sleep(1);
+	}
+	gl_report(true);
+	if (!(ad_slave & SLAVE_READY) || (ad_slave & SLAVE_FATAL)) {
+		printf("PANDORA ADSP: not ready after %llu ms (slave-kernel %#x)\n", ad_ms(ad_t0), ad_slave);
+		smem_crash_reason();
+		return;
+	}
+	printf("PANDORA ADSP: ready after %llu ms\n", ad_ms(ad_t0));
+	if (gl_start(open_gpr)) {
+		return;
+	}
+	/* From here on this thread only answers: every 1 ms for 30 s, then every 20 ms. */
+	uint64_t fast_until, next_report;
+	clock_interval_to_deadline(30000, NSEC_PER_MSEC, &fast_until);
+	clock_interval_to_deadline(5000, NSEC_PER_MSEC, &next_report);
+	for (;;) {
+		(void)ipcc_poll();
+		p2p_service();
+		gl_service();
+		uint64_t now = mach_absolute_time();
+		gl_report(now >= next_report);
+		if (now >= next_report) {
+			clock_interval_to_deadline(now < fast_until ? 5000 : 60000, NSEC_PER_MSEC, &next_report);
+		}
+		ad_sleep(now < fast_until ? 1 : 20);
+	}
+}
+
 static void
 adsp_boot(void)
 {
 	int err;
 	uint64_t b_dtb = 0, b_main = 0;
 	struct scm_res r;
-	if ((err = fw_dir())) {
-		return;
-	}
-	ad_rsc = ml_io_map(AD_RSC_PA, 0x10000);
-	ad_db = ml_io_map(AD_CMDDB_PA, AD_CMDDB_SIZE);
-	if (!ad_rsc || !ad_db) {
+	int open_gpr = 0;
+	(void)PE_parse_boot_argn("pandora_adsp_gpr", &open_gpr, sizeof(open_gpr));
+	if ((err = fw_dir()) || (err = adsp_comms_setup())) {
 		return;
 	}
 	(void)arc_vote("lcx.lvl", 384);
@@ -549,16 +1087,28 @@ adsp_boot(void)
 		/* Go on with the main image anyway: its answer tells more. */
 		printf("PANDORA ADSP: DTB image failed %d\n", err);
 	}
-	if ((err = pas_load("adsp", AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main)) ||
-	    (err = pas_auth(AD_PAS_MAIN))) {
+	if ((err = pas_load("adsp", AD_PAS_MAIN, AD_MEM_PA, AD_MEM_SIZE, &b_main))) {
+		printf("PANDORA ADSP: main image failed %d\n", err);
+		return;
+	}
+	ad_t0 = mach_absolute_time();
+	if ((err = pas_auth(AD_PAS_MAIN))) {
 		printf("PANDORA ADSP: main image failed %d\n", err);
 		return;
 	}
 	printf("PANDORA ADSP: ADSP released from reset\n");
-	ad_sleep(2000);
+	adsp_talk(open_gpr == 2);
+	/* adsp_talk returns only when the DSP did not come up: stop it, as qcom_pas_start's error path. */
+	scm_smc(SCM_FN(2, 6), SCM_ARGS(1), AD_PAS_MAIN, 0, 0, 0, &r);
+	printf("PANDORA ADSP: pas %u shutdown -> a0 %#llx a1 %#llx\n", AD_PAS_MAIN, r.a0, r.a1);
+	scm_smc(SCM_FN(2, 6), SCM_ARGS(1), AD_PAS_DTB, 0, 0, 0, &r);
+	printf("PANDORA ADSP: pas %u shutdown -> a0 %#llx a1 %#llx\n", AD_PAS_DTB, r.a0, r.a1);
+	if (!ad_handed) {
+		(void)arc_vote("lcx.lvl", 0);
+		(void)arc_vote("lmx.lvl", 0);
+	}
 	(void)b_main;
 	(void)b_dtb;
-	(void)r;
 }
 
 static void
