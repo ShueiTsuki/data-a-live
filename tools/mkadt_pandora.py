@@ -292,12 +292,16 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        # Its interrupt (patch 0221): the MDSS line, phone DT qcom,mdss_mdp@9800000 interrupts
+        # <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH> = INTID 115; SweetFramebuffer.cpp takes CTL0's frame start from it.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 83) + u32(4)),
         ]),
         # The Adreno 840 (patch 0216): its interrupt line for PandoraAdrenoGpu.cpp. The phone's DT
         # (qcom,kgsl-3d0@3d00000) gives kgsl_3d0_irq as <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH> = INTID 332.

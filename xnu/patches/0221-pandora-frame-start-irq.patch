@@ -1,0 +1,278 @@
+diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
+index 94a1fd2..47a3343 100644
+--- a/bsd/dev/pandora_dpu.c
++++ b/bsd/dev/pandora_dpu.c
+@@ -30,6 +30,8 @@
+ #if defined(PANDORA)
+ 
+ #include <vm/pmap.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ 
+ /*
+  * Mappings come from ml_io_map_unmappable (kernel_map), not ml_io_map: ml_io_map takes permanent space in the small
+@@ -463,6 +465,7 @@ sc_flush_idle(void)
+ }
+ 
+ static void sc_irq_probe(void);
++static void sc_irq_start(void);
+ 
+ int pandora_scanout_init(void);
+ int
+@@ -601,6 +604,7 @@ pandora_scanout_init(void)
+ 	sc.ready = true;
+ 	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
+ 	sc_irq_probe();
++	sc_irq_start();
+ 	return 0;
+ }
+ 
+@@ -809,6 +813,136 @@ sc_irq_probe(void)
+ 	}
+ }
+ 
++/*
++ * 0221: CTL0's frame start (INTR2 bit 9) as an interrupt, in place of polling for a flushed frame to be taken. The
++ * MDSS line (INTID 115, level) reaches SweetFramebuffer.cpp's filter, which calls pandora_scanout_irq: it clears the
++ * status, turns the bit's enable off again and wakes the waiter. The enable is on only while a frame waits to be taken
++ * (pandora_scanout_wait), so a still screen takes no interrupts. 1000 interrupts in a row with nothing of ours in the
++ * status (the line held by another MDSS block) turn the source off and the waits poll. Boot-arg pandora_scanout_irq=0:
++ * polling only.
++ */
++#define SC_INTR2_EN      (DPU_MDP + 0x08u)
++#define SC_INTR2_STATUS  (DPU_MDP + 0x0cu)
++#define SC_INTR2_CLEAR   (DPU_MDP + 0x2cu)
++#define SC_CTL0_START    (1u << 9)
++static int sc_frame_chan;
++static bool sc_irq_on;
++static void (*sc_irq_enable)(void);
++static uint32_t sc_irq_empty_run;
++static uint64_t sc_irq_count, sc_irq_starts, sc_irq_empty, sc_wait_slept, sc_wait_missed, sc_wait_polled;
++
++/* The display's interrupt filter (primary interrupt context): 0, or 1 to turn the source off. */
++int pandora_scanout_irq(void);
++int
++pandora_scanout_irq(void)
++{
++	sc_irq_count++;
++	const uint32_t st = sc.ready ? dpu_rd(SC_INTR2_STATUS) & SC_CTL0_START : 0;
++	if (st == 0) {
++		sc_irq_empty++;
++		if (++sc_irq_empty_run >= 1000) {
++			__atomic_store_n(&sc_irq_on, false, __ATOMIC_RELEASE);
++			if (sc.ready) {
++				dpu_wr(SC_INTR2_EN, 0);
++			}
++			thread_wakeup((event_t)&sc_frame_chan);
++			return 1;
++		}
++		return 0;
++	}
++	sc_irq_empty_run = 0;
++	dpu_wr(SC_INTR2_EN, 0);
++	dpu_wr(SC_INTR2_CLEAR, st);
++	sc_irq_starts++;
++	thread_wakeup((event_t)&sc_frame_chan);
++	return 0;
++}
++
++/* SweetFramebuffer.cpp: its event source exists (disabled); ENABLE turns it on once the pipes are ours. */
++void pandora_scanout_irq_attach(void (*enable)(void));
++void
++pandora_scanout_irq_attach(void (*enable)(void))
++{
++	sc_irq_enable = enable;
++}
++
++static void
++sc_irq_start(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("pandora_scanout_irq", &on, sizeof(on));
++	if (!on || !sc_irq_enable) {
++		printf("PANDORA SCANOUT: frame start by polling (%s)\n", on ? "no event source" : "pandora_scanout_irq=0");
++		return;
++	}
++	dpu_wr(SC_INTR2_EN, 0);
++	dpu_wr(SC_INTR2_CLEAR, SC_CTL0_START);
++	sc_irq_enable();
++	__atomic_store_n(&sc_irq_on, true, __ATOMIC_RELEASE);
++	printf("PANDORA SCANOUT: frame start interrupt on (CTL0 start, INTR2 bit 9, INTID 115)\n");
++}
++
++static bool
++sc_taken(uint32_t want)
++{
++	return (dpu_rd(DPU_CTL(0) + 0x18) & SC_FLUSH) == 0 && pandora_scanout_current(want);
++}
++
++/*
++ * Until the pipes have taken the frame at WANT (0: the panel memory): CTL0's flush bits clear and both pipes read it.
++ * Sleeps until the next frame start (the interrupt, enabled for this wait only; 2 ms slices in case one is missed),
++ * or polls every 250 us without it. False after LIMIT_NS.
++ */
++bool pandora_scanout_wait(uint32_t want, uint64_t limit_ns);
++bool
++pandora_scanout_wait(uint32_t want, uint64_t limit_ns)
++{
++	if (!sc.ready) {
++		return true;
++	}
++	uint64_t now = mach_absolute_time(), span, slice;
++	nanoseconds_to_absolutetime(limit_ns, &span);
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &slice);
++	const uint64_t end = now + span;
++	bool taken = sc_taken(want);
++	while (!taken && (now = mach_absolute_time()) < end) {
++		if (!__atomic_load_n(&sc_irq_on, __ATOMIC_ACQUIRE)) {
++			sc_wait_polled++;
++			delay(250);
++		} else {
++			(void)assert_wait_deadline((event_t)&sc_frame_chan, THREAD_UNINT, MIN(end, now + slice));
++			dpu_wr(SC_INTR2_CLEAR, SC_CTL0_START);
++			dpu_wr(SC_INTR2_EN, SC_CTL0_START);
++			if (sc_taken(want)) {
++				(void)clear_wait(current_thread(), THREAD_AWAKENED);
++				break;
++			}
++			sc_wait_slept++;
++			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && sc_taken(want)) {
++				sc_wait_missed++;
++			}
++		}
++		taken = sc_taken(want);
++	}
++	if (__atomic_load_n(&sc_irq_on, __ATOMIC_ACQUIRE)) {
++		dpu_wr(SC_INTR2_EN, 0);
++	}
++	return taken || sc_taken(want);
++}
++
++/* For SweetFramebuffer.cpp's stats: interrupts (frame starts, empty), waits that slept, found taken without their
++ * interrupt, polled. */
++void pandora_scanout_irq_counts(uint64_t out[5]);
++void
++pandora_scanout_irq_counts(uint64_t out[5])
++{
++	out[0] = sc_irq_count;
++	out[1] = sc_irq_starts;
++	out[2] = sc_wait_slept;
++	out[3] = sc_wait_missed;
++	out[4] = sc_wait_polled;
++}
++
+ /* 0218: whether CTL0 has taken the last flush (its bits clear at the frame that latches them), without waiting. */
+ bool pandora_scanout_flushed(void);
+ bool
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 983203c..f96ee7a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,6 +69,10 @@ extern "C" bool pandora_scanout_current(uint32_t addr);
+ extern "C" bool pandora_scanout_ready(void);
+ extern "C" void pandora_scanout_counts(uint64_t *shows, uint64_t *faults);
+ extern "C" bool pandora_scanout_flushed(void);
++extern "C" int pandora_scanout_irq(void);                        /* 0221 */
++extern "C" void pandora_scanout_irq_attach(void (*enable)(void));
++extern "C" bool pandora_scanout_wait(uint32_t want, uint64_t limit_ns);
++extern "C" void pandora_scanout_irq_counts(uint64_t out[5]);
+ #define SWEET_SCAN_MAPS 6
+ 
+ /* Dump header (block 0 of the dump area); frames follow at 4096, BGRA, tightly packed. */
+@@ -188,6 +192,7 @@ sweet_fb_scale(uint32_t p, uint32_t k)
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -328,6 +333,8 @@ public:
+ 	void scanPanel(void);
+ 	void scanTick(void);
+ 	bool scanSettle(void);
++	bool scanIrqFilter(IOFilterInterruptEventSource *source);
++	void scanIrqAction(IOInterruptEventSource *source, int count);
+ 	void presentLoop(void);
+ 	void displayOff(void);
+ 	bool swapDone(uint32_t id, uint32_t type);
+@@ -679,6 +686,31 @@ sweet_fb_present_thread(void *arg, wait_result_t)
+ {
+ 	static_cast<AppleCLCD *>(arg)->presentLoop();
+ }
++
++/* 0221: the display's interrupt (CTL0 frame start); bsd/dev/pandora_dpu.c enables it once the pipes are ours. */
++static IOFilterInterruptEventSource *gSweetScanIrq;
++
++static void
++sweet_scan_irq_enable(void)
++{
++	if (gSweetScanIrq != NULL) {
++		gSweetScanIrq->enable();
++	}
++}
++
++bool
++AppleCLCD::scanIrqFilter(IOFilterInterruptEventSource *source)
++{
++	if (pandora_scanout_irq() != 0) {
++		source->disable();   /* the line stayed up for another MDSS block: polling from now on */
++	}
++	return false;
++}
++
++void
++AppleCLCD::scanIrqAction(IOInterruptEventSource *, int)
++{
++}
+ #endif
+ 
+ bool
+@@ -772,6 +804,21 @@ AppleCLCD::start(IOService *provider)
+ #endif
+ 
+ #if defined(PANDORA)
++	if (provider->getProperty("IOInterruptSpecifiers") != NULL) {
++		IOFilterInterruptEventSource *irq = IOFilterInterruptEventSource::filterInterruptEventSource(this,
++		    OSMemberFunctionCast(IOInterruptEventSource::Action, this, &AppleCLCD::scanIrqAction),
++		    OSMemberFunctionCast(IOFilterInterruptEventSource::Filter, this, &AppleCLCD::scanIrqFilter), provider, 0);
++		if (irq != NULL && fWorkLoop->addEventSource(irq) == kIOReturnSuccess) {
++			irq->disable();
++			gSweetScanIrq = irq;
++			pandora_scanout_irq_attach(sweet_scan_irq_enable);
++		} else {
++			IOLog("SWEET FB: display interrupt source refused: frame starts by polling\n");
++			OSSafeReleaseNULL(irq);
++		}
++	} else {
++		IOLog("SWEET FB: no display interrupt in the device tree: frame starts by polling\n");
++	}
+ 	{
+ 		thread_t t;
+ 		if (kernel_thread_start(sweet_fb_present_thread, this, &t) != KERN_SUCCESS) {
+@@ -1228,12 +1275,8 @@ AppleCLCD::scanSettle(void)
+ 	}
+ 	const uint32_t want = fScanToPanel ? 0 : fScanQueuedAddr;
+ 	const uint64_t t0 = mach_absolute_time();
+-	uint64_t limit;
+-	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
+-	bool on;
+-	while (!(on = pandora_scanout_flushed() && pandora_scanout_current(want)) && mach_absolute_time() - t0 < limit) {
+-		delay(250);     /* a sleep, not a spin */
+-	}
++	/* 0221: asleep until the frame start that takes it (an interrupt), polling every 250 us without one. */
++	const bool on = pandora_scanout_wait(want, 50 * NSEC_PER_MSEC);
+ 	const uint64_t took = mach_absolute_time() - t0;
+ 	fLatchTime += took;
+ 	fLatchMax = MAX(fLatchMax, took);
+@@ -1752,6 +1795,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    screenAvg / 1000, screenMax / 1000);
+ 		fScreenSum = fScreenMax = 0;
+ 		fScreenCount = 0;
++		uint64_t irq[5];
++		pandora_scanout_irq_counts(irq);
++		IOLog("SWEET FB: display interrupts %llu (%llu frame starts); frame waits slept %llu, taken without the "
++		    "interrupt %llu, polled %llu\n", irq[0], irq[1], irq[2], irq[3], irq[4]);
+ #endif
+ 		uint64_t gpu_ns, cpu_ns;
+ 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
