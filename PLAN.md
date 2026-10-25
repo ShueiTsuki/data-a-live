@@ -196,6 +196,10 @@
 - 摄像头：iOS 相机依赖苹果 ISP 和私有驱动接口，高通 CAMSS 接不进去，没做。
 - 无人值守测试：`tools/ios_test.sh 名字 内核号 秒数 "附加参数"`，到时自动重启回安卓并取回日志 device/logs/名字.txt；日志文件 /data/local/tmp/ioslog.img（8 MiB，可删）。
 
+## 硬件适配：和 UniXNU sheng（SM8550）的寄存器核对（2026-10-25）
+- DeepSeek 按 `D:\DeepSeekHarness\regcheck\TASK.md` 做了核对表（`RESULT.md`，WiFi 40 项、ADSP/音频 36 项），我逐条对照原文复核（`VERIFY.md`）：大多数正确；改正 W08（pandora ATU 是 `0x410000000`）、A16/A28（GLINK 的 SMEM 项和 APM 端口是协议常数，两边相同）、W16 的时钟投票（寄存器和比特相同，多 phy_aux `0x52018` bit31、cfg_noc_pcie_anoc_ahb `0x52000` bit20）；W09 配置空间和 W31 MSI 只能上机确认。
+- 结论：ADSP 通信（SMEM、SMP2P、GLINK、GPR）两边编号一样，最好搬，接在我们已有的 `pandora_adsp.c` 后面；出声还要自己做播放图和两颗 CS35L43（sheng 也没做到）；WiFi 芯片不同（`cnss-peach`，PCIe ID `0x110e`，不是 WCN7850，主线 ath12k 也不认），固件和 MHI 配置要从手机自己的分区查。
+
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
 1. 固件：/vendor/firmware_mnt/image/adsp.mdt + adsp.b00–b40（约 30 MB）和 adsp_dtb.mdt，装进 pinned 文件，内核按扩展区读入保留内存（adspslpi_region@0xa1400000、q6_adsp_dtb_region@0xa1380000）。
