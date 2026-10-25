@@ -545,6 +545,7 @@ gpu_level3(void)
 #define GMU_SLOT          2u
 #define GMU_TABLE_PAGES   64u
 #define GPU_TABLE_PAGES   1024u     /* 4 MiB: the level-9 tables plus room for ~2 GiB of later 4K maps */
+#define GPU_INPUT_BITS    36u       /* 0219: the GPU context's addresses; room for the clients' 4 GiB windows */
 
 struct gmu_buf {
 	const char *name;
@@ -619,7 +620,7 @@ gpu_alloc_bufs(const char *who, struct gmu_buf *bufs, unsigned n)
  * routed to it through stream-match slot SLOT, all through ArmSmmu4K. */
 static bool
 smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned n, unsigned bank,
-    unsigned asid, unsigned slot, unsigned sid, unsigned tpages)
+    unsigned asid, unsigned slot, unsigned sid, unsigned tpages, unsigned want_in)
 {
 	uint64_t tpa;
 	vm_offset_t tva = gpu_contig(tpages * 0x1000ull, &tpa);
@@ -663,11 +664,15 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned 
 			return false;
 		}
 	}
-	c->tcfg = (ArmSmmu4KConfig){ 32, oas, tpa, (size_t)leaves };
+	/* 0219: input size WANT_IN when the upstream bus carries it (ID2.UBS: 32 36 40 42 44 49 64 bits), else 32. */
+	static const uint8_t ubs_bits[16] = {32, 36, 40, 42, 44, 49, 64};
+	const unsigned ubs = ((id2 >> 8) & 15) < 7 ? ubs_bits[(id2 >> 8) & 15] : 32;
+	const unsigned in = want_in <= ubs ? want_in : 32;
+	c->tcfg = (ArmSmmu4KConfig){ in, oas, tpa, (size_t)leaves };
 	ArmSmmu4KStatus st = ArmSmmu4KBuild(&c->tcfg, ranges, n, (uint64_t *)tva, tpages, &c->tables);
 	printf("PANDORA GPU: %s tables: status %d root %#llx pages %zu leaves %zu start level %u mair %#llx "
-	    "(oas %u, id0 %08x id1 %08x id2 %08x)\n", who, st, c->tables.root_physical, c->tables.table_pages,
-	    c->tables.leaf_pages, c->tables.start_level, c->tables.mair, oas, id0, id1, id2);
+	    "(in %u, oas %u, id0 %08x id1 %08x id2 %08x)\n", who, st, c->tables.root_physical, c->tables.table_pages,
+	    c->tables.leaf_pages, c->tables.start_level, c->tables.mair, in, oas, id0, id1, id2);
 	if (st != ArmSmmu4KSuccess) {
 		return false;
 	}
@@ -730,7 +735,7 @@ gpu_level4a(void)
 {
 	return gpu_alloc_bufs("GMU", gmu_bufs, GMU_NBUFS) &&
 	       smmu_ctx_up("GMU", &gmu_smmu, gmu_bufs, GMU_NBUFS, GMU_BANK, GMU_ASID, GMU_SLOT, GMU_SID,
-	           GMU_TABLE_PAGES);
+	           GMU_TABLE_PAGES, 32);
 }
 
 /* ---- level 5 (4b): GMU cold start --------------------------------------------------- */
@@ -1433,7 +1438,7 @@ gpu_level9(void)
 	    w[0], w[1], w[2], w[3]);
 	kfree_data(sqe, (vm_size_t)len);
 	return smmu_ctx_up("GPU", &gpu_smmu, gpu_bufs, GPU_NBUFS, GPU_BANK, GPU_ASID, GPU_SLOT, GPU_SID,
-	    GPU_TABLE_PAGES);
+	    GPU_TABLE_PAGES, GPU_INPUT_BITS);
 }
 
 /* ---- level 10: the CP ------------------------------------------------------------------- */
@@ -2231,10 +2236,30 @@ static struct {
 	char name[24];                  /* the opening process (patch 0189: the watch log) */
 	uint32_t allocs, imports, maps, submits, frees, fence;
 } gpu_clients[GPU_MAX_CLIENTS];
-static const uint64_t gpu_window[GPU_MAX_CLIENTS][2] = {
+/*
+ * 0219: client windows. With the GPU context's input at 36 bits (GPU_INPUT_BITS) each client gets 4 GiB from
+ * 4 GiB * (client + 1), as msm gives each process a private 4 GiB at 0x1_0000_0000
+ * (adreno_private_address_space_size); one shared table here, so the windows sit side by side. r2g: in the 32-bit
+ * layout below backboardd had a 178 MiB window (vktest had opened first and taken the 1 GiB one) and ran out of it:
+ * CoreAnimation's frame buffers were refused (OutOfMemory) and those frames went to the screen undrawn. The 32-bit
+ * layout (NativeAdrenoPublish's) stays for an SMMU that cannot take 36 bits.
+ */
+static const uint64_t gpu_window32[GPU_MAX_CLIENTS][2] = {
 	{ 0x20000000ull, 0x40000000ull }, { 0x60000000ull, 0xaaa9000ull },
 	{ 0x6aaa9000ull, 0xaaa9000ull }, { 0x75552000ull, 0xaaa9000ull },
 };
+
+static void
+gpu_window_of(unsigned client, uint64_t *start, uint64_t *size)
+{
+	if (gpu_smmu.tcfg.input_bits >= 36) {
+		*start = (uint64_t)(client + 1) << 32;
+		*size = 1ull << 32;
+	} else {
+		*start = gpu_window32[client][0];
+		*size = gpu_window32[client][1];
+	}
+}
 static bool gpu_ready;
 static uint32_t gpu_bo_gen;
 static uint32_t gpu_chip_id = 0x44050a01u;
@@ -2432,8 +2457,7 @@ pandora_gpu_open(void)
 		if (!gpu_clients[i].used) {
 			gpu_clients[i].used = true;
 			gpu_clients[i].reset = true;
-			gpu_clients[i].va_start = gpu_window[i][0];
-			gpu_clients[i].va_size = gpu_window[i][1];
+			gpu_window_of(i, &gpu_clients[i].va_start, &gpu_clients[i].va_size);
 			gpu_clients[i].allocs = gpu_clients[i].imports = gpu_clients[i].maps = 0;
 			gpu_clients[i].submits = gpu_clients[i].frees = gpu_clients[i].fence = 0;
 			proc_selfname(gpu_clients[i].name, sizeof(gpu_clients[i].name));
@@ -2441,6 +2465,10 @@ pandora_gpu_open(void)
 		}
 	}
 	lck_mtx_unlock(&gpu_lock);
+	if (c >= 0) {
+		printf("PANDORA GPU: client %d (%s) window %#llx+%#llx\n", c, gpu_clients[c].name, gpu_clients[c].va_start,
+		    gpu_clients[c].va_size);
+	}
 	return c;
 }
 
@@ -3155,19 +3183,30 @@ gpu_hang_dump(uint32_t ring)
 static void
 gpu_watch(void)
 {
-	char last[GPU_MAX_CLIENTS][96] = {};
+	char last[GPU_MAX_CLIENTS][160] = {};
 	uint32_t last_ring = ~0u, last_fsr = 0, dumped = ~0u, last_issued = 0;
 	for (unsigned t = 0; ; t++) {   /* 0193: as long as the system runs (lines only on change) */
 		gpu_sleep(5000);
 		lck_mtx_lock(&gpu_lock);
+		/* 0219: how much of each window is mapped, and of the pool taken (allocations; imports are the caller's pages). */
+		uint64_t mapped[GPU_MAX_CLIENTS] = {}, pooled = 0;
+		for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
+			const struct gpu_bo *b = &gpu_bos[j];
+			if (b->used && b->client >= 0 && b->client < (int)GPU_MAX_CLIENTS) {
+				mapped[b->client] += b->iova ? b->bytes : 0;
+				pooled += b->pages ? 0 : b->bytes;
+			}
+		}
 		for (unsigned i = 0; i < GPU_MAX_CLIENTS; i++) {
-			char now[96];
+			char now[160];
 			if (!gpu_clients[i].used) {
 				snprintf(now, sizeof(now), "-");
 			} else {
-				snprintf(now, sizeof(now), "%s alloc %u import %u map %u free %u submit %u fence %u",
+				snprintf(now, sizeof(now), "%s alloc %u import %u map %u free %u submit %u fence %u; "
+				    "mapped %llu of %llu MiB, pool %llu of %llu MiB",
 				    gpu_clients[i].name, gpu_clients[i].allocs, gpu_clients[i].imports, gpu_clients[i].maps,
-				    gpu_clients[i].frees, gpu_clients[i].submits, gpu_clients[i].fence);
+				    gpu_clients[i].frees, gpu_clients[i].submits, gpu_clients[i].fence, mapped[i] >> 20,
+				    gpu_clients[i].va_size >> 20, pooled >> 20, gpu_pool_bytes >> 20);
 			}
 			if (strcmp(now, last[i]) != 0) {
 				printf("PANDORA GPU WATCH: %u s client %u: %s\n", (t + 1) * 5, i, now);
