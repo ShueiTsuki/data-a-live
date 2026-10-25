@@ -231,6 +231,17 @@
   2. 第一次出声就按安卓：两颗功放加载扬声器保护固件、各自的系数、出厂校准（运行时从手机 persist 分区读，不进仓库）和 music 调音，`PCM Source = DSP`，寄存器照安卓放音时的实际值（`D:\DeepSeekHarness\speakercheck\raw\during\`，注意文件名 T/B 标反了）；DSP 图照安卓：共享内存端点 → PCM 解码 → PCM 转换 → SPR → TDM 端点，48 kHz / 32 位 / 2 声道，ASPTX 反馈接回 SPR。不做"先直通出声"这一步。功放的文件在 odm 分区（不是 FAT），放进固定固件包。
   3. 接 iOS，照真 iPhone 的方式：先查 iOS 16（iPhone X）自己的音频驱动栈怎么认设备，让 iOS 自己的音频软件直接驱动我们的设备，不另做音频服务器插件。喇叭 / 听筒切换（GPIO174）、音量都按 iOS 的做法。
   4. 做不到的：安卓主处理器这侧的 Dolby DAP 是闭源的用户空间音效，搬不过来。从 HAL 往下（DSP 流程、TDM、功放固件、校准、增益）能做到和安卓一样。
+- 更好的做法（2026-10-26 用户同意）：DSP 用安卓 AAudio 的 MMAP 放音那条路（`vendor_audio_policy_configuration.xml` 的 `mmap_no_irq_out` 接到 Speaker 和 Earpiece），DSP 自己从环形缓冲取数据、把位置和时刻写回共享内存；iOS 那侧按 iPhone X 内置音频用的 `IOAudio2Family` 写原生设备，iOS 音频服务器混好的声音直接写进 DSP 读的缓冲；端点、槽、时钟、功放、数据流、缓冲都写进 ADT，换机器换描述。要先查的三件交给 DeepSeek：`D:\DeepSeekHarness\mmapcheck`、`iosaudiocheck`、`ampfwcheck`（电池那份是 `battcheck`）。
+- **spk1（2026-10-26，k0234，`pandora_spk=2`）：第 1 步的硬件准备都通了。**
+  - apps SMMU：引导程序配的 7 个表项用的是上下文 0–5，最后一个上下文 80 没人用；固件把写进去的"直通"读回成"报错"（`000200ff`），和 Linux 的 qcom 处理、sheng 遇到的一样，所以上下文 80 设成不翻译（SCTLR 0、CBAR `00010000`），新表项 7（`0x1001`/`0x80`）、8（`0x1041`/`0x20`）指向它，读回都对。
+  - DSP 缓冲：ADT `/chosen pandora-dsp-shm` = 0xb0000000 + 1 MiB，写合并映射；APM 登记（地址高位放 1）给了句柄，注销状态 0。
+  - TDM 引脚 GPIO 122–125 从 `0x1`（下拉、GPIO）改成 `0xc4`（功能 1、8 mA、不上下拉）；PRM 位时钟申请（3.072 MHz、属性 4）答复状态 0，2 秒后释放状态 0。PRM 答复的负载是 {参数号 `0x0800102C`, 状态}。
+  - 电池：小米 MCA 协议通了，每 20 秒一轮：`pack_vbat` 4213–4388（应是 mV），`pack_ibat` 343–4463（mA，方向待定），`pack_tbat` 27→39（℃，GPU 测试时在升温），`bus_volt` 约 5 000 000（µV），`chg_status` 3、`chg_type` 3（含义待定）。开道后第一个请求的答复晚到 1 秒以上，之后都按时。百分比要读电量计。
+  - 功放 I2C：连写 3 个、连读 3 个寄存器都对（中断屏蔽读回 `ffffffff 3fffffff ffffffff`）；连读 17 个超了单次 64 字节的上限（已改成 128，下次测）。TX/RX FIFO 都是 32 个字。
+  - GPU 同时正常：vktest PASS 17，没有失败。
+- TDM 端点参数的线索：libagm.so 常量表 0xd448 `0x08001063`/12 字节（接口配置），0xd478 `0x0800113D`/28 字节，尺寸正好是 DeepSeek 说的 48 字节"槽配置"块（16 字节头 + 28 + 4）。搭图时对照反汇编确认。
+- 电量计总线（`i2c@a94000`）：QUP 包装层 1 的 SE5，SDA GPIO 52、SCL GPIO 53，功能 1（qup1_se5），上拉 2 mA；主线 gcc-kaanapali.c：SE5 分支 0x18508（投票 0x52008 位 27），时钟源 0x18518，包装层核心 0x23148/0x2315c（位 19/18），从 AHB 0x23144（位 21）。设备树的时钟编号是安卓自己的，和主线头文件对不上，按引脚功能名对。共用的问题查清前不碰这条总线。
+- 功放固件大小：`.wmfw` 37.5 KB（Halo 核，要写进 DSP 的 PM 19.3 KB、XM 约 4.2 KB、YM 40 字节），系数 `.bin` 14 KB，场景 delta 约 4.7 KB；按 100 kHz 的 I2C 每颗约 4 秒，以后提到 400 kHz 或 1 MHz。
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
 1. 固件：/vendor/firmware_mnt/image/adsp.mdt + adsp.b00–b40（约 30 MB）和 adsp_dtb.mdt，装进 pinned 文件，内核按扩展区读入保留内存（adspslpi_region@0xa1400000、q6_adsp_dtb_region@0xa1380000）。
 2. 安全世界启动：SCM PAS 调用（init_image / mem_setup / auth_and_reset，两个镜像），这代芯片的元数据缓冲要先通过 SHM bridge 登记；通过 AOP 的 QMP 消息给 ADSP 上电，RPMh 投 LCX/LMX 电压。
@@ -377,7 +388,7 @@
 - **帧率**：屏幕 120 Hz 刷新，iOS 按 iPhone X 的 60 Hz 画；要 120 帧得让 iOS 把屏幕当高刷屏，另做。
 - **未解决**：mtltest 第 9 部分（9a–9c，填充三角形 992/4096 像素没画到）在 r2f、r2g、r2h 一样失败，不是这轮改出来的，待查；r1c 照片小组件"无可用内容"一段时间乱码：用户说之后可能已不再出现，没再看到就不追（GMEM 测试已排除 GMEM）。
 - **待查（2026-10-26 用户报）**：在后台（多任务界面）划掉 App 时，整个界面几秒点不动。adsp2 测试进行中报的，还没确认是不是只在这次出现。普通 App 不是 GPU 客户端（只有 NativeAdrenoMetal.clients 里的 bluetoothd、vktest、mtltest、backboardd 拿 GPU），所以不是 App 的 GPU 地址空间拆除；adsp2 日志里没有对应的超时记录，要开分析器专门测。fw1（0229）里用户反复划掉后台、开 App 压力测试：不再卡，开 App 也不掉帧（2026-10-26），不再追。
-- **待查（2026-10-26 用户报）**：电池一直显示"充电中 100%"。现在的电池是 ios-sweet 带来的替身服务 `SweetBattery.cpp`，数字是写死的，不读硬件（它的真实读数路径是 sweet 的 PM6150，不是这台手机）。pandora 的电量由 SOCCP 管，不是 ADSP：设备树 `pmic-glink` 走 GLINK 通道 "PMIC_RTR_SOCCP_APPS"，SOCCP 的 remote-pid 19，IPCC 客户端 13 信号 0，还有小米的 `mca,adsp_glink`。和 ADSP 用的是同一套 SMEM/GLINK 代码，ADSP 通了以后可以接着做；sheng 的 ShengBattmgr.c（高通 battmgr 协议）可参考。要先查 SOCCP 开机时是不是已经由引导程序启动了。
+- **待查（2026-10-26 用户报）**：电池一直显示"充电中 100%"。现在的电池是 ios-sweet 带来的替身服务 `SweetBattery.cpp`，数字是写死的，不读硬件（它的真实读数路径是 sweet 的 PM6150，不是这台手机）。pandora 的电量由 SOCCP 管，不是 ADSP：设备树 `pmic-glink` 走 GLINK 通道 "PMIC_RTR_SOCCP_APPS"，SOCCP 的 remote-pid 19，IPCC 客户端 13 信号 0，还有小米的 `mca,adsp_glink`。和 ADSP 用的是同一套 SMEM/GLINK 代码，ADSP 通了以后可以接着做；sheng 的 ShengBattmgr.c（高通 battmgr 协议）可参考。要先查 SOCCP 开机时是不是已经由引导程序启动了。（2026-10-26 进展：SOCCP 由引导程序启动，我们接上它的 GLINK 会话（0231）；电池走小米 MCA 协议，电压、电流、温度能读到（spk1）；百分比在主处理器 I2C 上的 bq27z561 电量计，等 `D:\DeepSeekHarness\battcheck` 查清那条共用总线。电池服务还用替身数字。）
 
 ### iOS 显示接口调查（2026-10-25，QuartzCore + IOMobileFramebuffer 反汇编，原版 iPhone X 内核）
 - **帧节奏**：CA 的 `CADeviceUseVBL` 按 MobileGestalt `ChipID` 决定用不用硬件垂直同步，只有 0x7000、0x8000–0x8004、0x8010（A8–A10）用；A11（iPhone X，0x8015）不用，CA 自己开定时器（EAGLServer 里 0x30d 标志第 1 位为 0 → add_vsync_source 走定时器）。所以 CA 不需要我们的垂直同步通知；显示中断只给我们自己的上屏线程用。
