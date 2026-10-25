@@ -49,7 +49,7 @@ for p in "$NM"/bridge/patches/000*.patch; do
 	fi
 done
 # data-a-live's own runtime changes (tools/metal/m2v/NNNN-*.patch, made against the tree above), in order.
-for p in "$(dirname "$0")"/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
+for p in "$(cd "$(dirname "$0")" && pwd)"/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
 	[ -e "$p" ] || continue
 	if git -C "$M2V" apply --reverse --check "$p" 2>/dev/null; then
 		echo "   m2v/$(basename "$p") (already applied)"
