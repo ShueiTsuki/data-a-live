@@ -48,6 +48,16 @@ for p in "$NM"/bridge/patches/000*.patch; do
 		git -C "$M2V" apply "$p"
 	fi
 done
+# data-a-live's own runtime changes (tools/metal/m2v/NNNN-*.patch, made against the tree above), in order.
+for p in "$(dirname "$0")"/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
+	[ -e "$p" ] || continue
+	if git -C "$M2V" apply --reverse --check "$p" 2>/dev/null; then
+		echo "   m2v/$(basename "$p") (already applied)"
+	else
+		echo "   m2v/$(basename "$p")"
+		git -C "$M2V" apply "$p"
+	fi
+done
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
 cat > "$B/Cargo.toml" <<EOF
@@ -100,12 +110,16 @@ PY
 	COMPAT=(-I "$B/gen/compat")
 fi
 # -x drops local symbols (strip -x).
-clang++ "${BASE[@]}" "${LINK[@]}" "${COMPAT[@]}" -std=c++17 -fobjc-arc -Wno-deprecated-declarations -bundle \
-	-I "$NA" -I "$U/kits/AdrenoPM4" -I "$MESA/include" -I "$B/gen" \
-	-x objective-c++ "$NM/NativeAdrenoMetalPlugin.mm" "$NM/NativeBridgeMetalFrontend.mm" -x none \
-	"$B/AdrenoPM4.o" "$BRIDGE" -Wl,-dead_strip -Wl,-x -Wl,-adhoc_codesign -lobjc \
-	-framework Foundation -framework Metal -framework IOSurface \
-	-o "$BUNDLE/NativeAdrenoMetal"
+PLUGIN_LINK=("${BASE[@]}" "${LINK[@]}" "${COMPAT[@]}" -std=c++17 -fobjc-arc -Wno-deprecated-declarations -bundle
+	-I "$NA" -I "$U/kits/AdrenoPM4" -I "$MESA/include" -I "$B/gen"
+	-x objective-c++ "$NM/NativeAdrenoMetalPlugin.mm" "$NM/NativeBridgeMetalFrontend.mm" -x none
+	"$B/AdrenoPM4.o" "$BRIDGE" -Wl,-dead_strip -Wl,-adhoc_codesign -lobjc
+	-framework Foundation -framework Metal -framework IOSurface)
+clang++ "${PLUGIN_LINK[@]}" -Wl,-x -o "$BUNDLE/NativeAdrenoMetal"
+# data-a-live: the same link with its local symbols, for tools/prof.py to name the phone's samples (never
+# installed; dropping local symbols moves no code, so its addresses are the bundle's).
+clang++ "${PLUGIN_LINK[@]}" -o "$OUT/NativeAdrenoMetal.symbols"
+rm -rf "$OUT/NativeAdrenoMetal.symbols.dSYM"
 rm -rf "$BUNDLE/NativeAdrenoMetal.dSYM"
 # Signed again as codesign -s - --identifier does on CI (lld's own signature is a linker-signed one).
 rcodesign sign --binary-identifier org.blu-sharky.NativeAdrenoMetal "$BUNDLE/NativeAdrenoMetal" 2>/dev/null
