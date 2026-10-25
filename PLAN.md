@@ -317,6 +317,25 @@
   - 然后用 hfsplus 模块只读挂载，再用 unifiedlog_iterator 解析；
   - 解析出的时间戳会被压缩，计时以内核日志和 backboardd 自己记的耗时为准。
 
+## 着色器预热（2026-10-26 用户加入，以后做）
+目的：第一次打开某个界面或 App 时，不再因为现编着色器而卡一下。照 UniXNU 主仓库 16e592a（docs/drivers/adreno-metal.md）的做法，按这块芯片和 iOS 16 调整：
+1. 管线缓存跨重启保留：编好的管线导出到磁盘，下次开机直接用。
+2. 空闲时预热：渲染服务（backboardd）在桌面空闲时，把系统镜像里所有 Metal 着色器库提前编一遍；要编的库列在一个清单文件里（上游叫 NativeAdrenoMetal.primelist），随固件包装进去。渲染服务的沙盒读不到的库（上游是 cryptex 里的 QuartzCore 库）另拷一份。
+3. 不抢当前画面：只在显卡提交少的时候做（上游门槛：每 250 ms 超过 8 个命令缓冲就暂停；我们的门槛要在这台手机上量桌面空闲时的提交数再定）。
+- 我们先要查：我们的插件版本（NativeMetal c6d29ca + adapt_ios16.py）是否已经有跨重启的管线缓存；iOS 16 的系统镜像里有哪些 Metal 库、哪些在 backboardd 沙盒外；上游清单和预热代码在 NativeMetal 哪个提交。
+- 验证：预热前后各开一遍同一组界面和 App，用分析器看着色器编译的时间是否从首次打开时消失；桌面空闲时不掉帧。
+
+## 原版壁纸（2026-10-26 用户加入，以后做）
+- 现状：iOS 16 默认壁纸的图层是 HEIC，也就是用 HEVC 视频编码存的图片。iPhone X 靠苹果自己的视频解码硬件来解（系统里是 AppleD5500 / AppleVXD393 那一套驱动），这台手机没有这块硬件。所以现在的文件安装器（补丁 0147）用 `tools/mkwallpaper.py` 把这些图层换成 PNG 再装进去。
+- 目标：用原版的 HEIC 图层，不再换成 PNG。
+- 先查清楚：
+  - iOS 的图片库（ImageIO）解 HEIC 时走哪条路：是不是只走 VideoToolbox 的硬件解码，有没有软件解码可以退回去；
+  - 去掉 PNG 以后，系统日志里 VideoToolbox / ImageIO 报的是什么错。`docs/GPU_PLAN.md` 第 6 项还没有结论。
+- 可能的做法，查清以后再选，选之前先问用户：
+  1. 给 iOS 提供一个它认得的 HEVC 软件解码器，只解静态图片，用 CPU 解；
+  2. 驱动这块芯片自己的视频硬件（高通 Iris），接到 iOS 的解码接口上。工作量大，但视频播放也能一起受益。
+- 验证：去掉替换用的 PNG 以后，原版壁纸各层都显示正确，包括亮色、暗色两种外观和景深效果。
+
 ## GPU、显示、CPU 休眠：第 1 轮（2026-10-25，k0215，日志 r1c）
 用户要求：GPU 换掉 sysmem 模式；翻译层要做得好，不偷工减料；每帧 CPU 拷屏要解决；CPU 核要能深度休眠；"大核优先"不是官方做法（官方是苹果的 AMP 调度加性能控制器的核推荐），以后换掉。
 - **日期时间（0214）**：PMK8850 的 RTC 加安卓的偏移，iOS 时间正确（状态栏显示太平洋时间，时区由用户在设置里改）。
@@ -350,7 +369,7 @@
 - **内存**：iOS 用 5 GiB 那块内存里的约 4 GiB（扣 1 MiB 崩溃日志、1 GiB GPU 内存池）；高地址那块约 3.9 GiB 还没给 iOS。
 - **帧率**：屏幕 120 Hz 刷新，iOS 按 iPhone X 的 60 Hz 画；要 120 帧得让 iOS 把屏幕当高刷屏，另做。
 - **未解决**：mtltest 第 9 部分（9a–9c，填充三角形 992/4096 像素没画到）在 r2f、r2g、r2h 一样失败，不是这轮改出来的，待查；r1c 照片小组件"无可用内容"一段时间乱码：用户说之后可能已不再出现，没再看到就不追（GMEM 测试已排除 GMEM）。
-- **待查（2026-10-26 用户报）**：在后台（多任务界面）划掉 App 时，整个界面几秒点不动。adsp2 测试进行中报的，还没确认是不是只在这次出现。普通 App 不是 GPU 客户端（只有 NativeAdrenoMetal.clients 里的 bluetoothd、vktest、mtltest、backboardd 拿 GPU），所以不是 App 的 GPU 地址空间拆除；adsp2 日志里没有对应的超时记录，要开分析器专门测。
+- **待查（2026-10-26 用户报）**：在后台（多任务界面）划掉 App 时，整个界面几秒点不动。adsp2 测试进行中报的，还没确认是不是只在这次出现。普通 App 不是 GPU 客户端（只有 NativeAdrenoMetal.clients 里的 bluetoothd、vktest、mtltest、backboardd 拿 GPU），所以不是 App 的 GPU 地址空间拆除；adsp2 日志里没有对应的超时记录，要开分析器专门测。fw1（0229）里用户反复划掉后台、开 App 压力测试：不再卡，开 App 也不掉帧（2026-10-26），不再追。
 - **待查（2026-10-26 用户报）**：电池一直显示"充电中 100%"。现在的电池是 ios-sweet 带来的替身服务 `SweetBattery.cpp`，数字是写死的，不读硬件（它的真实读数路径是 sweet 的 PM6150，不是这台手机）。pandora 的电量由 SOCCP 管，不是 ADSP：设备树 `pmic-glink` 走 GLINK 通道 "PMIC_RTR_SOCCP_APPS"，SOCCP 的 remote-pid 19，IPCC 客户端 13 信号 0，还有小米的 `mca,adsp_glink`。和 ADSP 用的是同一套 SMEM/GLINK 代码，ADSP 通了以后可以接着做；sheng 的 ShengBattmgr.c（高通 battmgr 协议）可参考。要先查 SOCCP 开机时是不是已经由引导程序启动了。
 
 ### iOS 显示接口调查（2026-10-25，QuartzCore + IOMobileFramebuffer 反汇编，原版 iPhone X 内核）
