@@ -230,6 +230,8 @@ def main():
     ap.add_argument('--top', type=int, default=40)
     ap.add_argument('--callers', default=CALLERS)
     ap.add_argument('--image', default='')
+    ap.add_argument('--under', action='append', default=[],
+                    help='a function (regex): what it calls directly, and the functions its samples end in')
     a = ap.parse_args()
     images, total, cache_base, cache_slide, kernel_slide, nrep = parse_log(a.log, a.reports)
     counts = total['pc']
@@ -322,6 +324,39 @@ def main():
                 print('    nearest plugin/QuartzCore/Turnip frame:')
                 for g, c in app_callers[name].most_common(8):
                     print('     %5.1f%%  %s' % (100.0 * c / tot, g))
+
+    for pattern in a.under:
+        # The samples whose stack holds a function matching PATTERN (its outermost appearance): the frame it called
+        # (one nearer the leaf), and the leaf function itself.
+        want = re.compile(pattern)
+        callees, leaves = collections.Counter(), collections.Counter()
+        tot, all_w = 0, 0
+        root = None
+        for (lr, f), (u, k) in stacks.items():
+            fr = frames(n, False, f[0], lr, f[1:])
+            w = u + k
+            all_w += w
+            hits = [i for i, name in enumerate(fr) if want.search(name.split('  [')[0])]
+            if not hits:
+                continue
+            i = hits[-1]
+            root = root or fr[i]
+            tot += w
+            j = i - 1
+            while j >= 0 and fr[j] == fr[i]:
+                j -= 1
+            callees[fr[j] if j >= 0 else '(itself)'] += w
+            leaves[fr[0] if fr[0] != fr[i] else '(itself)'] += w
+        if not tot:
+            print('\n== under %s: no samples' % pattern)
+            continue
+        print('\n== under %s: %.1f%% of all samples (%s)' % (pattern, 100.0 * tot / all_w, root))
+        print('-- what it calls (share of its samples)')
+        for g, c in callees.most_common(a.top):
+            print('  %5.1f%%  %s' % (100.0 * c / tot, g))
+        print('-- where its samples end')
+        for g, c in leaves.most_common(a.top):
+            print('  %5.1f%%  %s' % (100.0 * c / tot, g))
 
     chains = total['kc']
     if chains:
