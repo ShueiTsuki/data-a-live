@@ -265,4 +265,485 @@ pandora_dpu_probe(uint64_t fb)
 	dpu_sample("t0+100ms", pipes);
 	dpu_smmu(fetch, fb);
 }
+
+/*
+ * Patch 0217: the display scans out iOS's frames itself, as an iPhone's display does, instead of a CPU copy of
+ * every frame into the ABL's panel memory (2.4 ms a frame, r1c). iokit/Kernel/arm/SweetFramebuffer.cpp decides
+ * per frame; this part owns the hardware:
+ *
+ * SMMU. The display stream (SID 0x800 mask 2) reaches memory through apps SMMU bank 2 with translation off,
+ * so it can read only what lies at a 32-bit physical address, and iOS's surfaces are wired kernel pages above
+ * 4 GiB. Mainline Linux keeps the DPU behind its SMMU with 32-bit IOVAs; here likewise: a free context bank
+ * gets 4K stage-1 tables (ArmSmmu4K) that map the ABL's panel memory (main and rear screen, both read
+ * now) at the same addresses, the bank is enabled, and only then the stream's S2CR is pointed at it in one
+ * write. Surfaces are mapped into 16 MiB slots from 0x80000000. ACTLR is the DT's for SID 0x800 (qcom,actlr
+ * 0x1). Any fault in the bank in the first 100 ms points the stream back at bank 2 and leaves the CPU copy.
+ *
+ * Pipes. Main screen: CTL0 -> INTF1 (DSI0), source split over LM0/LM1: VIG0 fills x 0-609 and VIG1 x 610-1219
+ * of the 1220x2656 panel. A frame is shown by giving both pipes the surface: source rectangles, stride and
+ * address in their REC0 blocks, and with sweetfb_fill the QSEED3 scaler (bilinear, no LUT, phase step
+ * src/dst in 21-bit fixed point, QSEED4 preload 4/2), all as mainline dpu_hw_sspp_v13.c / dpu_plane.c program
+ * them, then CTL0 FLUSH (VIG0 bit 0, VIG1 bit 1, CTL bit 17). Command mode with autorefresh latches the
+ * flushed registers at the next frame (120 Hz). The ABL's values are kept and written back for the panel
+ * memory (console, display off, frames the pipes cannot take).
+ */
+#include <sys/errno.h>
+#include <vm/vm_kern.h>
+#include <vm/pmap.h>
+#include <arm/caches_internal.h>
+#include "adreno/ArmSmmu4K.h"
+#include "adreno/ArmSmmu4KContext.h"
+#include "adreno/ArmSmmu4KProgram.h"
+#include "adreno/ArmSmmu4KMmio.h"
+
+extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* as bsd/dev/pandora_gpu.c */
+
+#define SC_SMMU_BYTES     0x100000u          /* DT apps-smmu@15000000 reg */
+#define SC_SMR_VALID      (1u << 31)
+#define SC_ACTLR          0x1u               /* DT qcom,actlr <0x800 0x02 0x01> */
+#define SC_TABLE_PAGES    192u
+#define SC_SLOT_BASE      0x80000000u
+#define SC_SLOT_BYTES     (16u << 20)
+#define SC_SLOTS          16u
+#define SC_PIPES          2u                 /* VIG0, VIG1 */
+#define SC_FLUSH          ((1u << 0) | (1u << 1) | (1u << 17))
+#define SC_PANEL_W        1220u
+#define SC_HALF_W         610u
+#define SC_PANEL_H        2656u
+/* REC block registers (dpu_hw_sspp_v13.c) */
+#define SC_OP_MODE        0x08u
+#define SC_SRC_SIZE       0x14u
+#define SC_SRC_XY         0x18u
+#define SC_OUT_SIZE       0x1cu
+#define SC_OUT_XY         0x20u
+#define SC_PIX_EXT_LR     0x24u
+#define SC_PIX_EXT_TB     0x28u
+#define SC_PIX_EXT_LR_ODX 0x40u
+#define SC_PIX_EXT_TB_ODX 0x44u
+#define SC_SRC0_ADDR      0x4cu
+#define SC_YSTRIDE0       0x5cu
+#define SC_CURRENT0       0x64u
+/* QSEED3 at pipe + 0x2000 (dpu_hw_util.c) */
+#define SC_QSEED          0x2000u
+#define SC_Q_OP_MODE      0x04u
+#define SC_Q_STEP_Y_H     0x10u
+#define SC_Q_STEP_Y_V     0x14u
+#define SC_Q_STEP_UV_H    0x18u
+#define SC_Q_STEP_UV_V    0x1cu
+#define SC_Q_PRELOAD      0x20u
+#define SC_Q_SRC_SIZE     0x40u
+#define SC_Q_SRC_SIZE_UV  0x44u
+#define SC_Q_DST_SIZE     0x48u
+#define SC_Q_INIT_Y_H     0x90u
+#define SC_Q_INIT_Y_V     0x94u
+#define SC_Q_INIT_UV_H    0x98u
+#define SC_Q_INIT_UV_V    0x9cu
+
+static const uint32_t sc_rec[SC_PIPES] = { DPU_MDP + 0x2b000u + DPU_REC0, DPU_MDP + 0x34000u + DPU_REC0 };
+static const uint32_t sc_qseed[SC_PIPES] = { DPU_MDP + 0x2b000u + SC_QSEED, DPU_MDP + 0x34000u + SC_QSEED };
+static const uint32_t sc_save_regs[] = { SC_OP_MODE, SC_SRC_SIZE, SC_SRC_XY, SC_OUT_SIZE, SC_OUT_XY, SC_PIX_EXT_LR,
+	                                 SC_PIX_EXT_TB, SC_PIX_EXT_LR_ODX, SC_PIX_EXT_TB_ODX, SC_SRC0_ADDR, SC_YSTRIDE0 };
+#define SC_SAVED (sizeof(sc_save_regs) / sizeof(sc_save_regs[0]))
+
+static struct {
+	bool ready;                     /* bank on, stream switched, pipes' panel values saved */
+	bool on_panel;                  /* the pipes show the ABL's panel memory */
+	vm_offset_t smmu;
+	ArmSmmu4KMmio mmio;
+	ArmSmmu4KIo io;
+	ArmSmmu4KConfig tcfg;
+	ArmSmmu4KResult tables;
+	ArmSmmu4KContextConfig ctx;
+	vm_offset_t tva;
+	uint64_t tpa;
+	unsigned tnext, bank, smr;
+	uint32_t panel_s2cr, cb_off;
+	uint32_t saved[SC_PIPES][SC_SAVED], saved_qop[SC_PIPES];
+	uint32_t panel_addr;            /* what the pipes read before (0xfc800000) */
+	bool slot_used[SC_SLOTS];
+	uint64_t shows, faults;
+} sc;
+
+static inline void
+dpu_wr(uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(dpu_va + off) = v;
+}
+
+static inline uint32_t
+sc_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(sc.smmu + off);
+}
+
+static inline void
+sc_wr(uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(sc.smmu + off) = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Map PAGES (4K physical pages) at IOVA in the bank's tables, read-only for the display; then TLBIALL. */
+static bool
+sc_map(uint64_t iova, const uint64_t *pages, uint64_t pa, uint32_t npages)
+{
+	const uint64_t pool = sc.tables.root_physical;
+	const uint64_t attr = (1u << 11) | (1u << 10) | (2u << 8) | (1u << 7) | (1u << 6) | 3 | (3ull << 53);
+	const unsigned in = sc.tcfg.input_bits, start = sc.tables.start_level;
+	for (uint32_t i = 0; i < npages; i++) {
+		const uint64_t va = iova + 0x1000ull * i, page = pages ? pages[i] : pa + 0x1000ull * i;
+		uint64_t *t = (uint64_t *)sc.tva;
+		for (unsigned level = start; level < 3; level++) {
+			const unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+			uint64_t *e = &t[(va >> shift) & ((1u << width) - 1)];
+			if (!*e) {
+				if (sc.tnext >= SC_TABLE_PAGES) {
+					printf("PANDORA SCANOUT: table pool full at iova %#llx\n", va);
+					return false;
+				}
+				*e = (pool + 0x1000ull * sc.tnext++) | 3;
+				clean_dcache64((addr64_t)(pool + ((vm_offset_t)e - sc.tva)), 8, TRUE);
+			}
+			t = (uint64_t *)(sc.tva + ((*e & 0xfffffffff000ull) - pool));
+		}
+		uint64_t *leaf = &t[(va >> 12) & 511];
+		*leaf = (page & 0xfffffffff000ull) | attr;
+		clean_dcache64((addr64_t)(pool + ((vm_offset_t)leaf - sc.tva)), 8, TRUE);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ArmSmmu4KProgramResult r;
+	return ArmSmmu4KInvalidateAllOwnedContext(&sc.io, sc.bank, &sc.ctx, 1000, &r) == ArmSmmu4KSuccess;
+}
+
+static void
+sc_unmap(uint64_t iova, uint32_t npages)
+{
+	const uint64_t pool = sc.tables.root_physical;
+	const unsigned in = sc.tcfg.input_bits, start = sc.tables.start_level;
+	for (uint32_t i = 0; i < npages; i++) {
+		const uint64_t va = iova + 0x1000ull * i;
+		uint64_t *t = (uint64_t *)sc.tva;
+		for (unsigned level = start; level < 3 && t; level++) {
+			const unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
+			const uint64_t e = t[(va >> shift) & ((1u << width) - 1)];
+			t = e ? (uint64_t *)(sc.tva + ((e & 0xfffffffff000ull) - pool)) : NULL;
+		}
+		if (t) {
+			t[(va >> 12) & 511] = 0;
+			clean_dcache64((addr64_t)(pool + ((vm_offset_t)&t[(va >> 12) & 511] - sc.tva)), 8, TRUE);
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ArmSmmu4KProgramResult r;
+	(void)ArmSmmu4KInvalidateAllOwnedContext(&sc.io, sc.bank, &sc.ctx, 1000, &r);
+}
+
+/* Until CTL0 has taken the last flush (it clears its bits at the frame that latches them), at most 25 ms. */
+static bool
+sc_flush_idle(void)
+{
+	for (unsigned i = 0; i < 250; i++) {
+		if ((dpu_rd(DPU_CTL(0) + 0x18) & SC_FLUSH) == 0) {
+			return true;
+		}
+		delay(100);
+	}
+	return false;
+}
+
+int pandora_scanout_init(void);
+int
+pandora_scanout_init(void)
+{
+	int on = 1;
+	PE_parse_boot_argn("pandora_scanout", &on, sizeof(on));
+	if (!on) {
+		printf("PANDORA SCANOUT: off (pandora_scanout=0): CPU copy\n");
+		return ENOTSUP;
+	}
+	if (!dpu_va) {
+		dpu_va = ml_io_map(DPU_MDSS_PA, DPU_MDSS_LEN);
+	}
+	sc.smmu = ml_io_map(DPU_SMMU_PA, SC_SMMU_BYTES);
+	if (!dpu_va || !sc.smmu) {
+		return ENOMEM;
+	}
+	/* What the main screen shows now: CTL0 drives VIG0 + VIG1 (fetch bits 16, 17) from one address. */
+	const uint32_t a0 = dpu_rd(sc_rec[0] + SC_SRC0_ADDR), a1 = dpu_rd(sc_rec[1] + SC_SRC0_ADDR);
+	if ((dpu_rd(DPU_CTL(0) + 0xfc) & 0x30000u) != 0x30000u || a0 == 0 || a0 != a1) {
+		printf("PANDORA SCANOUT: main screen not as expected (ctl0 fetch %08x, vig0 %08x vig1 %08x): CPU copy\n",
+		    dpu_rd(DPU_CTL(0) + 0xfc), a0, a1);
+		return ENODEV;
+	}
+	/* Everything the display reads now must stay mapped at its address: main and rear screen (VIG2 on CTL1). */
+	uint64_t lo = a0, hi = (uint64_t)a0 + (uint64_t)(dpu_rd(sc_rec[0] + SC_YSTRIDE0) & 0xffff) * SC_PANEL_H;
+	const uint32_t rear = DPU_MDP + 0x3d000u + DPU_REC0, ra = dpu_rd(rear + SC_SRC0_ADDR);
+	if (ra) {
+		const uint64_t rend = (uint64_t)ra + (uint64_t)(dpu_rd(rear + SC_YSTRIDE0) & 0xffff) *
+		    (dpu_rd(rear + SC_SRC_SIZE) >> 16);
+		lo = MIN(lo, (uint64_t)ra);
+		hi = MAX(hi, rend);
+	}
+	lo &= ~0xfffull;
+	hi = (hi + 0xfff) & ~0xfffull;
+	if (hi > SC_SLOT_BASE && lo < SC_SLOT_BASE + SC_SLOTS * SC_SLOT_BYTES) {
+		printf("PANDORA SCANOUT: panel memory %#llx-%#llx inside the surface slots: CPU copy\n", lo, hi);
+		return ENODEV;
+	}
+	sc.panel_addr = a0;
+
+	/* The stream's route, and a free bank: not enabled, never configured, not named by any S2CR. */
+	const uint32_t id0 = sc_rd(0x20), id1 = sc_rd(0x24), id2 = sc_rd(0x28), nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	const uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000, numpage = 1ull << (((id1 >> 28) & 7) + 1);
+	uint32_t used[8] = {};
+	sc.smr = ~0u;
+	for (unsigned i = 0; i < nsmr; i++) {
+		const uint32_t smr = sc_rd(0x800 + 4 * i), s2cr = sc_rd(0xc00 + 4 * i);
+		if (!(smr & SC_SMR_VALID)) {
+			continue;
+		}
+		if (((s2cr >> 16) & 3) == 0) {
+			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
+		}
+		if ((smr & 0x7fff) == DPU_SID && ((smr >> 16) & 0x7fff) == 0x2) {
+			sc.smr = i;
+			sc.panel_s2cr = s2cr;
+		}
+	}
+	sc.bank = ~0u;
+	for (unsigned b = ncb; b-- > 0;) {
+		const uint64_t off = numpage * page + b * page;
+		if (!(used[b / 32] & (1u << (b % 32))) && off + 0x1000 <= SC_SMMU_BYTES && sc_rd((uint32_t)off) == 0 &&
+		    sc_rd((uint32_t)(page + 4 * b)) == 0) {
+			sc.bank = b;
+			sc.cb_off = (uint32_t)off;
+			break;
+		}
+	}
+	if (sc.smr == ~0u || ((sc.panel_s2cr >> 16) & 3) != 0 || sc.bank == ~0u) {
+		printf("PANDORA SCANOUT: no stream match (%u, s2cr %08x) or no free bank (%u of %u): CPU copy\n", sc.smr,
+		    sc.panel_s2cr, sc.bank, ncb);
+		return ENODEV;
+	}
+
+	/* Tables: the panel memory at its own address. */
+	if (kmem_alloc_contig(kernel_map, &sc.tva, SC_TABLE_PAGES * 0x1000, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return ENOMEM;
+	}
+	sc.tpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)sc.tva));
+	static const uint8_t oas_bits[16] = {32, 36, 40, 42, 44, 48};
+	const unsigned oas = MIN(((id2 >> 4) & 15) < 6 ? oas_bits[(id2 >> 4) & 15] : 32, 40);
+	sc.tcfg = (ArmSmmu4KConfig){ 32, oas, sc.tpa, (size_t)((hi - lo) / 0x1000) };
+	const ArmSmmu4KRange panel = { lo, lo, hi - lo, ArmSmmu4KRead, 0, 2 };
+	ArmSmmu4KStatus st = ArmSmmu4KBuild(&sc.tcfg, &panel, 1, (uint64_t *)sc.tva, SC_TABLE_PAGES, &sc.tables);
+	if (st != ArmSmmu4KSuccess) {
+		printf("PANDORA SCANOUT: tables: status %d: CPU copy\n", st);
+		return EINVAL;
+	}
+	sc.tnext = (unsigned)sc.tables.table_pages;
+	clean_dcache64((addr64_t)sc.tpa, SC_TABLE_PAGES * 0x1000, TRUE);
+
+	/* The bank: platform ACTLR first, then ArmSmmu4K programs, reads back and enables it (no stream yet). */
+	sc.mmio.mapping = (volatile unsigned char *)sc.smmu;
+	sc.mmio.bytes = SC_SMMU_BYTES;
+	if (ArmSmmu4KBindMmio(&sc.mmio, &sc.io) != ArmSmmu4KSuccess) {
+		return EIO;
+	}
+	sc_wr(sc.cb_off + 4, SC_ACTLR);
+	sc.ctx = (ArmSmmu4KContextConfig){ &sc.tcfg, NULL, &sc.tables, NULL, id0, id2, 1, 0, 0, 0 };
+	ArmSmmu4KProgramResult prog;
+	st = ArmSmmu4KProgramDisabledContext(&sc.io, sc.bank, &sc.ctx, 1000, &prog);
+	printf("PANDORA SCANOUT: bank %u (ACTLR %#x, ABL's bank %u had %#x): status %d sctlr %08x tcr %08x ttbr0 %#llx; "
+	    "panel memory %#llx-%#llx mapped as itself, %zu table pages\n", sc.bank, sc_rd(sc.cb_off + 4),
+	    sc.panel_s2cr & 0xff, sc_rd((uint32_t)(numpage * page + (sc.panel_s2cr & 0xff) * page) + 4), st,
+	    prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0, lo, hi, sc.tables.table_pages);
+	if (st != ArmSmmu4KSuccess) {
+		return EIO;
+	}
+
+	/* The switch: one S2CR write. Then 100 ms of frames must go by without a fault in the bank. */
+	const uint32_t f0 = dpu_rd(DPU_INTF(1) + 0xac);
+	sc_wr(0xc00 + 4 * sc.smr, (sc.panel_s2cr & ~0xffu) | sc.bank);
+	IOSleep(100);
+	const uint32_t fsr = sc_rd(sc.cb_off + 0x58), f1 = dpu_rd(DPU_INTF(1) + 0xac);
+	if (fsr != 0 || f1 == f0) {
+		sc_wr(0xc00 + 4 * sc.smr, sc.panel_s2cr);
+		printf("PANDORA SCANOUT: after the switch fsr %08x far %08x%08x, frames %u -> %u: stream back on bank %u, "
+		    "CPU copy\n", fsr, sc_rd(sc.cb_off + 0x64), sc_rd(sc.cb_off + 0x60), f0, f1, sc.panel_s2cr & 0xff);
+		return EIO;
+	}
+	for (unsigned p = 0; p < SC_PIPES; p++) {
+		for (unsigned r = 0; r < SC_SAVED; r++) {
+			sc.saved[p][r] = dpu_rd(sc_rec[p] + sc_save_regs[r]);
+		}
+		sc.saved_qop[p] = dpu_rd(sc_qseed[p] + SC_Q_OP_MODE);
+	}
+	sc.on_panel = true;
+	sc.ready = true;
+	printf("PANDORA SCANOUT: display stream on bank %u (S2CR %08x), frames %u -> %u in 100 ms, no fault: "
+	    "frames can be scanned out\n", sc.bank, sc_rd(0xc00 + 4 * sc.smr), f0, f1);
+	return 0;
+}
+
+/* A slot of 16 MiB of IOVA with PAGES mapped, or 0. */
+uint32_t pandora_scanout_map(const uint64_t *pages, uint32_t npages);
+uint32_t
+pandora_scanout_map(const uint64_t *pages, uint32_t npages)
+{
+	if (!sc.ready || npages == 0 || npages > SC_SLOT_BYTES / 0x1000) {
+		return 0;
+	}
+	for (unsigned i = 0; i < SC_SLOTS; i++) {
+		if (!sc.slot_used[i]) {
+			const uint32_t iova = SC_SLOT_BASE + i * SC_SLOT_BYTES;
+			if (!sc_map(iova, pages, 0, npages)) {
+				sc_unmap(iova, npages);
+				return 0;
+			}
+			sc.slot_used[i] = true;
+			return iova;
+		}
+	}
+	return 0;
+}
+
+void pandora_scanout_unmap(uint32_t iova, uint32_t npages);
+void
+pandora_scanout_unmap(uint32_t iova, uint32_t npages)
+{
+	if (!sc.ready || iova < SC_SLOT_BASE || iova >= SC_SLOT_BASE + SC_SLOTS * SC_SLOT_BYTES) {
+		return;
+	}
+	sc_unmap(iova, npages);
+	sc.slot_used[(iova - SC_SLOT_BASE) / SC_SLOT_BYTES] = false;
+}
+
+/*
+ * Show a W x H frame at ADDR (IOVA of its first pixel, rows of STRIDE bytes) on the main screen: scaled to the
+ * whole panel with FILL, else centred at its own size. Returns false when the previous flush is still pending.
+ */
+bool pandora_scanout_show(uint32_t addr, uint32_t stride, uint32_t w, uint32_t h, bool fill);
+bool
+pandora_scanout_show(uint32_t addr, uint32_t stride, uint32_t w, uint32_t h, bool fill)
+{
+	if (!sc.ready || w < 2 || h == 0 || w > SC_PANEL_W || h > SC_PANEL_H || !sc_flush_idle()) {
+		return false;
+	}
+	/* Both modes split at the mixers' boundary (panel x 610), as the ABL's setup does: scaled, the source splits
+	 * at its middle (mainline splits a plane the same way); centred, at the column that lands on x 610. */
+	const uint32_t left = fill ? 0 : (SC_PANEL_W - w) / 2;
+	const uint32_t half = fill ? w / 2 : SC_HALF_W - left;
+	for (unsigned p = 0; p < SC_PIPES; p++) {
+		const uint32_t sx = p ? half : 0, sw = p ? w - half : half;
+		uint32_t dx, dw, dy, dh;
+		if (fill) {
+			dx = p ? SC_HALF_W : 0;
+			dw = SC_HALF_W;
+			dy = 0;
+			dh = SC_PANEL_H;
+		} else {
+			dx = left + sx;
+			dw = sw;
+			dy = (SC_PANEL_H - h) / 2;
+			dh = h;
+		}
+		const uint32_t r = sc_rec[p], q = sc_qseed[p];
+		dpu_wr(r + SC_SRC0_ADDR, addr);
+		dpu_wr(r + SC_YSTRIDE0, stride & 0xffff);
+		dpu_wr(r + SC_SRC_SIZE, (h << 16) | sw);
+		dpu_wr(r + SC_SRC_XY, sx);
+		dpu_wr(r + SC_OUT_SIZE, (dh << 16) | dw);
+		dpu_wr(r + SC_OUT_XY, (dy << 16) | dx);
+		if (dw != sw || dh != h) {
+			const uint32_t sh = (uint32_t)(((uint64_t)sw << 21) / dw), sv = (uint32_t)(((uint64_t)h << 21) / dh);
+			dpu_wr(r + SC_PIX_EXT_LR, 0);
+			dpu_wr(r + SC_PIX_EXT_TB, 0);
+			dpu_wr(r + SC_PIX_EXT_LR_ODX, 0);
+			dpu_wr(r + SC_PIX_EXT_TB_ODX, 0);
+			dpu_wr(r + SC_OP_MODE, sc.saved[p][0] | (1u << 31));          /* SW pixel extension override */
+			dpu_wr(q + SC_Q_INIT_Y_H, 0);
+			dpu_wr(q + SC_Q_INIT_Y_V, 0);
+			dpu_wr(q + SC_Q_INIT_UV_H, 0);
+			dpu_wr(q + SC_Q_INIT_UV_V, 0);
+			dpu_wr(q + SC_Q_STEP_Y_H, sh & 0xffffff);
+			dpu_wr(q + SC_Q_STEP_Y_V, sv & 0xffffff);
+			dpu_wr(q + SC_Q_STEP_UV_H, sh & 0xffffff);
+			dpu_wr(q + SC_Q_STEP_UV_V, sv & 0xffffff);
+			dpu_wr(q + SC_Q_PRELOAD, 4u | (2u << 8) | (4u << 16) | (2u << 24));
+			dpu_wr(q + SC_Q_SRC_SIZE, sw | (h << 16));
+			dpu_wr(q + SC_Q_SRC_SIZE_UV, sw | (h << 16));
+			dpu_wr(q + SC_Q_DST_SIZE, dw | (dh << 16));
+			/* enable, Y/RGB filter bilinear (3), blend, non-DX format, alpha bilinear (1) */
+			dpu_wr(q + SC_Q_OP_MODE, 1u | (3u << 16) | (1u << 31) | (1u << 14) | (1u << 10) | (1u << 29));
+		} else {
+			dpu_wr(r + SC_OP_MODE, sc.saved[p][0]);
+			dpu_wr(q + SC_Q_OP_MODE, sc.saved_qop[p]);
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	dpu_wr(DPU_CTL(0) + 0x18, SC_FLUSH);
+	sc.on_panel = false;
+	sc.shows++;
+	return true;
+}
+
+/* The ABL's own pipe setup again: the panel memory, unscaled. */
+bool pandora_scanout_panel(void);
+bool
+pandora_scanout_panel(void)
+{
+	if (!sc.ready || sc.on_panel) {
+		return true;
+	}
+	if (!sc_flush_idle()) {
+		return false;
+	}
+	for (unsigned p = 0; p < SC_PIPES; p++) {
+		for (unsigned r = 0; r < SC_SAVED; r++) {
+			dpu_wr(sc_rec[p] + sc_save_regs[r], sc.saved[p][r]);
+		}
+		dpu_wr(sc_qseed[p] + SC_Q_OP_MODE, sc.saved_qop[p]);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	dpu_wr(DPU_CTL(0) + 0x18, SC_FLUSH);
+	sc.on_panel = true;
+	return true;
+}
+
+/* Whether both pipes now read ADDR (0: the panel memory); and the bank's fault status, cleared once read. */
+bool pandora_scanout_current(uint32_t addr);
+bool
+pandora_scanout_current(uint32_t addr)
+{
+	if (!sc.ready) {
+		return true;
+	}
+	const uint32_t want = addr ? addr : sc.panel_addr;
+	const uint32_t fsr = sc_rd(sc.cb_off + 0x58);
+	if (fsr) {
+		sc.faults++;
+		if (sc.faults <= 8) {
+			printf("PANDORA SCANOUT: fault fsr %08x far %08x%08x fsynr0 %08x\n", fsr, sc_rd(sc.cb_off + 0x64),
+			    sc_rd(sc.cb_off + 0x60), sc_rd(sc.cb_off + 0x68));
+		}
+		sc_wr(sc.cb_off + 0x58, fsr);
+	}
+	return dpu_rd(sc_rec[0] + SC_CURRENT0) == want && dpu_rd(sc_rec[1] + SC_CURRENT0) == want;
+}
+
+bool pandora_scanout_ready(void);
+bool
+pandora_scanout_ready(void)
+{
+	return sc.ready;
+}
+
+void pandora_scanout_counts(uint64_t *shows, uint64_t *faults);
+void
+pandora_scanout_counts(uint64_t *shows, uint64_t *faults)
+{
+	*shows = sc.shows;
+	*faults = sc.faults;
+}
 #endif /* PANDORA */
