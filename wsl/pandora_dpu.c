@@ -308,6 +308,9 @@ extern bool pandora_log_sync(void);                          /* bsd/dev/sweet_uf
 
 #define SC_SMMU_BYTES     0x100000u          /* DT apps-smmu@15000000 reg */
 #define SC_SMR_VALID      (1u << 31)
+/* CB_FSR fault bits as Linux arm-smmu reads them (TF..UUT, SS, MULTI); bits 10:9 are FORMAT, set from boot (r2e:
+ * 0x400 before and after, no fault), not a fault. */
+#define SC_FSR_FAULT      (0x1feu | (1u << 30) | (1u << 31))
 #define SC_ACTLR          0x1u               /* DT qcom,actlr <0x800 0x02 0x01> */
 #define SC_TABLE_PAGES    192u
 #define SC_SLOT_BASE      0x80000000u
@@ -574,7 +577,7 @@ pandora_scanout_init(void)
 	printf("PANDORA SCANOUT: bank %u: status %d sctlr %08x tcr %08x ttbr0 %#llx; 100 ms later fsr %08x far %08x%08x, "
 	    "frames %u -> %u\n", sc.bank, st, prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0, fsr,
 	    sc_rd(sc.cb_off + 0x64), sc_rd(sc.cb_off + 0x60), f0, f1);
-	if (st != ArmSmmu4KSuccess || fsr != 0 || f1 == f0) {
+	if (st != ArmSmmu4KSuccess || (fsr & SC_FSR_FAULT) || f1 == f0) {
 		/* Back as the ABL left it: translation off, its attributes. */
 		sc_wr(sc.cb_off, was_sctlr);
 		sc_wr(sc.cb_off + 4, was_actlr);
@@ -733,7 +736,7 @@ pandora_scanout_current(uint32_t addr)
 	}
 	const uint32_t want = addr ? addr : sc.panel_addr;
 	const uint32_t fsr = sc_rd(sc.cb_off + 0x58);
-	if (fsr) {
+	if (fsr & SC_FSR_FAULT) {
 		sc.faults++;
 		if (sc.faults <= 8) {
 			printf("PANDORA SCANOUT: fault fsr %08x far %08x%08x fsynr0 %08x\n", fsr, sc_rd(sc.cb_off + 0x64),
