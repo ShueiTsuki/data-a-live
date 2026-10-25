@@ -329,3 +329,7 @@
 - **刷新率**：CA 的 AppleDisplay 从显示服务属性 `IOMFBDisplayRefresh` 读刷新能力；做 120 帧要照真机格式发布它。CA 读的其他属性：IOMFBScalingLimits、color-accuracy-index、FFR_raw_index、PanelLayout、DisplayPipeStrideRequirements、DisplayPipePlaneBaseAlignment、IOMFBMaxSrcPixels、maxAverageBpp、maxPeakBpp、PCCCabalEnable、W40a_Blending_OK、IOMFBSupportsICC、Brightness_Scale、SupportsRotation、IOMFBUUID、DisplayContainerID、DisplayAttributes、Transport。
 - **被忽略但有用的接口**：55 SetMatrix 和 69 SwapSetColorMatrix（夜览、色彩滤镜、反转、降低白点），78/79 数据块 0x4d/0x4e（色域映射），84 SetContrast，50 SetBrightnessCorrection；作用待查：68 SetParameter（参数 3、6、7、8，值 1），79 数据块 0x48/0x4a，29 GetDisplayArea（回 0），74 SupportedFrameInfo（回 0 = 不支持帧信息）。
 - **SwapWait 选项**（0218 已实现）：第 31 位不等待；0 离开屏幕、1 已上屏、2 全部完成、3/4 显示是否就绪；无超时 5 s 后清交换。
+
+### 用户插入的任务（2026-10-25）
+- **120 帧并解开 iOS 的 80 帧限制**：先照真机格式发布 `IOMFBDisplayRefresh` 等属性，让 iOS 把屏幕当 120 Hz 高刷屏；再查 80 帧上限是 iOS 哪一层的策略（CA 的帧率范围、UIKit 动画、MobileGestalt 设备能力），找到后解开。
+- **十点触控**：触摸芯片固件报 10 个点（app info objects 10），内核 pandora_touch.c（PT_MAX 10）和 SweetHIDTouch（SWEET_TOUCH_FINGERS 10）都按 10 点写；r2g 里最多出现 5 指同时按下（编号 0–4），6–10 指还没试。待办：内核记下同时按下的最多手指数；上手机试 6–10 指；查 iOS 在 iPhone 上是否只收 5 点（常见说法 iPhone 5 指、iPad 11 指），是的话找到限制处解开。
