@@ -11,11 +11,13 @@
 | 部分 | 状态 |
 |---|---|
 | 启动 | `fastboot boot` 临时启动，不刷任何分区；iOS 的根文件系统放在安卓数据分区里的一个固定文件中 |
-| 锁屏、主屏幕 | 能进 |
-| 触摸、电源键、音量键 | 能用 |
-| 画面 | 默认由 CPU 绘制，把画面拷到屏幕上 |
-| GPU（Adreno 840） | **实验中**：驱动、Vulkan（Mesa Turnip）、Metal（UniXNU NativeMetal）都已在手机上跑通；2026-10-24 主屏幕第一次完全由 GPU 画出，但快速操作时会卡死，正在查 |
-| Wi-Fi、蜂窝网络、声音、相机、背屏 | 不能用 |
+| 锁屏、主屏幕、App | 能进、能开；后台划掉 App、连续开 App 不卡 |
+| 触摸、电源键、音量键、亮度 | 能用 |
+| 画面（Adreno 840） | 测试启动时由 GPU 合成整个系统界面：自写的 GPU 内核驱动，Vulkan 用 Mesa Turnip，Metal 用 UniXNU 的 NativeMetal 插件加我们改进的 metal2vulkan 翻译层。屏幕直接读 GPU 画好的图，不再由 CPU 拷屏；120 Hz 屏上滑动动画约 110 帧 |
+| CPU | 8 个核全开，按负载调频，空闲时核休眠，过热降频 |
+| 音频 DSP | 能启动并通信（SMEM、SMP2P、GLINK、GPR），固件从手机自己的固件分区读；声音还放不出来，喇叭在做 |
+| 电池 | 显示的还是固定值；真实电量在做（经 SOCCP 的电池管理器） |
+| Wi-Fi、蜂窝网络、相机、背屏 | 不能用 |
 | App Store 应用 | 基本不能用（解密依赖苹果芯片里的安全模块） |
 
 详细进度见 [PLAN.md](PLAN.md)，GPU 部分见 [docs/GPU_PLAN.md](docs/GPU_PLAN.md)。
@@ -25,7 +27,7 @@
 | 目录 | 内容 |
 |---|---|
 | `xnu/patches/` | 对 xnu-8796 的补丁，按编号顺序应用；前面一部分来自 ios-sweet / ios-fuxi，`pandora` 开头的是本机专用的 |
-| `wsl/` | 编进内核的驱动源码（GPU、触摸、按键、存储、固件包安装等），以及生成补丁、本地编译用的脚本 |
+| `wsl/` | 编进内核的驱动源码（GPU、显示、触摸、按键、存储、固件包安装、音频 DSP 等），以及生成补丁、本地编译用的脚本；`wsl/qcom/` 是从 UniXNU-sheng 原样拷来的 SMEM/SMP2P/GLINK/GPR/FAT 代码 |
 | `shim/` | `fastboot boot` 启动的小程序：`loader` 代替 iBoot 把内核拉起来，`hello` 是最早的硬件探测程序 |
 | `tools/` | 启动镜像、设备树、固件包、信任缓存的生成工具，真机测试脚本，GPU 测试程序（vktest、pgputest、mtltest） |
 | `tools/turnip/`、`tools/metal/` | 在 GitHub Actions 上为 iOS 16 交叉编译 Turnip 和 NativeMetal 插件 |
@@ -50,7 +52,7 @@
 
 - [ios-sweet](https://github.com/dipa-studio/ios-sweet)：在骁龙手机上原生跑 iOS 16 的开创项目，前面的内核补丁和启动方式都基于它。
 - [ios-fuxi](https://github.com/bangprovn/ios-fuxi)：ios-sweet 在骁龙 8 Gen 2 上的移植，提供了大量参考。
-- [UniXNU](https://github.com/UniXNU/UniXNU)：4K 页内核、存储驱动，以及 NativeAdreno、NativeMetal、ArmSmmu4K 等 GPU 组件。
+- [UniXNU](https://github.com/UniXNU/UniXNU)：4K 页内核、存储驱动，以及 NativeAdreno、NativeMetal、ArmSmmu4K 等 GPU 组件；[UniXNU-sheng](https://github.com/UniXNU/UniXNU-sheng) 的 SMEM、SMP2P、GLINK、GPR、FAT 读取代码。
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（Turnip Vulkan 驱动）、[metal2vulkan](https://github.com/steelbrain/metal2vulkan)（Metal 着色器翻译）。
 - Linux 内核的 msm/Adreno 驱动：GPU 寄存器和启动顺序的参考。
 
