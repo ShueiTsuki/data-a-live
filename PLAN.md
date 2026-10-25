@@ -333,3 +333,10 @@
 ### 用户插入的任务（2026-10-25）
 - **120 帧并解开 iOS 的 80 帧限制**：先照真机格式发布 `IOMFBDisplayRefresh` 等属性，让 iOS 把屏幕当 120 Hz 高刷屏；再查 80 帧上限是 iOS 哪一层的策略（CA 的帧率范围、UIKit 动画、MobileGestalt 设备能力），找到后解开。
 - **十点触控**：触摸芯片固件报 10 个点（app info objects 10），内核 pandora_touch.c（PT_MAX 10）和 SweetHIDTouch（SWEET_TOUCH_FINGERS 10）都按 10 点写；r2g 里最多出现 5 指同时按下（编号 0–4），6–10 指还没试。待办：内核记下同时按下的最多手指数；上手机试 6–10 指；查 iOS 在 iPhone 上是否只收 5 点（常见说法 iPhone 5 指、iPad 11 指），是的话找到限制处解开。
+
+### 120 帧和探测结果（2026-10-25，k0220，日志 r2i）
+- **120 帧（0220）**：AppleCLCD 上发布 `IOMFBDisplayRefresh`（displayMinRefreshInterval = 2^32/120，不给步长 = 不声明 APT）。动画时平均 102–104 帧（以前 60），最短间隔 2.5–5.7 ms；没满 120 是 GPU 慢（600 帧里 480–570 帧要等 GPU）。交换到上屏平均约 11 ms，最长约 20 ms。
+- **十点触控**：内核记到 10 指同时按下，iOS 端没再卡。
+- **PSCI**：1.1，CPU_SUSPEND 特性 0x3（支持 OS 协调模式、扩展状态号），SET_SUSPEND_MODE 支持，STAT_RESIDENCY 不支持 → 簇级/整机级休眠按 Linux cpuidle-psci-domain 做。
+- **显示中断（只读）**：100 ms 内各 14 次：INTR bit 8、10（pingpong 0/2 完成），INTR2 bit 9（CTL0 开始一帧）、bit 10（CTL1，背屏），INTF1 bit 11，INTF1 tear bit 0–3、6。CTL0 开始一帧可代替上屏线程的轮询。
+- **被忽略接口的参数**：17 伽马表全 0、55 颜色矩阵为单位阵、68 参数 6=0 和 7=0x200000、79 数据块 0x4d（1580 字节）和 0x40（40 字节）、84 对比度 0、thermalmonitord 78 数据块 2（1788 字节）。
