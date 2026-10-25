@@ -20,10 +20,10 @@ index 9c22f03..28b00a1 100644
  	int mode = 1;
 diff --git a/osfmk/arm/pandora_prof.c b/osfmk/arm/pandora_prof.c
 new file mode 100644
-index 0000000..cfcd2e6
+index 0000000..0a59f4a
 --- /dev/null
 +++ b/osfmk/arm/pandora_prof.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,272 @@
 +/*
 + * PANDORA sampling profiler (patch 0222): where one process's threads are, about 1000 times a second, as Apple's kperf
 + * samples on its timers. Boot-arg pandora_prof=NAME (the process, e.g. backboardd; off without it), pandora_prof_hz
@@ -32,7 +32,7 @@ index 0000000..cfcd2e6
 + * A kernel thread wakes at that rate and sends an interrupt (cpu_xcall) to each other CPU running a thread of the task.
 + * The handler, in that CPU's interrupt context, takes the interrupted state: the user PC when the thread ran user
 + * code; else the kernel PC, and the user PC where the thread entered the kernel (its user saved state). Each period
-+ * the hottest PCs of the three kinds go to the log ("PANDORA PROF U/E/K <pc> <count>"), and, whenever the task has
++ * every PC counted of the three kinds goes to the log ("PANDORA PROF U/E/K <pc> <count>"), and, whenever the task has
 + * loaded more images, dyld's all-image info: each image outside the shared cache with its load address and path, the
 + * shared cache's slide, and the kernel's slide, so tools/prof.py can name the PCs.
 + */
@@ -61,7 +61,7 @@ index 0000000..cfcd2e6
 +#define PPROF_CPUS      8
 +#define PPROF_RING      2048u            /* samples per CPU between two drains (1 s at 1000 Hz) */
 +#define PPROF_SLOTS     8192u            /* distinct PCs counted per kind and period */
-+#define PPROF_TOP       48u
++#define PPROF_LINES     4000u            /* PCs logged per kind and period */
 +
 +struct pprof_sample {
 +	uint64_t pc;            /* user PC, or kernel PC when !user */
@@ -156,23 +156,20 @@ index 0000000..cfcd2e6
 +{
 +	static const char kinds[3] = { 'U', 'E', 'K' };
 +	printf("PANDORA PROF: %u s of %s: %llu in user code, %llu in the kernel (%llu interrupts sent, %llu refused, "
-+	    "%llu samples dropped)\n", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
++	    "%llu samples dropped)
++", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
 +	    pprof_dropped);
++	/* Every PC counted (a hot function's samples spread over its instructions; tools/prof.py sums them by function),
++	 * at most PPROF_LINES of each kind. */
 +	for (unsigned kind = 0; kind < 3; kind++) {
 +		struct pprof_count *t = pprof_counts[kind];
-+		for (unsigned k = 0; k < PPROF_TOP; k++) {
-+			uint32_t best = 0, at = PPROF_SLOTS;
-+			for (uint32_t i = 0; i < PPROF_SLOTS; i++) {
-+				if (t[i].n > best) {
-+					best = t[i].n;
-+					at = i;
-+				}
++		unsigned lines = 0;
++		for (uint32_t i = 0; i < PPROF_SLOTS && lines < PPROF_LINES; i++) {
++			if (t[i].n) {
++				printf("PANDORA PROF %c %#llx %u
++", kinds[kind], t[i].pc, t[i].n);
++				lines++;
 +			}
-+			if (at == PPROF_SLOTS) {
-+				break;
-+			}
-+			printf("PANDORA PROF %c %#llx %u\n", kinds[kind], t[at].pc, best);
-+			t[at].n = 0;            /* taken; the table is cleared below */
 +		}
 +		bzero(t, PPROF_SLOTS * sizeof(*t));
 +		pprof_totals[kind] = 0;
