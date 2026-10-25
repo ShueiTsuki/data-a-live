@@ -24,6 +24,10 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <kern/thread.h>
 #include "NativeAdrenoABIv1.h"
 
 extern "C" {
@@ -44,6 +48,9 @@ uint32_t pandora_gpu_chip_id(void);
 int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, bool readonly,
     uint64_t *handle);
 void pandora_gpu_release_ref(void *ref);
+int pandora_gpu_irq(void);
+void pandora_gpu_irq_attach(void (*enable)(void));
+bool sweet_gic_ready(void);
 }
 
 #define PANDORA_GPU_OPEN_TYPE   0x4147u
@@ -427,13 +434,90 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 class PandoraAdrenoGpu : public IOService {
 	OSDeclareDefaultStructors(PandoraAdrenoGpu);
 
+	bool irqFilter(IOFilterInterruptEventSource *source);
+	void irqAction(IOInterruptEventSource *source, int count);
+
 public:
+	void startInterrupt(void);   /* on its own thread (start): it waits for the GIC controller and the nub */
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(PandoraAdrenoGpu, IOService);
+
+/*
+ * Patch 0216: the GPU's interrupt line, from its device tree node /arm-io/gpu ("interrupts" INTID 332 level,
+ * "interrupt-parent" the GIC; tools/mkadt_pandora.py) through the GIC controller (SweetGIC.cpp), the way an
+ * iPhone driver takes its interrupts. The filter runs at interrupt time: pandora_gpu_irq clears the GPU's
+ * interrupt status and wakes the fence waiters; nothing is left for the work loop. bsd/dev/pandora_gpu.c
+ * enables the source once the GPU is up.
+ */
+static IOFilterInterruptEventSource *gPandoraGpuIrq;
+static IOWorkLoop *gPandoraGpuLoop;
+
+static void
+pandora_gpu_irq_enable(void)
+{
+	if (gPandoraGpuIrq != nullptr) {
+		gPandoraGpuIrq->enable();
+	}
+}
+
+bool
+PandoraAdrenoGpu::irqFilter(IOFilterInterruptEventSource *source)
+{
+	if (pandora_gpu_irq() != 0) {
+		source->disable();   /* status stayed empty: polling from now on */
+	}
+	return false;
+}
+
+void
+PandoraAdrenoGpu::irqAction(IOInterruptEventSource *, int)
+{
+}
+
+void
+PandoraAdrenoGpu::startInterrupt(void)
+{
+	/* This service matches on IOResources and can start before the platform expert has made the GIC
+	 * controller and the /arm-io nubs: wait for both (they come within the first second). */
+	OSDictionary *want = IOService::serviceMatching("SweetGIC");
+	IOService *gic = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
+	OSSafeReleaseNULL(want);
+	want = IOService::nameMatching("gpu");
+	IOService *nub = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
+	OSSafeReleaseNULL(want);
+	OSSafeReleaseNULL(gic);
+	IORegistryEntry *node = nub;   /* released below */
+	if (nub == nullptr || !sweet_gic_ready() || nub->getProperty("IOInterruptSpecifiers") == nullptr) {
+		IOLog("PANDORA GPU UC: no interrupt (node %d, controller %d): fence waits poll\n", nub != nullptr,
+		    sweet_gic_ready());
+		OSSafeReleaseNULL(node);
+		return;
+	}
+	gPandoraGpuLoop = IOWorkLoop::workLoop();
+	gPandoraGpuIrq = gPandoraGpuLoop == nullptr ? nullptr : IOFilterInterruptEventSource::filterInterruptEventSource(this,
+	    OSMemberFunctionCast(IOInterruptEventSource::Action, this, &PandoraAdrenoGpu::irqAction),
+	    OSMemberFunctionCast(IOFilterInterruptEventSource::Filter, this, &PandoraAdrenoGpu::irqFilter), nub, 0);
+	if (gPandoraGpuIrq == nullptr || gPandoraGpuLoop->addEventSource(gPandoraGpuIrq) != kIOReturnSuccess) {
+		IOLog("PANDORA GPU UC: interrupt source refused: fence waits poll\n");
+		OSSafeReleaseNULL(gPandoraGpuIrq);
+		OSSafeReleaseNULL(node);
+		return;
+	}
+	gPandoraGpuIrq->disable();
+	IOLog("PANDORA GPU UC: interrupt source on %s, enabled when the GPU is up\n", nub->getName());
+	pandora_gpu_irq_attach(pandora_gpu_irq_enable);
+	OSSafeReleaseNULL(node);
+}
+
+static void
+pandora_gpu_irq_thread(void *arg, wait_result_t)
+{
+	static_cast<PandoraAdrenoGpu *>(arg)->startInterrupt();
+}
 
 bool
 PandoraAdrenoGpu::start(IOService *provider)
@@ -444,6 +528,10 @@ PandoraAdrenoGpu::start(IOService *provider)
 	setName("NativeAdrenoGpu");
 	registerService();
 	IOLog("PANDORA GPU UC: PandoraAdrenoGpu registered\n");
+	thread_t thread;
+	if (kernel_thread_start(pandora_gpu_irq_thread, this, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 	return true;
 }
 

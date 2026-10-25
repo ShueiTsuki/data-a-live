@@ -1130,3 +1130,27 @@ edit('NativeAdrenoMetalPlugin.mm',
                 return nullptr;
             }, nullptr) == 0) pthread_detach(timing);
 """)
+
+# ---- data-a-live: device answers asked once per (selector, argument) (2026-10-25, round 2) ----------------------
+# r1c: QuartzCore asks the device about 3100 questions with an argument every 10 s while the screen moves
+# (supportsFamily:, supportsTextureSampleCount:, minimumLinearTextureAlignmentForPixelFormat:, ...), and the runtime
+# worked each out again: 140 us a call, 4 % of a core. Every such answer is a property of the device (NativeMetalObjects.rs
+# device_answer reads only the device's properties, family rows and format table), so each is asked once and kept, the
+# way the answers without an argument already are; a refusal is kept as 0/NO and logged once.
+edit('NativeBridgeMetalFrontend.mm',
+     """static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ uint64_t value=0;
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ return value;
+}""",
+     """static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ static std::mutex lock;   // data-a-live: each (selector, argument) asked once (tools/metal/adapt_ios16.py, round 2)
+ static std::unordered_map<uint64_t,std::vector<std::pair<SEL,uint64_t>>> known;   // argument -> (selector, answer)
+ {std::lock_guard<std::mutex> hold(lock);
+  if(auto at=known.find(arg);at!=known.end())for(const auto &seen:at->second)if(seen.first==cmd)return seen.second;}
+ uint64_t value=0;
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ std::lock_guard<std::mutex> hold(lock);
+ known[arg].emplace_back(cmd,value);
+ return value;
+}""")

@@ -1,0 +1,637 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 1600c3a..1ace8bd 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -1441,6 +1441,8 @@ gpu_level9(void)
+ /* A8XX GPU registers, dword offsets (a6xx.xml A8XX variants = gen8_reg.h) */
+ #define RBBM_GBIF_HALT            0x00au
+ #define RBBM_INT_0_STATUS         0x06au
++#define RBBM_INT_CLEAR_CMD        0x061u
++#define RBBM_INT_CP_CACHE_FLUSH_TS (1u << 20)  /* the ring timestamp event with its IRQ bit (gpu_submit) */
+ #define CP_RB_BASE                0x800u
+ #define CP_RB_CNTL                0x802u
+ #define CP_RB_RPTR_ADDR           0x804u
+@@ -2294,6 +2296,83 @@ pandora_gpu_issued(void)
+ 	return gpu_ready ? gpu_seqno : 0;
+ }
+ 
++/*
++ * Patch 0216: the GPU's interrupt. Every submission ends with a ring timestamp event that has its IRQ bit
++ * set (gpu_submit), and hw_init leaves CP_CACHE_FLUSH_TS in RBBM_INT_0_MASK (A8XX_INT_MASK), so the GPU
++ * raises its line (DT kgsl_3d0_irq, SPI 300 = INTID 332, level) when a fence lands, as Linux a8xx and KGSL
++ * expect. iokit/Kernel/arm/PandoraAdrenoGpu.cpp takes the line from /arm-io/gpu through the GIC controller
++ * (SweetGIC.cpp) with a filter that calls pandora_gpu_irq: read RBBM_INT_0_STATUS, write it to
++ * RBBM_INT_CLEAR_CMD (Linux a8xx_irq), wake the fence waiters. Waiters sleep on gpu_fence_chan instead of
++ * polling every 100 us; they also wake every 2 ms and look again, and a fence found done then without its
++ * interrupt is counted ("missed"). The line is enabled once the GPU is up (level 14) and the controller has
++ * registered it; boot-arg pandora_gpu_irq=0 keeps the polling. 64 interrupts in a row with nothing in the
++ * status turn it off again (the line would otherwise fire forever) and the waiters poll.
++ */
++extern void sweet_gic_counts(uint64_t *fired, uint64_t *unregistered, uint64_t *hard_disables);   /* SweetGIC.cpp */
++static int gpu_fence_chan;
++static bool gpu_irq_on;                          /* waiters sleep on gpu_fence_chan */
++static int gpu_irq_state;                        /* 0 none, 1 starting, 2 on, 3 off (refused or given up) */
++static void (*gpu_irq_enable)(void);             /* PandoraAdrenoGpu.cpp: enable the event source */
++static uint64_t gpu_irq_count, gpu_irq_fences, gpu_irq_empty, gpu_wait_sleeps, gpu_wait_missed;
++static uint32_t gpu_irq_other, gpu_irq_empty_run;
++
++/* In the GPU's interrupt filter (primary interrupt context): 0, or 1 to turn the line off. */
++int pandora_gpu_irq(void);
++int
++pandora_gpu_irq(void)
++{
++	const uint32_t st = gr(RBBM_INT_0_STATUS);
++	gpu_irq_count++;
++	if (st == 0) {
++		gpu_irq_empty++;
++		if (++gpu_irq_empty_run >= 64) {
++			__atomic_store_n(&gpu_irq_on, false, __ATOMIC_RELEASE);
++			gpu_irq_state = 3;
++			thread_wakeup((event_t)&gpu_fence_chan);
++			return 1;
++		}
++		return 0;
++	}
++	gpu_irq_empty_run = 0;
++	gw(RBBM_INT_CLEAR_CMD, st);
++	if (st & RBBM_INT_CP_CACHE_FLUSH_TS) {
++		gpu_irq_fences++;
++		thread_wakeup((event_t)&gpu_fence_chan);
++	}
++	gpu_irq_other |= st & ~RBBM_INT_CP_CACHE_FLUSH_TS;
++	return 0;
++}
++
++/* Once both the GPU (level 14) and the event source (PandoraAdrenoGpu::start) are there. */
++static void
++gpu_irq_start(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("pandora_gpu_irq", &on, sizeof(on));
++	if (!gpu_ready || !gpu_irq_enable || !on) {
++		return;
++	}
++	int expect = 0;
++	if (!__atomic_compare_exchange_n(&gpu_irq_state, &expect, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	const uint32_t stale = gr(RBBM_INT_0_STATUS);
++	gw(RBBM_INT_CLEAR_CMD, stale);
++	gpu_irq_enable();
++	__atomic_store_n(&gpu_irq_on, true, __ATOMIC_RELEASE);
++	gpu_irq_state = 2;
++	printf("PANDORA GPU: interrupt on (stale status %08x cleared): fence waits sleep until the GPU's interrupt\n", stale);
++}
++
++/* PandoraAdrenoGpu.cpp: its event source exists (still disabled); ENABLE turns the line on. */
++void pandora_gpu_irq_attach(void (*enable)(void));
++void
++pandora_gpu_irq_attach(void (*enable)(void))
++{
++	gpu_irq_enable = enable;
++	gpu_irq_start();
++}
++
+ /* Without the lock: until fence seq or the timeout (0 = look once). 0, ETIMEDOUT, EINVAL. */
+ int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
+ int
+@@ -2303,13 +2382,41 @@ pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns)
+ 	if (fence >> 32 || (int32_t)(seq - gpu_seqno) > 0) {
+ 		return EINVAL;
+ 	}
+-	uint64_t t0 = mach_absolute_time(), ns = 0;
++	if (!__atomic_load_n(&gpu_irq_on, __ATOMIC_ACQUIRE)) {
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		while (!gpu_fence_done(seq)) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			if (ns >= timeout_ns) {
++				return ETIMEDOUT;
++			}
++			delay(100);
++		}
++		return 0;
++	}
++	uint64_t now = mach_absolute_time(), span, slice;
++	nanoseconds_to_absolutetime(MIN(timeout_ns, 60ull * NSEC_PER_SEC), &span);
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &slice);
++	const uint64_t end = now + span;
+ 	while (!gpu_fence_done(seq)) {
+-		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-		if (ns >= timeout_ns) {
++		now = mach_absolute_time();
++		if (now >= end) {
+ 			return ETIMEDOUT;
+ 		}
+-		delay(100);
++		(void)assert_wait_deadline((event_t)&gpu_fence_chan, THREAD_UNINT, MIN(end, now + slice));
++		if (gpu_fence_done(seq)) {
++			(void)clear_wait(current_thread(), THREAD_AWAKENED);
++			break;
++		}
++		gpu_wait_sleeps++;
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && gpu_fence_done(seq)) {
++			gpu_wait_missed++;
++		}
++		if (!__atomic_load_n(&gpu_irq_on, __ATOMIC_ACQUIRE)) {   /* turned off meanwhile: poll the rest */
++			uint64_t left = 0;
++			now = mach_absolute_time();
++			absolutetime_to_nanoseconds(end > now ? end - now : 0, &left);
++			return pandora_gpu_wait(fence, left);
++		}
+ 	}
+ 	return 0;
+ }
+@@ -2921,6 +3028,7 @@ gpu_level14(bool rest)
+ 	gpu_chip_id = 0x44050a01u | ((uint32_t)__builtin_popcount(slices) << 4);
+ 	printf("PANDORA GPU: slice mask %x, chip id %08x\n", slices, gpu_chip_id);
+ 	gpu_ready = true;
++	gpu_irq_start();   /* 0216: when PandoraAdrenoGpu already registered the line */
+ 	gpu_step("user interface: kernel self-test through it");
+ 	int c = pandora_gpu_open();
+ 	uint64_t h = 0, ws = 0, wsz = 0, fence = 0;
+@@ -3279,6 +3387,12 @@ gpu_dcvs_thread(void *arg, wait_result_t result)
+ 			}
+ 			printf("PANDORA GPU DCVS: busy %llu%%, MHz:time%s, %u changes, %u boosts, %u failed, now %u MHz\n",
+ 			    win_busy * 100 / win_ns, used, changes, boosts, failed, gpu_opps[cur - 1].hz / 1000000);
++			uint64_t fired, unreg, hard;
++			sweet_gic_counts(&fired, &unreg, &hard);
++			printf("PANDORA GPU IRQ: state %d, %llu interrupts (%llu fences, %llu empty, other bits %08x); waits slept %llu, "
++			    "found done without the interrupt %llu | GIC %llu fired, %llu unregistered, %llu hard-disabled\n",
++			    gpu_irq_state, gpu_irq_count, gpu_irq_fences, gpu_irq_empty, gpu_irq_other, gpu_wait_sleeps,
++			    gpu_wait_missed, fired, unreg, hard);
+ 			win_busy = win_ns = 0;
+ 			changes = failed = boosts = 0;
+ 		}
+diff --git a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+index 4499e56..e633be6 100644
+--- a/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
++++ b/iokit/Kernel/arm/PandoraAdrenoGpu.cpp
+@@ -24,6 +24,10 @@
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <kern/thread.h>
+ #include "NativeAdrenoABIv1.h"
+ 
+ extern "C" {
+@@ -44,6 +48,9 @@ uint32_t pandora_gpu_chip_id(void);
+ int pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, bool readonly,
+     uint64_t *handle);
+ void pandora_gpu_release_ref(void *ref);
++int pandora_gpu_irq(void);
++void pandora_gpu_irq_attach(void (*enable)(void));
++bool sweet_gic_ready(void);
+ }
+ 
+ #define PANDORA_GPU_OPEN_TYPE   0x4147u
+@@ -427,7 +434,11 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ class PandoraAdrenoGpu : public IOService {
+ 	OSDeclareDefaultStructors(PandoraAdrenoGpu);
+ 
++	bool irqFilter(IOFilterInterruptEventSource *source);
++	void irqAction(IOInterruptEventSource *source, int count);
++
+ public:
++	void startInterrupt(void);   /* on its own thread (start): it waits for the GIC controller and the nub */
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+ 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+@@ -435,6 +446,79 @@ public:
+ 
+ OSDefineMetaClassAndStructors(PandoraAdrenoGpu, IOService);
+ 
++/*
++ * Patch 0216: the GPU's interrupt line, from its device tree node /arm-io/gpu ("interrupts" INTID 332 level,
++ * "interrupt-parent" the GIC; tools/mkadt_pandora.py) through the GIC controller (SweetGIC.cpp), the way an
++ * iPhone driver takes its interrupts. The filter runs at interrupt time: pandora_gpu_irq clears the GPU's
++ * interrupt status and wakes the fence waiters; nothing is left for the work loop. bsd/dev/pandora_gpu.c
++ * enables the source once the GPU is up.
++ */
++static IOFilterInterruptEventSource *gPandoraGpuIrq;
++static IOWorkLoop *gPandoraGpuLoop;
++
++static void
++pandora_gpu_irq_enable(void)
++{
++	if (gPandoraGpuIrq != nullptr) {
++		gPandoraGpuIrq->enable();
++	}
++}
++
++bool
++PandoraAdrenoGpu::irqFilter(IOFilterInterruptEventSource *source)
++{
++	if (pandora_gpu_irq() != 0) {
++		source->disable();   /* status stayed empty: polling from now on */
++	}
++	return false;
++}
++
++void
++PandoraAdrenoGpu::irqAction(IOInterruptEventSource *, int)
++{
++}
++
++void
++PandoraAdrenoGpu::startInterrupt(void)
++{
++	/* This service matches on IOResources and can start before the platform expert has made the GIC
++	 * controller and the /arm-io nubs: wait for both (they come within the first second). */
++	OSDictionary *want = IOService::serviceMatching("SweetGIC");
++	IOService *gic = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
++	OSSafeReleaseNULL(want);
++	want = IOService::nameMatching("gpu");
++	IOService *nub = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
++	OSSafeReleaseNULL(want);
++	OSSafeReleaseNULL(gic);
++	IORegistryEntry *node = nub;   /* released below */
++	if (nub == nullptr || !sweet_gic_ready() || nub->getProperty("IOInterruptSpecifiers") == nullptr) {
++		IOLog("PANDORA GPU UC: no interrupt (node %d, controller %d): fence waits poll\n", nub != nullptr,
++		    sweet_gic_ready());
++		OSSafeReleaseNULL(node);
++		return;
++	}
++	gPandoraGpuLoop = IOWorkLoop::workLoop();
++	gPandoraGpuIrq = gPandoraGpuLoop == nullptr ? nullptr : IOFilterInterruptEventSource::filterInterruptEventSource(this,
++	    OSMemberFunctionCast(IOInterruptEventSource::Action, this, &PandoraAdrenoGpu::irqAction),
++	    OSMemberFunctionCast(IOFilterInterruptEventSource::Filter, this, &PandoraAdrenoGpu::irqFilter), nub, 0);
++	if (gPandoraGpuIrq == nullptr || gPandoraGpuLoop->addEventSource(gPandoraGpuIrq) != kIOReturnSuccess) {
++		IOLog("PANDORA GPU UC: interrupt source refused: fence waits poll\n");
++		OSSafeReleaseNULL(gPandoraGpuIrq);
++		OSSafeReleaseNULL(node);
++		return;
++	}
++	gPandoraGpuIrq->disable();
++	IOLog("PANDORA GPU UC: interrupt source on %s, enabled when the GPU is up\n", nub->getName());
++	pandora_gpu_irq_attach(pandora_gpu_irq_enable);
++	OSSafeReleaseNULL(node);
++}
++
++static void
++pandora_gpu_irq_thread(void *arg, wait_result_t)
++{
++	static_cast<PandoraAdrenoGpu *>(arg)->startInterrupt();
++}
++
+ bool
+ PandoraAdrenoGpu::start(IOService *provider)
+ {
+@@ -444,6 +528,10 @@ PandoraAdrenoGpu::start(IOService *provider)
+ 	setName("NativeAdrenoGpu");
+ 	registerService();
+ 	IOLog("PANDORA GPU UC: PandoraAdrenoGpu registered\n");
++	thread_t thread;
++	if (kernel_thread_start(pandora_gpu_irq_thread, this, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetGIC.cpp b/iokit/Kernel/arm/SweetGIC.cpp
+new file mode 100644
+index 0000000..7c7bef4
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGIC.cpp
+@@ -0,0 +1,236 @@
++/*
++ * PANDORA (patch 0216): the GIC as IOKit's interrupt controller for device interrupts.
++ *
++ * On an iPhone the AIC driver registers as the platform's interrupt controller and every driver takes its
++ * interrupts through IOInterruptEventSource on its device tree nub ("interrupts" + "interrupt-parent");
++ * IODeviceTreeSupport turns those into IOInterruptControllers / IOInterruptSpecifiers when the tree is read.
++ * Here the GIC's distributor is that controller: SweetPlatformExpert creates this object for /arm-io/gic
++ * (#interrupt-cells 2: INTID, Linux trigger flags), registers it under IODTInterruptControllerName and
++ * installs its handleInterrupt on every CPU. sleh_irq (SWEET) already takes Group 1 interrupts: the timer and
++ * IPIs itself, every other INTID through the CPU's interrupt handler, then writes EOIR.
++ *
++ * Shared peripheral interrupts only (INTID 32-1019), all level-sensitive (the phone's GPU and display lines
++ * are IRQ_TYPE_LEVEL_HIGH), routed to the boot CPU. The configuration follows Linux irq-gic-v3 for an SPI:
++ * Group 1 non-secure, priority 0xa0, level, IROUTER = target affinity, enable through ISENABLER, disable
++ * through ICENABLER and wait for GICD_CTLR.RWP. IOInterruptController's protocol: a driver's disable is
++ * soft; when the line fires again while soft-disabled, handleInterrupt disables it in the distributor.
++ */
++#include <pexpert/arm64/board_config.h>
++#include <IOKit/IOInterruptController.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++#if defined(PANDORA)
++extern "C" vm_offset_t sweet_gicd_base(void);   /* pexpert/arm/pe_fiq.c */
++extern "C" void pandora_install_interrupt_handler_all(void *nub, int source, void *target,
++    IOInterruptHandler handler, void *refCon);   /* osfmk/arm64/machine_routines.c */
++bool sweet_gic_create(IOService *platform, IORegistryEntry *node);   /* SweetPlatformExpert.cpp */
++extern "C" bool sweet_gic_ready(void);                               /* PandoraAdrenoGpu.cpp */
++extern "C" void sweet_gic_counts(uint64_t *fired, uint64_t *unregistered, uint64_t *hard_disables);
++
++#define GIC_VECTORS       1020u
++#define GIC_FIRST_SPI     32u
++#define GICD_CTLR         0x0000u
++#define GICD_CTLR_RWP     (1u << 31)
++#define GICD_IGROUPR      0x0080u
++#define GICD_ISENABLER    0x0100u
++#define GICD_ICENABLER    0x0180u
++#define GICD_ISPENDR      0x0200u
++#define GICD_ICPENDR      0x0280u
++#define GICD_IPRIORITYR   0x0400u
++#define GICD_ICFGR        0x0c00u
++#define GICD_IROUTER      0x6000u
++
++class SweetGIC : public IOInterruptController {
++	OSDeclareDefaultStructors(SweetGIC);
++
++	vm_offset_t gicd = 0;
++	uint64_t    route = 0;      /* IROUTER value: the boot CPU's affinity, IRM 0 */
++
++	uint32_t rd(uint32_t o) const { return *(volatile uint32_t *)(gicd + o); }
++	void wr(uint32_t o, uint32_t v) const { *(volatile uint32_t *)(gicd + o) = v; }
++	void waitRWP() const;
++
++public:
++	/* Counts for the log (bsd/dev/pandora_gpu.c prints them with the GPU's). */
++	uint64_t    fired = 0, unregistered = 0, hardDisables = 0;
++
++	bool setup(IOService *platform, IORegistryEntry *node);
++	IOReturn handleInterrupt(void *refCon, IOService *nub, int source) APPLE_KEXT_OVERRIDE;
++	bool vectorCanBeShared(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++	void initVector(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++	int getVectorType(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++	void disableVectorHard(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++	void enableVector(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++	void causeVector(IOInterruptVectorNumber n, IOInterruptVector *v) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGIC, IOInterruptController);
++
++static SweetGIC *gSweetGIC;
++
++void
++SweetGIC::waitRWP() const
++{
++	for (unsigned i = 0; i < 100000 && (rd(GICD_CTLR) & GICD_CTLR_RWP); i++) {
++	}
++}
++
++bool
++SweetGIC::setup(IOService *platform, IORegistryEntry *node)
++{
++	gicd = sweet_gicd_base();
++	const ml_topology_info_t *t = ml_get_topology_info();
++	if (!gicd || !t || !t->boot_cpu) {
++		IOLog("SWEET GIC: no distributor mapping or boot CPU\n");
++		return false;
++	}
++	const uint64_t mpidr = t->boot_cpu->phys_id;
++	route = (mpidr & 0x00ffffffull) | ((mpidr & 0xff00000000ull));   /* Aff3 at [39:32], Aff2..Aff0 at [23:0] */
++	vectors = IONewZero(IOInterruptVector, GIC_VECTORS);
++	if (!vectors) {
++		return false;
++	}
++	for (unsigned i = 0; i < GIC_VECTORS; i++) {
++		vectors[i].interruptLock = IOLockAlloc();
++		if (!vectors[i].interruptLock) {
++			return false;
++		}
++	}
++	const OSSymbol *name = IODTInterruptControllerName(node);
++	if (!name) {
++		return false;
++	}
++	pandora_install_interrupt_handler_all(this, 0, this,
++	    OSMemberFunctionCast(IOInterruptHandler, this, &SweetGIC::handleInterrupt), NULL);
++	IOPlatformExpert *pe = OSDynamicCast(IOPlatformExpert, platform);
++	if (!pe) {
++		name->release();
++		return false;
++	}
++	pe->registerInterruptController(const_cast<OSSymbol *>(name), this);
++	IOLog("SWEET GIC: interrupt controller %s, SPIs %u-%u to MPIDR %#llx, %u lines in the distributor\n",
++	    name->getCStringNoCopy(), GIC_FIRST_SPI, GIC_VECTORS - 1, mpidr, 32u * ((rd(0x4) & 0x1f) + 1));
++	name->release();
++	__atomic_store_n(&gSweetGIC, this, __ATOMIC_RELEASE);
++	return true;
++}
++
++IOReturn
++SweetGIC::handleInterrupt(void * /*refCon*/, IOService * /*nub*/, int source)
++{
++	if (source < (int)GIC_FIRST_SPI || source >= (int)GIC_VECTORS) {
++		return kIOReturnInvalid;
++	}
++	IOInterruptVector *v = &vectors[source];
++	fired++;
++	if (!v->interruptRegistered) {
++		unregistered++;
++		disableVectorHard(source, v);   /* nobody to clear the source: keep the line quiet */
++		return kIOReturnInvalid;
++	}
++	v->interruptActive = 1;
++	OSMemoryBarrier();
++	if (!v->interruptDisabledSoft) {
++		v->handler(v->target, v->refCon, v->nub, v->source);
++	} else if (!v->interruptDisabledHard) {
++		/* the driver disabled it (IOInterruptEventSource does for a level line until its work loop runs) */
++		v->interruptDisabledHard = 1;
++		hardDisables++;
++		disableVectorHard(source, v);
++	}
++	v->interruptActive = 0;
++	return kIOReturnSuccess;
++}
++
++bool
++SweetGIC::vectorCanBeShared(IOInterruptVectorNumber, IOInterruptVector *)
++{
++	return false;
++}
++
++void
++SweetGIC::initVector(IOInterruptVectorNumber n, IOInterruptVector *)
++{
++	if (n < GIC_FIRST_SPI || n >= GIC_VECTORS) {
++		return;
++	}
++	const uint32_t bit = 1u << (n % 32), word = 4 * (n / 32);
++	wr(GICD_ICENABLER + word, bit);
++	waitRWP();
++	wr(GICD_IGROUPR + word, rd(GICD_IGROUPR + word) | bit);        /* Group 1 NS (WI if the secure side owns it) */
++	*(volatile uint8_t *)(gicd + GICD_IPRIORITYR + n) = 0xa0;
++	const uint32_t cfg = GICD_ICFGR + 4 * (n / 16), shift = 2 * (n % 16) + 1;
++	wr(cfg, rd(cfg) & ~(1u << shift));                              /* level-sensitive */
++	*(volatile uint64_t *)(gicd + GICD_IROUTER + 8 * n) = route;
++	wr(GICD_ICPENDR + word, bit);
++}
++
++int
++SweetGIC::getVectorType(IOInterruptVectorNumber, IOInterruptVector *)
++{
++	return kIOInterruptTypeLevel;
++}
++
++void
++SweetGIC::disableVectorHard(IOInterruptVectorNumber n, IOInterruptVector *)
++{
++	if (n >= GIC_FIRST_SPI && n < GIC_VECTORS) {
++		wr(GICD_ICENABLER + 4 * (n / 32), 1u << (n % 32));
++		waitRWP();
++	}
++}
++
++void
++SweetGIC::enableVector(IOInterruptVectorNumber n, IOInterruptVector *)
++{
++	if (n >= GIC_FIRST_SPI && n < GIC_VECTORS) {
++		wr(GICD_ISENABLER + 4 * (n / 32), 1u << (n % 32));
++	}
++}
++
++void
++SweetGIC::causeVector(IOInterruptVectorNumber n, IOInterruptVector *)
++{
++	if (n >= GIC_FIRST_SPI && n < GIC_VECTORS) {
++		wr(GICD_ISPENDR + 4 * (n / 32), 1u << (n % 32));
++	}
++}
++
++/* For SweetPlatformExpert::processTopLevel: create and register the controller for the /arm-io/gic node. */
++bool
++sweet_gic_create(IOService *platform, IORegistryEntry *node)
++{
++	SweetGIC *gic = OSTypeAlloc(SweetGIC);
++	if (!gic || !gic->init()) {
++		OSSafeReleaseNULL(gic);
++		return false;
++	}
++	gic->setName("gic");
++	if (!gic->attach(platform) || !gic->setup(platform, node)) {
++		IOLog("SWEET GIC: setup failed; device interrupts stay off\n");
++		return false;
++	}
++	gic->registerService();
++	return true;
++}
++
++/* Whether device interrupts can be registered, and the controller's counts (for logs). */
++extern "C" bool
++sweet_gic_ready(void)
++{
++	return __atomic_load_n(&gSweetGIC, __ATOMIC_ACQUIRE) != NULL;
++}
++
++extern "C" void
++sweet_gic_counts(uint64_t *fired, uint64_t *unregistered, uint64_t *hard_disables)
++{
++	SweetGIC *g = __atomic_load_n(&gSweetGIC, __ATOMIC_ACQUIRE);
++	*fired = g ? g->fired : 0;
++	*unregistered = g ? g->unregistered : 0;
++	*hard_disables = g ? g->hardDisables : 0;
++}
++#endif /* PANDORA */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 9871221..efdec4c 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -84,6 +84,10 @@ SweetPlatformExpert::excludeList(void)
+ #endif
+ }
+ 
++#if defined(PANDORA)
++extern bool sweet_gic_create(IOService *platform, IORegistryEntry *node);   /* SweetGIC.cpp (0216) */
++#endif
++
+ void
+ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+ {
+@@ -107,6 +111,14 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+ 	 */
+ 	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
+ 	if (armio != NULL) {
++#if defined(PANDORA)
++		/* 0216: the GIC as IOKit's interrupt controller for the nubs' "interrupts" (still no nub of its own). */
++		IORegistryEntry *gic = armio->childFromPath("gic", gIODTPlane);
++		if (gic != NULL) {
++			(void)sweet_gic_create(this, gic);
++			gic->release();
++		}
++#endif
+ 		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+ 		armio->release();
+ 	}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index a498c82..7745d33 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokit
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/PandoraPMGRNub.cpp                              optional iokitcpp
+ iokit/Kernel/arm/PandoraAdrenoGpu.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 3ada50e..36d5d3c 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -820,6 +820,35 @@ ml_install_interrupt_handler(
+ 	(void) ml_set_interrupts_enabled(current_state);
+ }
+ 
++#if defined(PANDORA)
++/*
++ * 0216: ml_install_interrupt_handler for every CPU at once. SWEET's sleh_irq hands every interrupt other than
++ * the timer and IPIs to the CPU's interrupt handler; the GIC controller (iokit/Kernel/arm/SweetGIC.cpp) is
++ * created after the CPUs have started, so it installs itself on all of them from one thread. The handler is
++ * stored last, after the rest is visible.
++ */
++void pandora_install_interrupt_handler_all(void *nub, int source, void *target, IOInterruptHandler handler,
++    void *refCon);
++void
++pandora_install_interrupt_handler_all(void *nub, int source, void *target, IOInterruptHandler handler,
++    void *refCon)
++{
++	for (int cpu = 0; cpu <= ml_get_max_cpu_number(); cpu++) {
++		cpu_data_t *cdp = cpu_datap(cpu);
++		if (cdp == NULL) {
++			continue;
++		}
++		cdp->interrupt_nub = nub;
++		cdp->interrupt_source = source;
++		cdp->interrupt_target = target;
++		cdp->interrupt_refCon = refCon;
++		__builtin_arm_dmb(DMB_ISH);
++		cdp->interrupt_handler = handler;
++	}
++	__builtin_arm_dsb(DSB_ISH);
++}
++#endif
++
+ /*
+  *	Routine:        ml_init_interrupt
+  *	Function:	Initialize Interrupts
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 291d2dc..fcf2e47 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -26,6 +26,16 @@ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+ 
++#if defined(SWEET)
++/* The distributor mapping, for iokit/Kernel/arm/SweetGIC.cpp (0216): it configures SPIs there. */
++vm_offset_t sweet_gicd_base(void);
++vm_offset_t
++sweet_gicd_base(void)
++{
++	return gicd_base;
++}
++#endif
++
+ static uint32_t
+ _gic_read32(vm_offset_t addr)
+ {

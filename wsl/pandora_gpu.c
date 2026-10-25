@@ -1441,6 +1441,8 @@ gpu_level9(void)
 /* A8XX GPU registers, dword offsets (a6xx.xml A8XX variants = gen8_reg.h) */
 #define RBBM_GBIF_HALT            0x00au
 #define RBBM_INT_0_STATUS         0x06au
+#define RBBM_INT_CLEAR_CMD        0x061u
+#define RBBM_INT_CP_CACHE_FLUSH_TS (1u << 20)  /* the ring timestamp event with its IRQ bit (gpu_submit) */
 #define CP_RB_BASE                0x800u
 #define CP_RB_CNTL                0x802u
 #define CP_RB_RPTR_ADDR           0x804u
@@ -2294,6 +2296,83 @@ pandora_gpu_issued(void)
 	return gpu_ready ? gpu_seqno : 0;
 }
 
+/*
+ * Patch 0216: the GPU's interrupt. Every submission ends with a ring timestamp event that has its IRQ bit
+ * set (gpu_submit), and hw_init leaves CP_CACHE_FLUSH_TS in RBBM_INT_0_MASK (A8XX_INT_MASK), so the GPU
+ * raises its line (DT kgsl_3d0_irq, SPI 300 = INTID 332, level) when a fence lands, as Linux a8xx and KGSL
+ * expect. iokit/Kernel/arm/PandoraAdrenoGpu.cpp takes the line from /arm-io/gpu through the GIC controller
+ * (SweetGIC.cpp) with a filter that calls pandora_gpu_irq: read RBBM_INT_0_STATUS, write it to
+ * RBBM_INT_CLEAR_CMD (Linux a8xx_irq), wake the fence waiters. Waiters sleep on gpu_fence_chan instead of
+ * polling every 100 us; they also wake every 2 ms and look again, and a fence found done then without its
+ * interrupt is counted ("missed"). The line is enabled once the GPU is up (level 14) and the controller has
+ * registered it; boot-arg pandora_gpu_irq=0 keeps the polling. 64 interrupts in a row with nothing in the
+ * status turn it off again (the line would otherwise fire forever) and the waiters poll.
+ */
+extern void sweet_gic_counts(uint64_t *fired, uint64_t *unregistered, uint64_t *hard_disables);   /* SweetGIC.cpp */
+static int gpu_fence_chan;
+static bool gpu_irq_on;                          /* waiters sleep on gpu_fence_chan */
+static int gpu_irq_state;                        /* 0 none, 1 starting, 2 on, 3 off (refused or given up) */
+static void (*gpu_irq_enable)(void);             /* PandoraAdrenoGpu.cpp: enable the event source */
+static uint64_t gpu_irq_count, gpu_irq_fences, gpu_irq_empty, gpu_wait_sleeps, gpu_wait_missed;
+static uint32_t gpu_irq_other, gpu_irq_empty_run;
+
+/* In the GPU's interrupt filter (primary interrupt context): 0, or 1 to turn the line off. */
+int pandora_gpu_irq(void);
+int
+pandora_gpu_irq(void)
+{
+	const uint32_t st = gr(RBBM_INT_0_STATUS);
+	gpu_irq_count++;
+	if (st == 0) {
+		gpu_irq_empty++;
+		if (++gpu_irq_empty_run >= 64) {
+			__atomic_store_n(&gpu_irq_on, false, __ATOMIC_RELEASE);
+			gpu_irq_state = 3;
+			thread_wakeup((event_t)&gpu_fence_chan);
+			return 1;
+		}
+		return 0;
+	}
+	gpu_irq_empty_run = 0;
+	gw(RBBM_INT_CLEAR_CMD, st);
+	if (st & RBBM_INT_CP_CACHE_FLUSH_TS) {
+		gpu_irq_fences++;
+		thread_wakeup((event_t)&gpu_fence_chan);
+	}
+	gpu_irq_other |= st & ~RBBM_INT_CP_CACHE_FLUSH_TS;
+	return 0;
+}
+
+/* Once both the GPU (level 14) and the event source (PandoraAdrenoGpu::start) are there. */
+static void
+gpu_irq_start(void)
+{
+	int on = 1;
+	(void)PE_parse_boot_argn("pandora_gpu_irq", &on, sizeof(on));
+	if (!gpu_ready || !gpu_irq_enable || !on) {
+		return;
+	}
+	int expect = 0;
+	if (!__atomic_compare_exchange_n(&gpu_irq_state, &expect, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	const uint32_t stale = gr(RBBM_INT_0_STATUS);
+	gw(RBBM_INT_CLEAR_CMD, stale);
+	gpu_irq_enable();
+	__atomic_store_n(&gpu_irq_on, true, __ATOMIC_RELEASE);
+	gpu_irq_state = 2;
+	printf("PANDORA GPU: interrupt on (stale status %08x cleared): fence waits sleep until the GPU's interrupt\n", stale);
+}
+
+/* PandoraAdrenoGpu.cpp: its event source exists (still disabled); ENABLE turns the line on. */
+void pandora_gpu_irq_attach(void (*enable)(void));
+void
+pandora_gpu_irq_attach(void (*enable)(void))
+{
+	gpu_irq_enable = enable;
+	gpu_irq_start();
+}
+
 /* Without the lock: until fence seq or the timeout (0 = look once). 0, ETIMEDOUT, EINVAL. */
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 int
@@ -2303,13 +2382,41 @@ pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns)
 	if (fence >> 32 || (int32_t)(seq - gpu_seqno) > 0) {
 		return EINVAL;
 	}
-	uint64_t t0 = mach_absolute_time(), ns = 0;
+	if (!__atomic_load_n(&gpu_irq_on, __ATOMIC_ACQUIRE)) {
+		uint64_t t0 = mach_absolute_time(), ns = 0;
+		while (!gpu_fence_done(seq)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			if (ns >= timeout_ns) {
+				return ETIMEDOUT;
+			}
+			delay(100);
+		}
+		return 0;
+	}
+	uint64_t now = mach_absolute_time(), span, slice;
+	nanoseconds_to_absolutetime(MIN(timeout_ns, 60ull * NSEC_PER_SEC), &span);
+	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &slice);
+	const uint64_t end = now + span;
 	while (!gpu_fence_done(seq)) {
-		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-		if (ns >= timeout_ns) {
+		now = mach_absolute_time();
+		if (now >= end) {
 			return ETIMEDOUT;
 		}
-		delay(100);
+		(void)assert_wait_deadline((event_t)&gpu_fence_chan, THREAD_UNINT, MIN(end, now + slice));
+		if (gpu_fence_done(seq)) {
+			(void)clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		gpu_wait_sleeps++;
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && gpu_fence_done(seq)) {
+			gpu_wait_missed++;
+		}
+		if (!__atomic_load_n(&gpu_irq_on, __ATOMIC_ACQUIRE)) {   /* turned off meanwhile: poll the rest */
+			uint64_t left = 0;
+			now = mach_absolute_time();
+			absolutetime_to_nanoseconds(end > now ? end - now : 0, &left);
+			return pandora_gpu_wait(fence, left);
+		}
 	}
 	return 0;
 }
@@ -2921,6 +3028,7 @@ gpu_level14(bool rest)
 	gpu_chip_id = 0x44050a01u | ((uint32_t)__builtin_popcount(slices) << 4);
 	printf("PANDORA GPU: slice mask %x, chip id %08x\n", slices, gpu_chip_id);
 	gpu_ready = true;
+	gpu_irq_start();   /* 0216: when PandoraAdrenoGpu already registered the line */
 	gpu_step("user interface: kernel self-test through it");
 	int c = pandora_gpu_open();
 	uint64_t h = 0, ws = 0, wsz = 0, fence = 0;
@@ -3279,6 +3387,12 @@ gpu_dcvs_thread(void *arg, wait_result_t result)
 			}
 			printf("PANDORA GPU DCVS: busy %llu%%, MHz:time%s, %u changes, %u boosts, %u failed, now %u MHz\n",
 			    win_busy * 100 / win_ns, used, changes, boosts, failed, gpu_opps[cur - 1].hz / 1000000);
+			uint64_t fired, unreg, hard;
+			sweet_gic_counts(&fired, &unreg, &hard);
+			printf("PANDORA GPU IRQ: state %d, %llu interrupts (%llu fences, %llu empty, other bits %08x); waits slept %llu, "
+			    "found done without the interrupt %llu | GIC %llu fired, %llu unregistered, %llu hard-disabled\n",
+			    gpu_irq_state, gpu_irq_count, gpu_irq_fences, gpu_irq_empty, gpu_irq_other, gpu_wait_sleeps,
+			    gpu_wait_missed, fired, unreg, hard);
 			win_busy = win_ns = 0;
 			changes = failed = boosts = 0;
 		}

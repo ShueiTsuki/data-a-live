@@ -265,10 +265,14 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
+    # The GIC is also IOKit's interrupt controller (patch 0216, iokit/Kernel/arm/SweetGIC.cpp): nubs name it
+    # in "interrupt-parent" and give "interrupts" as <INTID, Linux trigger flags> (#interrupt-cells 2).
+    gic_phandle = next(phandle)
     gic = node('gic', [
-        ph(),
+        ('AAPL,phandle', u32(gic_phandle)),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
+        ('#interrupt-cells', u32(2)),
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu or qemu_gic else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
@@ -294,6 +298,14 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
+        ]),
+        # The Adreno 840 (patch 0216): its interrupt line for PandoraAdrenoGpu.cpp. The phone's DT
+        # (qcom,kgsl-3d0@3d00000) gives kgsl_3d0_irq as <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH> = INTID 332.
+        node('gpu', [
+            ph(),
+            ('compatible', cstr('qcom,adreno-840') + cstr('qcom,adreno-gpu-gen8-2-1')),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 300) + u32(4)),
         ])])
 
     fbcon = node('sweet-fbcon', [
