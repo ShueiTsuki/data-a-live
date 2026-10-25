@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Turnip (Mesa 85fda3b with UniXNU's patches) counts how it draws each render pass, for the Metal plugin's log
-(tools/metal/adapt_ios16.py): in on-chip tiles (GMEM: passes, tiles drawn, passes with hardware binning) or
+(tools/metal/adapt_ios16.py): in on-chip tiles (GMEM: passes, tiles drawn, passes with hardware binning, and
+passes that store an attachment neither loaded nor cleared, render area whole or part: r1c showed a widget
+garbled for a while once GMEM was allowed, and such a store is where GMEM and sysmem differ) or
 straight to memory (sysmem) with the reason Turnip gives in gmem_disable_reason ("Autotune selected sysmem",
 "TU_DEBUG(SYSMEM)", ...). tu_pandora_render_stats(out, size) writes the totals as one line. Counting only:
 which path a pass takes is still Turnip's own choice (use_sysmem_rendering and its autotune).
@@ -22,6 +24,7 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
 {''', '''/* data-a-live (tools/turnip/pandora_rpstats.py): how render passes are drawn, for the Metal plugin's log. */
 static struct {
    uint64_t gmem, tiles, binned, sysmem;
+   uint64_t undef_full, undef_part;   /* GMEM passes storing an attachment neither loaded nor cleared */
    const char *reason[8];
    uint64_t by_reason[8];
 } pandora_rp;
@@ -35,6 +38,22 @@ pandora_rp_note(struct tu_cmd_buffer *cmd, bool sysmem)
       p_atomic_add(&pandora_rp.tiles, (uint64_t)vsc->tile_count.width * vsc->tile_count.height);
       if (use_hw_binning(cmd))
          p_atomic_inc(&pandora_rp.binned);
+      /* An attachment stored but neither loaded nor cleared: in GMEM its pixels no draw reaches are
+       * stored from whatever the tile held; in sysmem they keep what memory held. */
+      const struct tu_render_pass *pass = cmd->state.pass;
+      const struct tu_framebuffer *fb = cmd->state.framebuffer;
+      bool undef = false;
+      for (uint32_t i = 0; pass && i < pass->attachment_count; i++) {
+         const struct tu_render_pass_attachment *att = &pass->attachments[i];
+         if (att->gmem && att->store && !att->load && !att->clear_mask)
+            undef = true;
+      }
+      if (undef) {
+         const VkRect2D *ra = &cmd->state.render_areas[0];
+         const bool full = fb && ra->offset.x == 0 && ra->offset.y == 0 &&
+                           ra->extent.width >= fb->width && ra->extent.height >= fb->height;
+         p_atomic_inc(full ? &pandora_rp.undef_full : &pandora_rp.undef_part);
+      }
       return;
    }
    p_atomic_inc(&pandora_rp.sysmem);
@@ -52,10 +71,12 @@ extern "C" __attribute__((visibility("default"))) size_t tu_pandora_render_stats
 extern "C" __attribute__((visibility("default"))) size_t
 tu_pandora_render_stats(char *out, size_t size)
 {
-   int at = snprintf(out, size, "gmem %llu (tiles %llu, hw binning %llu) sysmem %llu",
+   int at = snprintf(out, size, "gmem %llu (tiles %llu, hw binning %llu, undefined store full %llu part %llu) sysmem %llu",
                      (unsigned long long)p_atomic_read(&pandora_rp.gmem),
                      (unsigned long long)p_atomic_read(&pandora_rp.tiles),
                      (unsigned long long)p_atomic_read(&pandora_rp.binned),
+                     (unsigned long long)p_atomic_read(&pandora_rp.undef_full),
+                     (unsigned long long)p_atomic_read(&pandora_rp.undef_part),
                      (unsigned long long)p_atomic_read(&pandora_rp.sysmem));
    for (unsigned i = 0; i < ARRAY_SIZE(pandora_rp.reason) && at > 0 && (size_t)at < size; i++) {
       const char *why = (const char *)p_atomic_read(&pandora_rp.reason[i]);
