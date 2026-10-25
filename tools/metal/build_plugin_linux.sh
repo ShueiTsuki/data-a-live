@@ -39,25 +39,35 @@ print("};")' "$B/$n.spv" "$n"
 } > "$B/gen/NativeTurnipShaders.h"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
-# A metal2vulkan tree kept between builds (so Rust reuses its build) already carries the patches.
-for p in "$NM"/bridge/patches/000*.patch; do
-	if git -C "$M2V" apply --reverse --check "$p" 2>/dev/null; then
-		echo "   $(basename "$p") (already applied)"
-	else
-		echo "   $(basename "$p")"
-		git -C "$M2V" apply "$p"
-	fi
-done
-# data-a-live's own runtime changes (tools/metal/m2v/NNNN-*.patch, made against the tree above), in order.
+# The patches, in order: NativeMetal's, then data-a-live's own runtime changes (tools/metal/m2v/NNNN-*.patch, made
+# against the tree after NativeMetal's).
+PATCHES=("$NM"/bridge/patches/000*.patch)
 for p in "$(cd "$(dirname "$0")" && pwd)"/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
-	[ -e "$p" ] || continue
-	if git -C "$M2V" apply --reverse --check "$p" 2>/dev/null; then
-		echo "   m2v/$(basename "$p") (already applied)"
-	else
-		echo "   m2v/$(basename "$p")"
-		git -C "$M2V" apply "$p"
-	fi
+	[ -e "$p" ] && PATCHES+=("$p")
 done
+# A metal2vulkan checkout kept between builds (so Rust reuses its build) carries the stack it was last given, named by a
+# stamp in its .git: the same stack stays; another starts again from its commit, every patch applied anew. Whether one
+# patch is applied cannot be read from the tree alone: a later patch changes lines an earlier one made, and the earlier
+# one's reverse check then fails though it is applied.
+WANT=$(sha256sum "${PATCHES[@]}" | awk '{print $1}' | sha256sum | cut -c1-16)
+STAMP=
+if GIT_DIR_M2V=$(git -C "$M2V" rev-parse --absolute-git-dir 2>/dev/null); then
+	STAMP=$GIT_DIR_M2V/data-a-live-patches
+	if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ]; then
+		echo "   another stack than the tree's: back to $(git -C "$M2V" rev-parse --short HEAD)"
+		git -C "$M2V" checkout -q -- . && git -C "$M2V" clean -fdq
+		rm -f "$STAMP"
+	fi
+fi
+if [ -n "$STAMP" ] && [ -f "$STAMP" ]; then
+	echo "   ${#PATCHES[@]} patches as last applied ($WANT)"
+else
+	for p in "${PATCHES[@]}"; do
+		case $p in */m2v/*) echo "   m2v/$(basename "$p")" ;; *) echo "   $(basename "$p")" ;; esac
+		git -C "$M2V" apply "$p"
+	done
+	[ -z "$STAMP" ] || echo "$WANT" > "$STAMP"
+fi
 "$LLVM_AS" -o "$B/runtime_examples.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$B/function_constant.air" "$M2V/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
 cat > "$B/Cargo.toml" <<EOF

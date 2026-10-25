@@ -1220,6 +1220,9 @@ pub extern "C" fn nmb_device_work_counts(device: *const NmbDevice, out: *mut c_c
 # 1125 pixels at 4608-byte rows, is copied in and out around every pass into it. pandora_m2v_padded=alias in the
 # boot-args makes such a texture an image over the surface's rows instead, Apple's own Metal's way (it renders into the
 # IOSurface), for a test of whether Turnip leaves the bytes between the rows; without it the runtime's default stands.
+# The same device options refuse rebinds of no-copy buffers (m2v 0006, DeviceOptions::refuse_rebinds), which this
+# frontend never makes: while CA's no-copy buffers live, every encoder logged each call for a rebind that never came.
+# pandora_m2v_rebinds=allow in the boot-args keeps the runtime's default.
 edit('bridge/NativeMetalObjects.rs',
      """        options.messages = Some(MessageSink::new(observe_message));
 """,
@@ -1228,6 +1231,9 @@ edit('bridge/NativeMetalObjects.rs',
         if pandora_boot_arg_is("pandora_m2v_padded", "alias") {
             options.policy.padded_targets = metal2vulkan::device::PaddedTargetsPolicy::Alias;
         }
+        // data-a-live: this frontend never rebinds a no-copy buffer (NativeMetalObjects.h), so the
+        // encoders need not log their calls for one (m2v 0006); pandora_m2v_rebinds=allow keeps the logs.
+        options.refuse_rebinds = !pandora_boot_arg_is("pandora_m2v_rebinds", "allow");
 """)
 p = ROOT / 'bridge/NativeMetalObjects.rs'
 p.write_text(p.read_text() + r'''
