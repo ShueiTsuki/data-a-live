@@ -1118,6 +1118,7 @@ edit('NativeAdrenoMetalPlugin.mm',
 """,
      """#include <sys/sysctl.h>
 extern "C" size_t native_bridge_metal_pandora_timing(char *out, size_t size);   // data-a-live (NativeBridgeMetalFrontend.mm)
+extern "C" size_t native_bridge_metal_pandora_work(char *out, size_t size);     // data-a-live (NativeBridgeMetalFrontend.mm)
 """)
 edit('NativeAdrenoMetalPlugin.mm',
      """        NSLog(@"pandora-metal: backboardd has a device; CAEnableDeepFramebuffer %@", (__bridge id)deep);
@@ -1125,7 +1126,7 @@ edit('NativeAdrenoMetalPlugin.mm',
      """        NSLog(@"pandora-metal: backboardd has a device; CAEnableDeepFramebuffer %@", (__bridge id)deep);
         pthread_t timing;   // data-a-live: the bridge's time and Turnip's render passes, every 10 s for 10 minutes
         if (pthread_create(&timing, nullptr, [](void *) -> void * {
-                static char text[4096];
+                static char text[4096], work[8192];
                 native_bridge_metal_pandora_timing(text, sizeof text);   // starts the first interval
                 for (unsigned round = 0; round < 60; ++round) {
                     sleep(10);
@@ -1134,6 +1135,13 @@ edit('NativeAdrenoMetalPlugin.mm',
                         end = strchr(line, '\\n');
                         if (end) *end++ = 0; else end = line + strlen(line);
                         NSLog(@"pandora-metal B%u %s", round, line);
+                    }
+                    // The runtime's work counts that changed (round 0: since it started): shadow copies and the like.
+                    native_bridge_metal_pandora_work(work, sizeof work);
+                    for (char *line = work, *end; *line; line = end) {
+                        end = strchr(line, '\\n');
+                        if (end) *end++ = 0; else end = line + strlen(line);
+                        NSLog(@"pandora-metal W%u %s", round, line);
                     }
                 }
                 return nullptr;
@@ -1163,3 +1171,88 @@ edit('NativeBridgeMetalFrontend.mm',
  known[arg].emplace_back(cmd,value);
  return value;
 }""")
+
+# ---- data-a-live: the runtime's work counts in the 10-second report (2026-10-25, round 2) --------------------------
+# r2n's call stacks put a quarter of a pass's end in shadow copies (EncoderCore::shadow_copies, Turnip's r2d blits): a
+# texture over a buffer or an IOSurface plane that no linear image aliases is an image of its own whose texels the
+# encoders copy in and back (metal2vulkan-runtime shadow.rs). Which of QuartzCore's surfaces take that path, and what it
+# moves a frame, is the runtime's own count (Device::work_counts: shadowed_textures, shadow_copies,
+# shadow_texels_copied_back, among queue submissions, pipelines made and the rest): the report prints every count that
+# changed since the last ("pandora-metal W<round> <name> +<change> <now>"). Counting only, as the bridge timing.
+edit('bridge/NativeMetalObjects.h',
+     """size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
+""",
+     """size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
+size_t nmb_device_work_counts(const NmbDevice *, char *out, size_t size); /* data-a-live: the work counts that changed since the last call, "name +change now" a line */
+""")
+p = ROOT / 'bridge/NativeMetalObjects.rs'
+p.write_text(p.read_text() + r'''
+/// data-a-live: the device's work counts (`Device::work_counts`) that changed since the last call, a line each, `name
+/// +change now`, into `out` (NUL-terminated); the length the whole text needs. The first call lists every count above 0.
+/// For the plugin's 10-second report (tools/metal/adapt_ios16.py).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_work_counts(device: *const NmbDevice, out: *mut c_char, size: usize) -> usize {
+    static LAST: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+    guard(0, || {
+        let counts = format!("{:#?}", get(device)?.0.work_counts());
+        let mut last = LAST.lock().map_err(|_| "work counts lock poisoned".to_string())?;
+        let mut text = String::new();
+        for line in counts.lines() {
+            let Some((name, value)) = line.trim().trim_end_matches(',').split_once(": ") else { continue };
+            let Ok(now) = value.parse::<u64>() else { continue };
+            let before = match last.iter_mut().find(|(known, _)| known == name) {
+                Some((_, held)) => std::mem::replace(held, now),
+                None => {
+                    last.push((name.to_owned(), now));
+                    0
+                }
+            };
+            if now != before {
+                text += &format!("{name} {:+} {now}\n", i128::from(now) - i128::from(before));
+            }
+        }
+        Ok(copy_out(&text, out, size))
+    })
+}
+''')
+# ---- data-a-live: padded targets rendered in place, by boot-arg (2026-10-25, round 2) ------------------------------
+# metal2vulkan makes a texture over padded rows that renders a shadow (m2v 0003, PaddedTargetsPolicy): CA's framebuffer,
+# 1125 pixels at 4608-byte rows, is copied in and out around every pass into it. pandora_m2v_padded=alias in the
+# boot-args makes such a texture an image over the surface's rows instead, Apple's own Metal's way (it renders into the
+# IOSurface), for a test of whether Turnip leaves the bytes between the rows; without it the runtime's default stands.
+edit('bridge/NativeMetalObjects.rs',
+     """        options.messages = Some(MessageSink::new(observe_message));
+""",
+     """        options.messages = Some(MessageSink::new(observe_message));
+        // data-a-live: pandora_m2v_padded=alias renders padded targets in place (tools/metal/adapt_ios16.py).
+        if pandora_boot_arg_is("pandora_m2v_padded", "alias") {
+            options.policy.padded_targets = metal2vulkan::device::PaddedTargetsPolicy::Alias;
+        }
+""")
+p = ROOT / 'bridge/NativeMetalObjects.rs'
+p.write_text(p.read_text() + r'''
+/// data-a-live: whether the kernel's boot-args (`kern.bootargs`) hold `name=value`.
+fn pandora_boot_arg_is(name: &str, value: &str) -> bool {
+    let mut args = [0u8; 1024];
+    let mut len = args.len();
+    // SAFETY: `args` holds `len` bytes; the name is a C string.
+    let read = unsafe {
+        libc::sysctlbyname(c"kern.bootargs".as_ptr(), args.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if read != 0 {
+        return false;
+    }
+    let args = String::from_utf8_lossy(&args[..len.min(args.len())]);
+    let wanted = format!("{name}={value}");
+    args.split_whitespace().any(|arg| arg.trim_end_matches('\0') == wanted)
+}
+''')
+p = ROOT / 'NativeBridgeMetalFrontend.mm'
+p.write_text(p.read_text() + r'''
+// data-a-live: the runtime's work counts that changed since the last call (NativeMetalObjects.rs nmb_device_work_counts).
+extern "C" size_t native_bridge_metal_pandora_work(char *out,size_t size) {
+ if(!gDevice){if(size)*out=0;return 0;}
+ return nmb_device_work_counts(gDevice,out,size);
+}
+''')
+print('added the work counts to the report')

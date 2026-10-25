@@ -970,6 +970,87 @@ run(void)
 			}
 		}
 
+		/* ---- part 4b: render into a padded IOSurface, the framebuffer's row layout (1125 texels at 4608-byte rows) ----
+		 * Two passes (clear and draw, then load and draw) over texels the CPU set to 0x11 and padding it set to 0xa5: every
+		 * texel ends green or black, and no byte between the rows changes. Under metal2vulkan's default the texture is a
+		 * shadow (its copies move texels alone); with boot-arg pandora_m2v_padded=alias it is rendered in place (m2v 0003),
+		 * and this shows whether the driver's loads and stores leave the bytes between the rows. */
+		{
+			const unsigned w = 1125, h = 64, bpr = 4608;
+			NSDictionary *props = @{
+				(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4,
+				(id)kIOSurfaceBytesPerRow: @(bpr), (id)kIOSurfacePixelFormat: @((uint32_t)'RGBA'),
+			};
+			IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+			if (surface) {
+				IOSurfaceLock(surface, 0, NULL);
+				uint8_t *b = (uint8_t *)IOSurfaceGetBaseAddress(surface);
+				const size_t row = IOSurfaceGetBytesPerRow(surface);
+				for (unsigned y = 0; y < h; y++) {
+					memset(b + y * row, 0x11, w * 4);
+					memset(b + y * row + w * 4, 0xa5, row - w * 4);
+				}
+				IOSurfaceUnlock(surface, 0, NULL);
+			}
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			    width:w height:h mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			td.storageMode = MTLStorageModeShared;
+			id<MTLTexture> tex = surface ? [dev newTextureWithDescriptor:td iosurface:surface plane:0] : nil;
+			MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+			rpd.vertexFunction = [lib newFunctionWithName:@"tri_vs"];
+			rpd.fragmentFunction = [lib newFunctionWithName:@"tri_fs"];
+			rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+			err = nil;
+			id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
+			if (!check("part 4b: texture over the padded IOSurface", tex, nil) &&
+			    !check("part 4b: render pipeline", rps, err)) {
+				MTLCommandBufferStatus status = MTLCommandBufferStatusCompleted;
+				for (unsigned p = 0; p < 2; p++) {
+					MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+					pass.colorAttachments[0].texture = tex;
+					pass.colorAttachments[0].loadAction = p == 0 ? MTLLoadActionClear : MTLLoadActionLoad;
+					pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+					pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+					id<MTLCommandBuffer> cb = [queue commandBuffer];
+					id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+					[enc setRenderPipelineState:rps];
+					[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+					[enc endEncoding];
+					[cb commit];
+					[cb waitUntilCompleted];
+					if (cb.status != MTLCommandBufferStatusCompleted) {
+						status = cb.status;
+					}
+				}
+				IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+				const uint8_t *b = (const uint8_t *)IOSurfaceGetBaseAddress(surface);
+				const size_t row = IOSurfaceGetBytesPerRow(surface);
+				unsigned green = 0, black = 0, other = 0, padding = 0, changed = 0;
+				for (unsigned y = 0; y < h; y++) {
+					const uint32_t *texels = (const uint32_t *)(b + y * row);
+					for (unsigned x = 0; x < w; x++) {
+						green += texels[x] == 0xff00ff00u;
+						black += texels[x] == 0xff000000u;
+						other += texels[x] != 0xff00ff00u && texels[x] != 0xff000000u;
+					}
+					for (size_t i = w * 4; i < row; i++, padding++) {
+						changed += b[y * row + i] != 0xa5;
+					}
+				}
+				IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+				const bool bad = other != 0 || green == 0 || black == 0 || changed != 0 ||
+				    status != MTLCommandBufferStatusCompleted;
+				say("MTLTEST: part 4b: padded IOSurface %ux%u at %zu-byte rows: status %ld; green %u black %u other %u; "
+				    "%u of %u bytes between the rows changed%s", w, h, row, (long)status, green, black, other, changed, padding,
+				    bad ? " FAIL" : "");
+				failures += bad;
+			}
+			if (surface) {
+				CFRelease(surface);
+			}
+		}
+
 		/* ---- part 5: sample an ASTC 4x4 image (the App Library's material, bb27-bb29) ---- */
 		/* 8x8 texels = 2x2 void-extent blocks, one colour each: red, green (top), blue, white (bottom).
 		 * (a) an ordinary texture filled by replaceRegion, (b) newTextureWithBytesNoCopy as QuartzCore makes it. */
