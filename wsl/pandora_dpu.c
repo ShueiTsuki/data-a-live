@@ -280,11 +280,11 @@ pandora_dpu_probe(uint64_t fb)
  *
  * SMMU. The display stream (SID 0x800 mask 2) reaches memory through apps SMMU bank 2 with translation off,
  * so it can read only what lies at a 32-bit physical address, and iOS's surfaces are wired kernel pages above
- * 4 GiB. Mainline Linux keeps the DPU behind its SMMU with 32-bit IOVAs; here likewise: a free context bank
- * gets 4K stage-1 tables (ArmSmmu4K) that map the ABL's panel memory (main and rear screen, both read
- * now) at the same addresses, the bank is enabled, and only then the stream's S2CR is pointed at it in one
- * write. Surfaces are mapped into 16 MiB slots from 0x80000000. ACTLR is the DT's for SID 0x800 (qcom,actlr
- * 0x1). Any fault in the bank in the first 100 ms points the stream back at bank 2 and leaves the CPU copy.
+ * 4 GiB. Mainline Linux keeps the DPU behind its SMMU with 32-bit IOVAs; here likewise: the display's own bank
+ * gets 4K stage-1 tables (ArmSmmu4K) that map the ABL's panel memory (main and rear screen, both read now) at
+ * the same addresses, and its translation is turned on; the stream's route is not touched. Surfaces are mapped
+ * into 16 MiB slots from 0x80000000. ACTLR is the DT's for SID 0x800 (qcom,actlr 0x1). Any fault in the bank in
+ * the first 100 ms turns translation off again (the ABL's state) and leaves the CPU copy.
  *
  * Pipes. Main screen: CTL0 -> INTF1 (DSI0), source split over LM0/LM1: VIG0 fills x 0-609 and VIG1 x 610-1219
  * of the 1220x2656 panel. A frame is shown by giving both pipes the surface: source rectangles, stride and
@@ -502,37 +502,37 @@ pandora_scanout_init(void)
 	printf("PANDORA SCANOUT: init at the first frame: panel memory %#llx-%#llx, main %#x\n", lo, hi, a0);
 	(void)pandora_log_sync();
 
-	/* The stream's route, and a free bank: not enabled, never configured, not named by any S2CR. */
-	const uint32_t id0 = sc_rd(0x20), id1 = sc_rd(0x24), id2 = sc_rd(0x28), nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	/*
+	 * The stream's route: its stream match and the bank its S2CR names (bank 2 from the ABL, stage 1 off, so the
+	 * pipes read physical addresses). r2d: a free bank of the 81 could not be told for certain (the ones not named
+	 * by an S2CR are not all reset), so no other bank is taken: the display's own bank gets the tables and its
+	 * translation is turned on, the route stays as it is. Turning it back off (SCTLR as the ABL left it) is the
+	 * way back to the old state.
+	 */
+	const uint32_t id0 = sc_rd(0x20), id1 = sc_rd(0x24), id2 = sc_rd(0x28), nsmr = id0 & 0xff;
 	const uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000, numpage = 1ull << (((id1 >> 28) & 7) + 1);
-	uint32_t used[8] = {};
 	sc.smr = ~0u;
 	for (unsigned i = 0; i < nsmr; i++) {
 		const uint32_t smr = sc_rd(0x800 + 4 * i), s2cr = sc_rd(0xc00 + 4 * i);
-		if (!(smr & SC_SMR_VALID)) {
-			continue;
-		}
-		if (((s2cr >> 16) & 3) == 0) {
-			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
-		}
-		if ((smr & 0x7fff) == DPU_SID && ((smr >> 16) & 0x7fff) == 0x2) {
+		if ((smr & SC_SMR_VALID) && (smr & 0x7fff) == DPU_SID && ((smr >> 16) & 0x7fff) == 0x2) {
 			sc.smr = i;
 			sc.panel_s2cr = s2cr;
 		}
 	}
-	sc.bank = ~0u;
-	for (unsigned b = ncb; b-- > 0;) {
-		const uint64_t off = numpage * page + b * page;
-		if (!(used[b / 32] & (1u << (b % 32))) && off + 0x1000 <= SC_SMMU_BYTES && sc_rd((uint32_t)off) == 0 &&
-		    sc_rd((uint32_t)(page + 4 * b)) == 0) {
-			sc.bank = b;
-			sc.cb_off = (uint32_t)off;
-			break;
-		}
+	if (sc.smr == ~0u || ((sc.panel_s2cr >> 16) & 3) != 0) {
+		printf("PANDORA SCANOUT: no translating stream match for %#x (%u, s2cr %08x): CPU copy\n", DPU_SID, sc.smr,
+		    sc.panel_s2cr);
+		return ENODEV;
 	}
-	if (sc.smr == ~0u || ((sc.panel_s2cr >> 16) & 3) != 0 || sc.bank == ~0u) {
-		printf("PANDORA SCANOUT: no stream match (%u, s2cr %08x) or no free bank (%u of %u): CPU copy\n", sc.smr,
-		    sc.panel_s2cr, sc.bank, ncb);
+	sc.bank = sc.panel_s2cr & 0xff;
+	sc.cb_off = (uint32_t)(numpage * page + sc.bank * page);
+	if (sc.cb_off + 0x1000 > SC_SMMU_BYTES) {
+		return ENODEV;
+	}
+	const uint32_t was_sctlr = sc_rd(sc.cb_off), was_actlr = sc_rd(sc.cb_off + 4);
+	const uint32_t was_cbar = sc_rd((uint32_t)(page + 4 * sc.bank)), was_cba2r = sc_rd((uint32_t)(page + 0x800 + 4 * sc.bank));
+	if (was_sctlr & 1) {
+		printf("PANDORA SCANOUT: bank %u already translates (sctlr %08x): CPU copy\n", sc.bank, was_sctlr);
 		return ENODEV;
 	}
 
@@ -554,38 +554,36 @@ pandora_scanout_init(void)
 	sc.tnext = (unsigned)sc.tables.table_pages;
 	clean_dcache64((addr64_t)sc.tpa, SC_TABLE_PAGES * 0x1000, TRUE);
 
-	/* The bank: platform ACTLR first, then ArmSmmu4K programs, reads back and enables it (no stream yet). */
+	/* The bank: platform ACTLR, then ArmSmmu4K programs it, reads it back and turns translation on. */
 	sc.mmio.mapping = (volatile unsigned char *)sc.smmu;
 	sc.mmio.bytes = SC_SMMU_BYTES;
 	if (ArmSmmu4KBindMmio(&sc.mmio, &sc.io) != ArmSmmu4KSuccess) {
 		return EIO;
 	}
-	printf("PANDORA SCANOUT: stream match %u (S2CR %08x), programming free bank %u of %u, %zu table pages\n", sc.smr,
-	    sc.panel_s2cr, sc.bank, ncb, sc.tables.table_pages);
+	printf("PANDORA SCANOUT: stream match %u (S2CR %08x) -> bank %u: sctlr %08x actlr %08x cbar %08x cba2r %08x; "
+	    "turning its translation on, %zu table pages\n", sc.smr, sc.panel_s2cr, sc.bank, was_sctlr, was_actlr, was_cbar,
+	    was_cba2r, sc.tables.table_pages);
 	(void)pandora_log_sync();
+	const uint32_t f0 = dpu_rd(DPU_INTF(1) + 0xac);
 	sc_wr(sc.cb_off + 4, SC_ACTLR);
 	sc.ctx = (ArmSmmu4KContextConfig){ &sc.tcfg, NULL, &sc.tables, NULL, id0, id2, 1, 0, 0, 0 };
 	ArmSmmu4KProgramResult prog;
 	st = ArmSmmu4KProgramDisabledContext(&sc.io, sc.bank, &sc.ctx, 1000, &prog);
-	printf("PANDORA SCANOUT: bank %u (ACTLR %#x, ABL's bank %u had %#x): status %d sctlr %08x tcr %08x ttbr0 %#llx; "
-	    "panel memory %#llx-%#llx mapped as itself, %zu table pages\n", sc.bank, sc_rd(sc.cb_off + 4),
-	    sc.panel_s2cr & 0xff, sc_rd((uint32_t)(numpage * page + (sc.panel_s2cr & 0xff) * page) + 4), st,
-	    prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0, lo, hi, sc.tables.table_pages);
-	if (st != ArmSmmu4KSuccess) {
-		return EIO;
-	}
-
-	/* The switch: one S2CR write. Then 100 ms of frames must go by without a fault in the bank. */
-	printf("PANDORA SCANOUT: switching the display stream to bank %u\n", sc.bank);
-	(void)pandora_log_sync();
-	const uint32_t f0 = dpu_rd(DPU_INTF(1) + 0xac);
-	sc_wr(0xc00 + 4 * sc.smr, (sc.panel_s2cr & ~0xffu) | sc.bank);
 	IOSleep(100);
 	const uint32_t fsr = sc_rd(sc.cb_off + 0x58), f1 = dpu_rd(DPU_INTF(1) + 0xac);
-	if (fsr != 0 || f1 == f0) {
-		sc_wr(0xc00 + 4 * sc.smr, sc.panel_s2cr);
-		printf("PANDORA SCANOUT: after the switch fsr %08x far %08x%08x, frames %u -> %u: stream back on bank %u, "
-		    "CPU copy\n", fsr, sc_rd(sc.cb_off + 0x64), sc_rd(sc.cb_off + 0x60), f0, f1, sc.panel_s2cr & 0xff);
+	printf("PANDORA SCANOUT: bank %u: status %d sctlr %08x tcr %08x ttbr0 %#llx; 100 ms later fsr %08x far %08x%08x, "
+	    "frames %u -> %u\n", sc.bank, st, prog.readback.sctlr, prog.readback.tcr, prog.readback.ttbr0, fsr,
+	    sc_rd(sc.cb_off + 0x64), sc_rd(sc.cb_off + 0x60), f0, f1);
+	if (st != ArmSmmu4KSuccess || fsr != 0 || f1 == f0) {
+		/* Back as the ABL left it: translation off, its attributes. */
+		sc_wr(sc.cb_off, was_sctlr);
+		sc_wr(sc.cb_off + 4, was_actlr);
+		sc_wr((uint32_t)(page + 4 * sc.bank), was_cbar);
+		sc_wr((uint32_t)(page + 0x800 + 4 * sc.bank), was_cba2r);
+		if (fsr) {
+			sc_wr(sc.cb_off + 0x58, fsr);
+		}
+		printf("PANDORA SCANOUT: bank %u back to translation off (sctlr %08x): CPU copy\n", sc.bank, sc_rd(sc.cb_off));
 		return EIO;
 	}
 	for (unsigned p = 0; p < SC_PIPES; p++) {
@@ -596,8 +594,7 @@ pandora_scanout_init(void)
 	}
 	sc.on_panel = true;
 	sc.ready = true;
-	printf("PANDORA SCANOUT: display stream on bank %u (S2CR %08x), frames %u -> %u in 100 ms, no fault: "
-	    "frames can be scanned out\n", sc.bank, sc_rd(0xc00 + 4 * sc.smr), f0, f1);
+	printf("PANDORA SCANOUT: the display reads through bank %u's tables, no fault: frames can be scanned out\n", sc.bank);
 	return 0;
 }
 
