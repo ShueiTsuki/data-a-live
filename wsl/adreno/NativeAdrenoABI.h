@@ -12,7 +12,7 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 1,
-    NativeAdrenoAbiMaxBuffers = 128,   /* ios-pandora: 16 upstream (tools/turnip/abi_128.py) */
+    NativeAdrenoAbiMaxBuffers = 128,   /* data-a-live: 16 upstream (tools/turnip/abi_128.py) */
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
