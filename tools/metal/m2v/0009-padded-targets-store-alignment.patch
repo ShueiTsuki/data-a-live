@@ -1,0 +1,304 @@
+From a847f07cb792ae9897181cd9e9cb6c1be8f77588 Mon Sep 17 00:00:00 2001
+From: root <root@MSI.localdomain>
+Date: Sun, 25 Oct 2026 22:56:43 +0800
+Subject: [PATCH] runtime: padded targets render in place only where the
+ driver's stores stay in their rows
+
+PaddedTargetsPolicy::Alias (0003) renders a padded texture over a buffer
+in place, an image over the buffer's rows at Metal's pitch. On Turnip that
+image's GMEM stores do not stop at the texture's last texel: where a render
+area ends at the image's right or bottom edge, tu_attachment_store_unaligned
+lets the store run on to the next multiple of gmem_align_w x gmem_align_h
+(16 x 4 texels on Adreno 6xx to 8xx, A6xxGPUInfo), "since it will write
+into padding space"; a single-level linear image takes no y2 alignment
+(fd6_view.cc's need_y2_align). On the phone a 1125 x 64 RGBA8 surface at
+4608-byte rows rendered in place had 44 bytes after each row's 4500 changed
+(1125 texels written as 1136). With rows narrower than the aligned width
+those writes reach the next row's first texels, and below a height that is
+not a multiple of 4 they reach past the texture.
+
+DeviceOptions::render_store_alignment (None by default, as before) names
+that reach. Under Alias a padded target is then an image over its rows only
+where the stores stay inside its own rows (stores_stay_in_rows): one slice,
+its height a multiple of the aligned height, its rows at least its aligned
+width apart, and the last row's aligned bytes inside the buffer; another
+stays a shadow.
+
+pitched_surfaces::a_store_alignment_keeps_the_padded_targets_its_stores_would_overrun_shadows:
+under 16 x 4 each padded layout is aliased exactly where it is without the
+alignment and fits (lavapipe: 1307x512/5248, 300x200/1216 and 1913x96/7680
+kept, 657x128/5312 RGBA16Float made a shadow). The pitched_surfaces tests
+(22, run without the validation layer, which WSL lacks) pass.
+---
+ crates/metal2vulkan-runtime/README.md         |  1 +
+ .../metal2vulkan-runtime/src/device/adopt.rs  |  2 +
+ .../metal2vulkan-runtime/src/device/create.rs | 13 ++++
+ crates/metal2vulkan-runtime/src/device/mod.rs |  7 ++
+ crates/metal2vulkan-runtime/src/texture.rs    | 34 ++++++++-
+ .../src/runtime_lane/pitched_surfaces.rs      | 69 +++++++++++++++++++
+ docs/FAST-PATHS.md                            |  6 ++
+ 7 files changed, 130 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/README.md b/crates/metal2vulkan-runtime/README.md
+index f756943..9b3b5dd 100644
+--- a/crates/metal2vulkan-runtime/README.md
++++ b/crates/metal2vulkan-runtime/README.md
+@@ -140,6 +140,7 @@ Vulkan-side choices Metal has no counterpart for:
+ | `metal_level` | The macOS release whose Metal the device answers as (the host's by default). |
+ | `record_executions` | Keep, per command buffer, which pipeline each dispatch and draw ran (`CommandBuffer::executions`). Off by default. |
+ | `refuse_rebinds` | Refuse every `rebind_bytes_no_copy` (`RebindProblem::Refused`), so the encoders log no calls to encode again while no-copy buffers live. Off by default. |
++| `render_store_alignment` | How far past an attachment's right or bottom edge the driver's render pass stores write (Turnip: 16 x 4 texels); under `PaddedTargetsPolicy::Alias` only padded targets whose stores stay in their own rows render in place. `None` by default. |
+ 
+ While a handle lives, equal options give the same device for a physical device, as Metal has one
+ `MTLDevice` per GPU. Nothing is read from the environment but the platform's default cache
+diff --git a/crates/metal2vulkan-runtime/src/device/adopt.rs b/crates/metal2vulkan-runtime/src/device/adopt.rs
+index 4262d65..92b3e76 100644
+--- a/crates/metal2vulkan-runtime/src/device/adopt.rs
++++ b/crates/metal2vulkan-runtime/src/device/adopt.rs
+@@ -268,6 +268,8 @@ impl Device {
+             record_executions: false,
+             // An adopted device's rebinds go as a made device's do by default.
+             refuse_rebinds: false,
++            // An adopted device's padded targets go as a made device's do by default.
++            render_store_alignment: None,
+             announce_each: raw.announce_each,
+             view_reinterpretation,
+             generated_commands: false,
+diff --git a/crates/metal2vulkan-runtime/src/device/create.rs b/crates/metal2vulkan-runtime/src/device/create.rs
+index 77ac8af..52a0b23 100644
+--- a/crates/metal2vulkan-runtime/src/device/create.rs
++++ b/crates/metal2vulkan-runtime/src/device/create.rs
+@@ -177,6 +177,16 @@ pub struct DeviceOptions {
+     /// a rebind, so a draw pays nothing for a log no one reads. `detach_backing` is unchanged. No
+     /// Metal counterpart.
+     pub refuse_rebinds: bool,
++    /// How far past a render area that ends at an attachment's right or bottom edge the driver's
++    /// render pass stores may write, in texels: up to the next multiples of these widths and
++    /// heights (`Some([16, 4])` for Turnip on Adreno 6xx to 8xx, its `gmem_align_w` and
++    /// `gmem_align_h`, which `tu_attachment_store_unaligned` lets a store at the image's edge
++    /// reach). `None`, the default, where they write the render area alone. Under
++    /// `PaddedTargetsPolicy::Alias` a padded texture over a buffer that renders is an image over
++    /// the buffer's rows only where such writes stay inside its own rows: one slice, its height a
++    /// multiple of the aligned height, its rows at least its aligned width apart, and the last
++    /// row's aligned bytes inside the buffer; else it is a shadow. No Metal counterpart.
++    pub render_store_alignment: Option<[u32; 2]>,
+ }
+ 
+ /// One setting of an instance layer (`VkLayerSettingEXT`).
+@@ -1257,6 +1267,7 @@ fn create_on(
+         announce_each: options.announce_each.clone(),
+         record_executions: options.record_executions,
+         refuse_rebinds: options.refuse_rebinds,
++        render_store_alignment: options.render_store_alignment,
+         view_reinterpretation,
+         generated_commands,
+         host_image_copy,
+@@ -1366,6 +1377,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
+         metal_level,
+         record_executions,
+         refuse_rebinds,
++        render_store_alignment,
+     } = a;
+     *policy == b.policy
+         && *layers == b.layers
+@@ -1385,6 +1397,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
+         && *metal_level == b.metal_level
+         && *record_executions == b.record_executions
+         && *refuse_rebinds == b.refuse_rebinds
++        && *render_store_alignment == b.render_store_alignment
+ }
+ 
+ /// The group of `made` for `options`: the live one, or a new one on a new instance. Its index.
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 81304a0..683b023 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -369,6 +369,9 @@ pub(super) struct DeviceShared {
+     /// It refuses every rebind (`DeviceOptions::refuse_rebinds`): its encoders log no calls
+     /// ([`DeviceShared::logs_calls`]).
+     pub(crate) refuse_rebinds: bool,
++    /// How far past a render area at an attachment's edge its driver's stores may write
++    /// (`DeviceOptions::render_store_alignment`): which padded targets render in place.
++    pub(crate) render_store_alignment: Option<[u32; 2]>,
+     /// Counts the times an image of the device let its views go, under its views lock (a
+     /// rebind's or a storage form's new `VkImage`, a detach's stand-in, a reattach): a view kept
+     /// by what it was made of (`binding::BindMemo`) is current while this holds.
+@@ -766,6 +769,8 @@ pub(super) struct Parts {
+     pub(super) record_executions: bool,
+     /// It refuses every rebind (`DeviceOptions::refuse_rebinds`).
+     pub(super) refuse_rebinds: bool,
++    /// Its driver's stores' reach (`DeviceOptions::render_store_alignment`).
++    pub(super) render_store_alignment: Option<[u32; 2]>,
+     /// Its views may reinterpret an image's components ([`DeviceShared`]'s field), outside
+     /// `enabled`'s vocabulary.
+     pub(super) view_reinterpretation: bool,
+@@ -834,6 +839,7 @@ impl Device {
+             announce_each,
+             record_executions,
+             refuse_rebinds,
++            render_store_alignment,
+             view_reinterpretation,
+             generated_commands,
+             host_image_copy,
+@@ -1233,6 +1239,7 @@ impl Device {
+             announced: Announced::new(&announce_each),
+             record_executions,
+             refuse_rebinds,
++            render_store_alignment,
+             views_epoch: AtomicU64::new(0),
+             device_address,
+             upload_alignment,
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 11e9b7c..1f8d05c 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1371,6 +1371,30 @@ fn undeclared_usage(
+     Ok(plan)
+ }
+ 
++/// Whether the render pass stores of a padded texture of `layout` over `texels` rendering in
++/// place stay inside its own rows, where a store that ends at its right or bottom edge may write
++/// on to the next multiples of `alignment`'s width and height in texels
++/// (`DeviceOptions::render_store_alignment`): one slice, its height a multiple of the aligned
++/// height (no row past its last is written), its rows at least its aligned width apart (each
++/// row's writes end in the bytes between it and the next), and the last row's aligned bytes
++/// inside the buffer. Always, where the driver's stores write the render area alone (`None`).
++fn stores_stay_in_rows(texels: &Texels, layout: &TextureLayout, alignment: Option<[u32; 2]>) -> bool {
++    let Some([align_w, align_h]) = alignment else {
++        return true;
++    };
++    let rows = &texels.layout;
++    let [width, height, _] = layout.extent.map(u64::from);
++    if rows.slices != 1 || layout.levels != 1 || width == 0 || rows.row_bytes % width != 0 {
++        return false;
++    }
++    let texel = rows.row_bytes / width;
++    let reached = width.next_multiple_of(u64::from(align_w.max(1))) * texel;
++    let last_row = rows.offset + (height.max(1) - 1) * rows.row_pitch;
++    height % u64::from(align_h.max(1)) == 0
++        && reached <= rows.row_pitch
++        && last_row + reached <= texels.buffer.length()
++}
++
+ fn view_error(call: &'static str, refusal: ViewRefusal) -> Error {
+     match refusal {
+         ViewRefusal::Invalid(problem) => invalid(call, Problem::TextureView(problem)),
+@@ -1961,10 +1985,16 @@ impl Device {
+         })?;
+         // What an image over the texels may hold beside them: the bytes between padded rows too
+         // where the texture only reads, by the policy (`linear_plan::holding`), and where it
+-        // renders or is written under `PaddedTargetsPolicy::Alias`; else why none may.
++        // renders or is written under `PaddedTargetsPolicy::Alias`, its driver's stores staying
++        // in its rows (`stores_stay_in_rows`); else why none may.
+         let policy = self.compile_device().policy();
++        let alignment = self.shared().render_store_alignment;
+         let holds = match holding(&texels.layout, usage, policy.padded_reads) {
+-            Err(_) if policy.padded_targets == PaddedTargetsPolicy::Alias && !only_reads(usage) => {
++            Err(_)
++                if policy.padded_targets == PaddedTargetsPolicy::Alias
++                    && !only_reads(usage)
++                    && stores_stay_in_rows(&texels, layout, alignment) =>
++            {
+                 Ok(Holds::Padding)
+             }
+             holds => holds,
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+index 4cde194..61b9dc1 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+@@ -1462,6 +1462,75 @@ fn a_padded_target_under_alias_renders_in_place_as_its_private_twin() {
+     );
+ }
+ 
++/// Under `PaddedTargetsPolicy::Alias` with a store alignment (`DeviceOptions::render_store_alignment`,
++/// Turnip's 16 x 4 texels here), a padded texture that renders is an image over its rows only
++/// where the driver's stores, which may write on to the next multiples of the alignment where a
++/// render area ends at its right or bottom edge, stay inside its own rows: its height a multiple
++/// of 4 and its rows at least its width rounded up to 16 texels apart. Else it is a shadow. Each
++/// padded layout of [`LAYOUTS`], and one whose rows fit but whose height (510) is not a multiple
++/// of 4, against the choice a device without the alignment makes. Printed (`PADDED-TARGETS
++/// aligned`): each layout's form under both.
++#[test]
++fn a_store_alignment_keeps_the_padded_targets_its_stores_would_overrun_shadows() {
++    const ALIGNMENT: [u32; 2] = [16, 4];
++    let odd_height = Layout::bgra8("1307x510/5376", 1307, 510, 5376);
++    let layouts: Vec<Layout> = LAYOUTS
++        .into_iter()
++        .filter(Layout::padded)
++        .chain([odd_height])
++        .collect();
++    let fits = |layout: &Layout| {
++        let reached = layout.w.next_multiple_of(u64::from(ALIGNMENT[0])) * layout.texel;
++        layout.h % u64::from(ALIGNMENT[1]) == 0 && reached <= layout.bpr
++    };
++    let cache = ScratchCache::new().unwrap();
++    let messages = Messages::default();
++    {
++        let plain = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
++            options.policy.padded_targets = PaddedTargetsPolicy::Alias;
++        })
++        .unwrap();
++        let aligned = validated_device_with(TEST_DEVICE, &messages, cache.path(), |options| {
++            options.policy.padded_targets = PaddedTargetsPolicy::Alias;
++            options.render_store_alignment = Some(ALIGNMENT);
++        })
++        .unwrap();
++        let aliased = |device: &Device, layout: &Layout| {
++            let len = layout.bpr * layout.h;
++            let buffer = device.new_buffer(len, ResourceOptions::default()).unwrap();
++            let mut d = TextureDescriptor::texture_2d(layout.pf, layout.w, layout.h, false);
++            d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++            d.resource_options = buffer.resource_options();
++            let texture = buffer.new_texture(&d, 0, layout.bpr).unwrap();
++            // SAFETY: the handle is only compared, while the texture lives.
++            unsafe { texture.vk_image() }.is_some()
++        };
++        let (mut kept, mut shadowed) = (0, 0);
++        for layout in &layouts {
++            let (without, with) = (aliased(&plain, layout), aliased(&aligned, layout));
++            eprintln!(
++                "PADDED-TARGETS aligned {}: {} without the alignment, {} with it",
++                layout.name,
++                if without { "an image over the rows" } else { "a shadow" },
++                if with { "an image over the rows" } else { "a shadow" },
++            );
++            assert_eq!(with, without && fits(layout), "{}", layout.name);
++            kept += usize::from(with);
++            shadowed += usize::from(without && !with);
++        }
++        assert!(
++            on_metal(&plain) || (kept > 0 && shadowed > 0),
++            "the alignment kept {kept} and made {shadowed} shadows of the padded targets aliased \
++             without it"
++        );
++    }
++    let messages = messages.take();
++    assert!(
++        messages.is_empty(),
++        "the validation layer reported: {messages:#?}"
++    );
++}
++
+ /// A texture that only reads over an ordinary `Shared` buffer's padded rows (each padded layout
+ /// of [`LAYOUTS`]): under the policy's default it is the device's own linear image over the
+ /// buffer's memory, made `PREINITIALIZED`, where the device lays one at the rows' pitch, and its
+diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
+index 977c1cd..84a8b2c 100644
+--- a/docs/FAST-PATHS.md
++++ b/docs/FAST-PATHS.md
+@@ -86,6 +86,12 @@ known. The rest of the differences are docs/API.md section 9's precision notes.
+   holds the bytes between the rows: no copy in or back, and those bytes stay the program's only as
+   far as the driver's moves, loads and stores leave them (lavapipe's do not), which a consumer
+   takes it for where it checked its driver's do. The runtime's choice: no pipeline differs.
++  Where the consumer names how far past an attachment's right or bottom edge its driver's stores
++  write (`DeviceOptions::render_store_alignment`: Turnip's 16 x 4 texels, `gmem_align_w` and
++  `gmem_align_h`), only a texture whose stores stay inside its own rows renders in place (one
++  slice, its height a multiple of the aligned height, its rows at least its aligned width apart);
++  another stays a shadow, as no row past its last nor the next row's first bytes are ever
++  written.
+ - `pointer_domain`, `handle_domain`, `containment` and `isolation` choose how resources resolve and
+   how guests are contained, not an answer of Metal's arithmetic or sampling.
+ 
+-- 
+2.43.0
+

@@ -1215,11 +1215,15 @@ pub extern "C" fn nmb_device_work_counts(device: *const NmbDevice, out: *mut c_c
     })
 }
 ''')
-# ---- data-a-live: padded targets rendered in place, by boot-arg (2026-10-25, round 2) ------------------------------
+# ---- data-a-live: padded targets rendered in place where Turnip's stores stay in their rows (2026-10-25) -----------
 # metal2vulkan makes a texture over padded rows that renders a shadow (m2v 0003, PaddedTargetsPolicy): CA's framebuffer,
-# 1125 pixels at 4608-byte rows, is copied in and out around every pass into it. pandora_m2v_padded=alias in the
-# boot-args makes such a texture an image over the surface's rows instead, Apple's own Metal's way (it renders into the
-# IOSurface), for a test of whether Turnip leaves the bytes between the rows; without it the runtime's default stands.
+# 1125 pixels at 4608-byte rows, was copied in and out around every pass into it (r2o: about 2.5 full screens copied
+# back a frame). Such a texture is now an image over the surface's rows, Apple's own Metal's way (it renders into the
+# IOSurface), where Turnip's stores stay inside the texture's rows: a GMEM store whose render area ends at the image's
+# right or bottom edge writes on to the next multiple of 16 texels across and 4 rows down (A6xxGPUInfo's gmem_align_w
+# and gmem_align_h, tu_attachment_store_unaligned; r2p's mtltest part 4b: 1125 texels written as 1136), so m2v 0009
+# takes those as DeviceOptions::render_store_alignment and keeps a shadow of any other. pandora_m2v_padded=shadow in the
+# boot-args keeps every one a shadow, the runtime's default.
 # The same device options refuse rebinds of no-copy buffers (m2v 0006, DeviceOptions::refuse_rebinds), which this
 # frontend never makes: while CA's no-copy buffers live, every encoder logged each call for a rebind that never came.
 # pandora_m2v_rebinds=allow in the boot-args keeps the runtime's default.
@@ -1227,9 +1231,11 @@ edit('bridge/NativeMetalObjects.rs',
      """        options.messages = Some(MessageSink::new(observe_message));
 """,
      """        options.messages = Some(MessageSink::new(observe_message));
-        // data-a-live: pandora_m2v_padded=alias renders padded targets in place (tools/metal/adapt_ios16.py).
-        if pandora_boot_arg_is("pandora_m2v_padded", "alias") {
+        // data-a-live: padded targets render in place where Turnip's stores, aligned to 16 x 4 texels
+        // at an image's edge, stay in their rows (tools/metal/adapt_ios16.py); pandora_m2v_padded=shadow keeps shadows.
+        if !pandora_boot_arg_is("pandora_m2v_padded", "shadow") {
             options.policy.padded_targets = metal2vulkan::device::PaddedTargetsPolicy::Alias;
+            options.render_store_alignment = Some([16, 4]);
         }
         // data-a-live: this frontend never rebinds a no-copy buffer (NativeMetalObjects.h), so the
         // encoders need not log their calls for one (m2v 0006); pandora_m2v_rebinds=allow keeps the logs.

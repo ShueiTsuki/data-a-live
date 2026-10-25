@@ -374,7 +374,13 @@
 - **发现**：metal2vulkan 对“行间有空隙、又要渲染或写入”的纹理一律走影子（另建一张图像，每个编码器用前把像素从缓冲拷进来，写完拷回去），因为 Vulkan 的渲染遍加载/存储可以改写整个子资源，包括行间空隙，而 Metal 从不写那些字节（docs/FAST-PATHS.md 写明的取舍）。CA 的画面缓冲 1125 像素宽、行跨度 4608（Turnip 线性图像要求行跨度是 64 字节的倍数），所以每个渲染进画面缓冲的渲染遍都要整张拷进拷出；宽度不是 16 倍数的图层表面同样如此。r2n 里结束渲染遍的四分之一（全部样本 2.4%）在影子拷贝，还要占 GPU 时间和内存带宽。
 - **0003**：DevicePolicy 新增 `padded_targets`（默认 Shadow，与原来完全一样；Alias 时直接用图像，和只读纹理的 `padded_reads = Alias` 同一种做法），FAST-PATHS.md 记了这一条，不影响编译配置指纹。lavapipe 上：行跨度是 64 倍数的布局在 Alias 下直接用图像，渲染结果与私有纹理逐像素一致、零影子拷贝；全部测试结果与基线一致（新测试因 WSL 缺验证层与同组一样无法建设备）。
 - **插件**：启动参数 `pandora_m2v_padded=alias` 才启用 Alias；每 10 秒的统计多打 `pandora-metal W` 行（运行时工作计数的变化：影子纹理、影子拷贝次数、拷回像素数、提交次数等）。mtltest 新增 part 4b：1125×64、行跨度 4608 的 IOSurface，两遍渲染后检查像素和行间空隙字节。
-- **下次上手机（需用户同意）**：插件 /opt/work/lplugin/out（m2v 0001–0008，工作计数，两个启动参数开关），Turnip local216（等围栏单次 100 ms），内核 0225。
+- **r2o / r2p 结果（2026-10-25，插件 0001–0008，Turnip local216，内核 0225，自动滑屏）**：
+  - 帧率（120 Hz 屏，GPU 发热封顶）：r2n 平均约 101 → r2o 约 106 → r2p 约 111 fps。GPU 忙碌率 r2o 75% → r2p 65%。温度三次都在 95 °C 上下。
+  - backboardd 调用栈 r2n → r2o：分配函数自身 16.6% → 12.9%，`instantiate` 3.4 → 2.2，`EncoderUses::record` 1.8 → 1.2，`command_uses` 1.1 → 0.6，Vec 扩容 3.5 → 2.2，调用日志释放 0.6 → 0，两平面建图 2.7 → 0.9，等 GPU（`wait_for_queue`）3.7 → 2.1；内核样本 2728 → 2243。短轮询超时每秒约 690 → 133 次。
+  - 工作计数：r2o 每 10 秒影子拷贝约 4.3 万次、拷回约 74 亿纹素（每帧约 2.5 张全屏）；r2p 影子拷贝约 3.9 万次、**拷回 0**。所以拷回全部来自单平面行间有空隙的渲染目标；两平面 'b3a8' 表面滑屏时只被读，剩下的都是拷入（每个用到它的编码器都要重新拷入一次，因为 CPU 可能改过表面）。
+  - part 4b：r2o（Shadow）通过；**r2p（Alias）不过**：每行之后有 44 字节被改（6912 中 2816），即 1125 像素的行被写到 1136 像素（看起来是按 16 像素对齐写满）。Metal 从不碰这些字节。mtltest part 9 的 3 处失败三次都有，是原来就有的。
+- **Alias 的决定（用户 2026-10-25：有条件地用）和 0009**：Turnip 源码确认了多写的范围：GMEM 回写在渲染区域碰到图像右边或下边时按 `gmem_align_w × gmem_align_h` 对齐写（Adreno 6xx–8xx 都是 16×4，`A6xxGPUInfo`；`tu_attachment_store_unaligned` 注释"x2/y2 can be unaligned if equal to the size of the image, since it will write into padding space"；单级线性图像下边也不要求对齐，`fd6_view.cc` 的 `need_y2_align`），所以可能向下多写最多 3 行、越出图像。0009 新增 `DeviceOptions::render_store_alignment`：给了对齐时，Alias 只在多写部分落在本行空隙里才生效（单层；高度是 4 的倍数；行距 ≥ 宽度按 16 对齐后的字节数；最后一行多写的部分在缓冲内），否则照旧影子。插件默认开 Alias 并给 [16, 4]，`pandora_m2v_padded=shadow` 退回全影子。mtltest：4b（1125×64）允许每行第 1125–1135 像素被写、其余空隙不许动；4c（1125×62）应退回影子，空隙一字节不许变。
+- **上次的测试安排（已做完）**：插件 /opt/work/lplugin/out（m2v 0001–0008，工作计数，两个启动参数开关），Turnip local216（等围栏单次 100 ms），内核 0225。
   - r2o：默认（Shadow；rebinds 拒绝默认开）。和 r2n 比 backboardd 的 CPU、分配占比、`drop CallLog` 是否消失；工作计数里每 10 秒的影子纹理、影子拷贝次数和像素数（分清两平面和单平面）、短轮询次数；part 4b 应通过。
   - r2p：加 `pandora_m2v_padded=alias`。part 4b 判断 Turnip 是否碰行间空隙；比较单平面影子拷贝、GPU 等待帧数、帧率和温度。part 4b 不过就不用 Alias。
   - 有问题时的对照开关：`pandora_m2v_rebinds=allow` 恢复调用日志。

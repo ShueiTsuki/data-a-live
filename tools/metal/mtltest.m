@@ -970,13 +970,18 @@ run(void)
 			}
 		}
 
-		/* ---- part 4b: render into a padded IOSurface, the framebuffer's row layout (1125 texels at 4608-byte rows) ----
-		 * Two passes (clear and draw, then load and draw) over texels the CPU set to 0x11 and padding it set to 0xa5: every
-		 * texel ends green or black, and no byte between the rows changes. Under metal2vulkan's default the texture is a
-		 * shadow (its copies move texels alone); with boot-arg pandora_m2v_padded=alias it is rendered in place (m2v 0003),
-		 * and this shows whether the driver's loads and stores leave the bytes between the rows. */
-		{
-			const unsigned w = 1125, h = 64, bpr = 4608;
+		/* ---- parts 4b and 4c: render into a padded IOSurface, the framebuffer's row layout (1125 texels at 4608-byte
+		 * rows). Two passes (clear and draw, then load and draw) over texels the CPU set to 0x11 and padding it set to 0xa5:
+		 * every texel ends green or black. The plugin renders such a texture in place where Turnip's stores stay in its rows
+		 * (m2v 0009: they write on to the next multiple of 16 texels across, 4 rows down, at the image's edge): 4b, 64
+		 * rows, may change the 11 texels after each row's 1125 (to 1136) and no other byte between the rows; 4c, 62 rows,
+		 * not a multiple of 4, stays a shadow, its copies moving texels alone, so no byte between its rows changes. With
+		 * boot-arg pandora_m2v_padded=shadow both are shadows. */
+		for (unsigned part = 0; part < 2; part++) {
+			const char *name = part == 0 ? "4b" : "4c";
+			const unsigned w = 1125, h = part == 0 ? 64 : 62, bpr = 4608;
+			/* Where Turnip's aligned stores may reach in each row, for the texture rendered in place (4b alone). */
+			const size_t reach = part == 0 ? ((w + 15) / 16 * 16) * 4 : w * 4;
 			NSDictionary *props = @{
 				(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4,
 				(id)kIOSurfaceBytesPerRow: @(bpr), (id)kIOSurfacePixelFormat: @((uint32_t)'RGBA'),
@@ -1003,8 +1008,9 @@ run(void)
 			rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
 			err = nil;
 			id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rpd error:&err];
-			if (!check("part 4b: texture over the padded IOSurface", tex, nil) &&
-			    !check("part 4b: render pipeline", rps, err)) {
+			if (!check(part == 0 ? "part 4b: texture over the padded IOSurface" : "part 4c: texture over the padded IOSurface",
+			        tex, nil) &&
+			    !check(part == 0 ? "part 4b: render pipeline" : "part 4c: render pipeline", rps, err)) {
 				MTLCommandBufferStatus status = MTLCommandBufferStatusCompleted;
 				for (unsigned p = 0; p < 2; p++) {
 					MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1026,7 +1032,7 @@ run(void)
 				IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
 				const uint8_t *b = (const uint8_t *)IOSurfaceGetBaseAddress(surface);
 				const size_t row = IOSurfaceGetBytesPerRow(surface);
-				unsigned green = 0, black = 0, other = 0, padding = 0, changed = 0;
+				unsigned green = 0, black = 0, other = 0, padding = 0, changed = 0, beyond = 0;
 				for (unsigned y = 0; y < h; y++) {
 					const uint32_t *texels = (const uint32_t *)(b + y * row);
 					for (unsigned x = 0; x < w; x++) {
@@ -1035,15 +1041,17 @@ run(void)
 						other += texels[x] != 0xff00ff00u && texels[x] != 0xff000000u;
 					}
 					for (size_t i = w * 4; i < row; i++, padding++) {
-						changed += b[y * row + i] != 0xa5;
+						const bool moved = b[y * row + i] != 0xa5;
+						changed += moved;
+						beyond += moved && i >= reach;
 					}
 				}
 				IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
-				const bool bad = other != 0 || green == 0 || black == 0 || changed != 0 ||
+				const bool bad = other != 0 || green == 0 || black == 0 || beyond != 0 ||
 				    status != MTLCommandBufferStatusCompleted;
-				say("MTLTEST: part 4b: padded IOSurface %ux%u at %zu-byte rows: status %ld; green %u black %u other %u; "
-				    "%u of %u bytes between the rows changed%s", w, h, row, (long)status, green, black, other, changed, padding,
-				    bad ? " FAIL" : "");
+				say("MTLTEST: part %s: padded IOSurface %ux%u at %zu-byte rows: status %ld; green %u black %u other %u; "
+				    "%u of %u bytes between the rows changed, %u past the stores' reach (%zu bytes a row)%s", name, w, h, row,
+				    (long)status, green, black, other, changed, padding, beyond, reach, bad ? " FAIL" : "");
 				failures += bad;
 			}
 			if (surface) {
