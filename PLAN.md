@@ -245,3 +245,29 @@
 
 ## 开机画面（2026-10-25 加入，以后做）
 现在开机时内核把日志文字画满屏幕，直到锁屏出现（0156/0157）。改成像 iPhone 一样：屏幕不画文字（日志照样写进日志文件），只显示一个开机 Logo 保持到锁屏；加开机参数在排查开机卡住时打开文字。Logo 两种做法：自己的 Logo 编进内核，一开机就显示，可公开；苹果 Logo 只能放在本机的固件包里，内核读到存储后才能画（开机先黑一两秒）。不影响开机速度（不画文字反而省一点时间）。
+
+2026-10-25 进展：
+- 开机 Logo：
+  - 用苹果 Logo。tools/bootlogo.py 从用户自己的 IPSW 解出 applelogo，打包时编进启动镜像（不进仓库）。加载器 v2 在没有 -v 时只画 Logo。
+  - 内核文字按用户决定先保留：0206 只挡住了 printf 这一路，kprintf（debug=0x8）还会画字，要去掉就在 fbcon_transmit_data 里也查 sweet_console_muted。
+  - 量过，画字总共约 0.5 秒，影响不大。
+- 开机提速：第一帧从 74 秒提前到约 20 秒（boot1 → boot3）。
+  - 0208/0209 给日志加了时间戳；
+  - 0210 由平台驱动发布 IORTC，省掉 IOKitInitializeTime 的 30 秒等待；
+  - 0211 用 ARMv8 SHA 指令算代码签名哈希，共享缓存校验从 33 秒降到约 9 秒。
+- 开机后屏幕不自己亮（要按电源键才出锁屏）。原因查清了，以后适配硬件时一起改：
+  - **现象**：backboardd 撤掉启动遮罩的同一刻，SpringBoard 的空闲计时器已经到期，直接熄屏。屏幕上露出的是垫在最底层的那层苹果 Logo（boot4，0212 只截第 N 帧的截图，以及系统日志）。
+  - **根本原因**：backboardd 启动花了 10.5 秒，主要在等两样我们没有的硬件。SpringBoard 要等 backboardd 准备好，所以锁屏出来得太晚。
+    1. "HID system start" 4.93 秒：IOHIDEventSystemOpen 里 RemoteHID 的 BTSessionAttach 在等 bluetoothd（被 sweetnoexec 拦着），等到超时；
+    2. "window server" 5.47 秒：CoreBrightness 的 CBU_ShouldWaitForALS 等环境光传感器，等到超时。
+  - **另外**：
+    - vmd（语音信箱）连不上 CommCenter（没有基带），死循环重试。开机这段时间写了约 37 万条日志，还占着一个核；
+    - 很多进程的 MobileGestalt 在等某个驱动出现，等到超时（"giving up waiting for match"）。
+  - **改法（按官方结构）**：
+    - 给手机的环境光传感器做一个 ALS 驱动，以后自动亮度也能用；
+    - 不想要的服务用 launchd 的 disabled.plist 关掉（vmd、bluetoothd），而不是在 exec 时杀掉，让客户端立刻知道服务不存在；
+    - 查清 MobileGestalt 在等哪个驱动。
+- 系统日志的读法：
+  - 用 `pinfile rawread` 按磁盘块拷 iosroot.img。直接按文件读会经过安卓的文件加密，读出来是乱码；
+  - 然后用 hfsplus 模块只读挂载，再用 unifiedlog_iterator 解析；
+  - 解析出的时间戳会被压缩，计时以内核日志和 backboardd 自己记的耗时为准。
