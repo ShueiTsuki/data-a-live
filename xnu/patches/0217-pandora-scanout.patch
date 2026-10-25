@@ -1,8 +1,62 @@
 diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
-index 24d842f..b2dd1c9 100644
+index 24d842f..de5ac36 100644
 --- a/bsd/dev/pandora_dpu.c
 +++ b/bsd/dev/pandora_dpu.c
-@@ -265,4 +265,493 @@ pandora_dpu_probe(uint64_t fb)
+@@ -29,7 +29,14 @@
+ 
+ #if defined(PANDORA)
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#include <vm/pmap.h>
++
++/*
++ * Mappings come from ml_io_map_unmappable (kernel_map), not ml_io_map: ml_io_map takes permanent space in the small
++ * io_submap, and the 1 MiB SMMU window at the first frame ran it out (r2c: kmem_alloc ... failed with 3, a panic).
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#define dpu_map(pa, len) ml_io_map_unmappable((vm_offset_t)(pa), (vm_size_t)(len), VM_WIMG_IO)
+ extern void IOSleep(unsigned int milliseconds);
+ 
+ #define DPU_MDSS_PA   0x09800000u
+@@ -70,7 +77,7 @@ io_rd(vm_offset_t va, uint32_t off)
+ static uint64_t
+ phys_rd64(uint64_t pa)
+ {
+-	vm_offset_t va = ml_io_map(pa & ~0xfffull, 0x1000);
++	vm_offset_t va = dpu_map(pa & ~0xfffull, 0x1000);
+ 	if (!va) {
+ 		return 0;
+ 	}
+@@ -111,7 +118,7 @@ dpu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova, uint64_t *tables, unsigned
+ static void
+ dpu_smmu(uint64_t fetch, uint64_t fb)
+ {
+-	vm_offset_t gr0 = ml_io_map(DPU_SMMU_PA, 0x1000);
++	vm_offset_t gr0 = dpu_map(DPU_SMMU_PA, 0x1000);
+ 	if (!gr0) {
+ 		printf("PANDORA DPU: apps SMMU not mapped\n");
+ 		return;
+@@ -132,8 +139,8 @@ dpu_smmu(uint64_t fetch, uint64_t fb)
+ 		if (type != 0) {
+ 			continue;
+ 		}
+-		vm_offset_t gr1 = ml_io_map(DPU_SMMU_PA + page, 0x1000);
+-		vm_offset_t cbv = ml_io_map(DPU_SMMU_PA + numpage * page + cb * page, 0x1000);
++		vm_offset_t gr1 = dpu_map(DPU_SMMU_PA + page, 0x1000);
++		vm_offset_t cbv = dpu_map(DPU_SMMU_PA + numpage * page + cb * page, 0x1000);
+ 		if (!gr1 || !cbv) {
+ 			printf("PANDORA DPU: SMMU bank %u not mapped\n", cb);
+ 			continue;
+@@ -189,7 +196,7 @@ pandora_dpu_probe(uint64_t fb)
+ 	if (!on) {
+ 		return;
+ 	}
+-	dpu_va = ml_io_map(DPU_MDSS_PA, DPU_MDSS_LEN);
++	dpu_va = dpu_map(DPU_MDSS_PA, DPU_MDSS_LEN);
+ 	if (!dpu_va) {
+ 		printf("PANDORA DPU: MDSS not mapped\n");
+ 		return;
+@@ -265,4 +272,493 @@ pandora_dpu_probe(uint64_t fb)
  	dpu_sample("t0+100ms", pipes);
  	dpu_smmu(fetch, fb);
  }
@@ -204,9 +258,9 @@ index 24d842f..b2dd1c9 100644
 +		return ENOTSUP;
 +	}
 +	if (!dpu_va) {
-+		dpu_va = ml_io_map(DPU_MDSS_PA, DPU_MDSS_LEN);
++		dpu_va = dpu_map(DPU_MDSS_PA, DPU_MDSS_LEN);
 +	}
-+	sc.smmu = ml_io_map(DPU_SMMU_PA, SC_SMMU_BYTES);
++	sc.smmu = dpu_map(DPU_SMMU_PA, SC_SMMU_BYTES);
 +	if (!dpu_va || !sc.smmu) {
 +		return ENOMEM;
 +	}
