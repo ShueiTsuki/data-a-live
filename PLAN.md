@@ -366,3 +366,4 @@
 - **0003**：DevicePolicy 新增 `padded_targets`（默认 Shadow，与原来完全一样；Alias 时直接用图像，和只读纹理的 `padded_reads = Alias` 同一种做法），FAST-PATHS.md 记了这一条，不影响编译配置指纹。lavapipe 上：行跨度是 64 倍数的布局在 Alias 下直接用图像，渲染结果与私有纹理逐像素一致、零影子拷贝；全部测试结果与基线一致（新测试因 WSL 缺验证层与同组一样无法建设备）。
 - **插件**：启动参数 `pandora_m2v_padded=alias` 才启用 Alias；每 10 秒的统计多打 `pandora-metal W` 行（运行时工作计数的变化：影子纹理、影子拷贝次数、拷回像素数、提交次数等）。mtltest 新增 part 4b：1125×64、行跨度 4608 的 IOSurface，两遍渲染后检查像素和行间空隙字节。
 - **下次上手机（需用户同意）**：r2o 默认策略（量 0002 的 CPU 和影子拷贝数，part 4b 应通过）；r2p 加 `pandora_m2v_padded=alias`（part 4b 判断 Turnip 是否碰行间空隙；比较影子拷贝、GPU 等待帧数、帧率和温度）。part 4b 不过就不用 Alias。
+- **Turnip 等围栏改成单次最多 100 ms（tools/turnip/pandora_wait.py，local216，待上手机）**：UniXNU 的 darwin 后端 `dw_wait_fence_raw` 每次只向内核要 1 ms，等一帧 GPU 工作要来回 IOKit 好几趟（r2n：backboardd 每秒约 420 次短轮询超时）。内核从 0216 起就睡到 GPU 围栏中断为止，照 Linux msm 后端 MSM_WAIT_FENCE 一次给整个超时的做法，改为每次给剩余时间、封顶 100 ms（内核等待不可中断，与翻译层自己的 100 ms 粒度一致）。CI 的 turnip.yml 同步加了这一步。
