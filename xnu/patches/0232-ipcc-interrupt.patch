@@ -1,0 +1,323 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 530959f..c7f16d4 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -936,24 +936,30 @@ smem_crash_reason(struct edge *e)
+ 	printf("PANDORA %s: crash reason: \"%s\"\n", e->name, text);
+ }
+ 
+-/* Takes and counts what rang (the links are serviced on every pass whatever rang). */
+-static void
++/*
++ * Takes and counts what rang; returns how many. The links are serviced on every pass of the thread
++ * whatever rang. Called by the thread and, with the interrupt on, at interrupt time
++ * (pandora_ipcc_irq): the counters are atomic.
++ */
++static unsigned
+ ipcc_poll(void)
+ {
++	unsigned taken = 0;
+ 	for (int n = 0; n < 32; n++) {
+ 		uint32_t id = ad_rd(ad_ipcc, IPCC_RECV_ID);
+ 		if (id == IPCC_NONE) {
+ 			break;
+ 		}
+ 		ad_wr(ad_ipcc, IPCC_RECV_CLEAR, id);
++		taken++;
+ 		bool known = false;
+ 		for (unsigned i = 0; i < 2 && !known; i++) {
+ 			struct edge *e = ad_edges[i];
+ 			if (id == ((e->client << 16) | IPCC_SIG_SMP2P)) {
+-				e->bells[0]++;
++				__atomic_fetch_add(&e->bells[0], 1, __ATOMIC_RELAXED);
+ 				known = true;
+ 			} else if (id == ((e->client << 16) | IPCC_SIG_GLINK)) {
+-				e->bells[1]++;
++				__atomic_fetch_add(&e->bells[1], 1, __ATOMIC_RELAXED);
+ 				known = true;
+ 			}
+ 		}
+@@ -961,12 +967,95 @@ ipcc_poll(void)
+ 			continue;
+ 		}
+ 		if (id == IPCC_AOP_QMP) {
+-			ad_ipcc_aop++;
++			__atomic_fetch_add(&ad_ipcc_aop, 1, __ATOMIC_RELAXED);
+ 		} else {
+-			ad_ipcc_other++;
++			__atomic_fetch_add(&ad_ipcc_other, 1, __ATOMIC_RELAXED);
+ 			ad_ipcc_last = id;
+ 		}
+ 	}
++	return taken;
++}
++
++/*
++ * 0232: the IPCC interrupt (iokit/Kernel/arm/PandoraIpcc.cpp, INTID 278 level). Its filter calls
++ * pandora_ipcc_irq, which takes what rang (clearing it lowers the line) and wakes the thread
++ * (ad_wait). 64 interrupts in a row with nothing pending turn it off for good, as the GPU's does,
++ * and the thread polls again. Until the source is there and the window is mapped, the thread polls.
++ */
++static volatile uint32_t ad_irq_pending;
++static void (*ad_irq_enable)(void);
++static int ad_irq_state;                 /* 0 off, 1 starting, 2 on, 3 given up */
++static uint32_t ad_irq_count, ad_irq_empty, ad_irq_empty_run;
++
++int pandora_ipcc_irq(void);
++int
++pandora_ipcc_irq(void)
++{
++	ad_irq_count++;
++	if (!ad_ipcc || !ipcc_poll()) {
++		ad_irq_empty++;
++		if (++ad_irq_empty_run >= 64) {
++			__atomic_store_n(&ad_irq_state, 3, __ATOMIC_RELEASE);
++			thread_wakeup((event_t)&ad_irq_pending);
++			return 1;
++		}
++		return 0;
++	}
++	ad_irq_empty_run = 0;
++	__atomic_store_n(&ad_irq_pending, 1, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&ad_irq_pending);
++	return 0;
++}
++
++/* Once both the window (rproc_map) and the event source (PandoraIpcc::start) are there. */
++static void
++ad_irq_start(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("pandora_ipcc_irq", &on, sizeof(on));
++	if (!ad_mapped || !ad_irq_enable || !on) {
++		return;
++	}
++	int expect = 0;
++	if (!__atomic_compare_exchange_n(&ad_irq_state, &expect, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	ad_irq_enable();
++	__atomic_store_n(&ad_irq_state, 2, __ATOMIC_RELEASE);
++	printf("PANDORA ADSP: IPCC interrupt on: the links' thread sleeps until a doorbell\n");
++}
++
++/* PandoraIpcc.cpp: its event source exists (still disabled); ENABLE turns the line on. */
++void pandora_ipcc_irq_attach(void (*enable)(void));
++void
++pandora_ipcc_irq_attach(void (*enable)(void))
++{
++	ad_irq_enable = enable;
++	ad_irq_start();
++}
++
++static bool
++ad_irq_on(void)
++{
++	return __atomic_load_n(&ad_irq_state, __ATOMIC_ACQUIRE) == 2;
++}
++
++/* Until a doorbell (the interrupt) or ms pass. */
++static void
++ad_wait(unsigned ms)
++{
++	if (__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&ad_irq_pending, THREAD_UNINT, deadline);
++	if (__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL)) {
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		return;
++	}
++	thread_block(THREAD_CONTINUE_NULL);
++	(void)__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL);
+ }
+ 
+ /* ---- SMP2P ---------------------------------------------------------------------------- */
+@@ -1177,10 +1266,11 @@ gl_report(struct edge *e, bool force)
+ 	e->gl.unknown_names[sizeof(e->gl.unknown_names) - 1] = 0;
+ 	printf("PANDORA %s: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
+ 	    "serves %u (%s); FIFOs ours %u/%u theirs %u/%u (tail/head); doorbells SMP2P %u GLINK %u; AOP %u other %u "
+-	    "(last %#x)\n", e->name, ad_ms(e->t0), e->gl.version_agreed ? "agreed" : "not agreed",
+-	    e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages, e->gl.tx_messages, e->gl.rx_data, e->gl.dropped,
+-	    e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail, *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head,
+-	    e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other, ad_ipcc_last);
++	    "(last %#x); IPCC interrupt state %d, %u interrupts, %u empty\n", e->name, ad_ms(e->t0),
++	    e->gl.version_agreed ? "agreed" : "not agreed", e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages,
++	    e->gl.tx_messages, e->gl.rx_data, e->gl.dropped, e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail,
++	    *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head, e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other,
++	    ad_ipcc_last, ad_irq_state, ad_irq_count, ad_irq_empty);
+ }
+ 
+ /* ---- the audio DSP's GPR channel ------------------------------------------------------- */
+@@ -1819,6 +1909,8 @@ adsp_thread(void *arg, wait_result_t result)
+ 	bool adsp_done = mode < 2, batt_done = !battery;
+ 	if (rproc_map()) {
+ 		adsp_done = batt_done = true;
++	} else {
++		ad_irq_start();
+ 	}
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time();
+@@ -1846,7 +1938,12 @@ adsp_thread(void *arg, wait_result_t result)
+ 		if (now >= next_report) {
+ 			clock_interval_to_deadline(now < fast_until ? 5000 : 60000, NSEC_PER_MSEC, &next_report);
+ 		}
+-		ad_sleep(now < fast_until ? 1 : 50);
++		/* With the interrupt a doorbell wakes the thread; the timeout serves the request timers. */
++		if (ad_irq_on()) {
++			ad_wait(now < fast_until ? 20 : 500);
++		} else {
++			ad_sleep(now < fast_until ? 1 : 50);
++		}
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/PandoraIpcc.cpp b/iokit/Kernel/arm/PandoraIpcc.cpp
+new file mode 100644
+index 0000000..4b0d2bd
+--- /dev/null
++++ b/iokit/Kernel/arm/PandoraIpcc.cpp
+@@ -0,0 +1,113 @@
++/*
++ * Patch 0232: the IPCC's interrupt line, the doorbells of the remote processors bsd/dev/pandora_adsp.c
++ * talks to (ADSP, SOCCP, AOP). The phone's DT qcom,ipcc@1106000 gives <GIC_SPI 246 IRQ_TYPE_LEVEL_HIGH>
++ * = INTID 278; tools/mkadt_pandora.py puts it on /arm-io/ipcc. Taken as PandoraAdrenoGpu.cpp takes the
++ * GPU's: the nub through the GIC controller (SweetGIC.cpp), a filter at interrupt time. The filter's
++ * pandora_ipcc_irq takes and clears what rang and wakes the links' thread; nothing is left for the work
++ * loop. pandora_adsp.c enables the source once its IPCC window is mapped.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(PANDORA)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
++#include <IOKit/IOWorkLoop.h>
++#include <kern/thread.h>
++
++extern "C" {
++int pandora_ipcc_irq(void);
++void pandora_ipcc_irq_attach(void (*enable)(void));
++bool sweet_gic_ready(void);
++}
++
++class PandoraIpcc : public IOService {
++	OSDeclareDefaultStructors(PandoraIpcc);
++
++	bool irqFilter(IOFilterInterruptEventSource *source);
++	void irqAction(IOInterruptEventSource *source, int count);
++
++public:
++	void startInterrupt(void);
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PandoraIpcc, IOService);
++
++static IOFilterInterruptEventSource *gPandoraIpccIrq;
++static IOWorkLoop *gPandoraIpccLoop;
++
++static void
++pandora_ipcc_irq_enable(void)
++{
++	if (gPandoraIpccIrq != nullptr) {
++		gPandoraIpccIrq->enable();
++	}
++}
++
++bool
++PandoraIpcc::irqFilter(IOFilterInterruptEventSource *source)
++{
++	if (pandora_ipcc_irq() != 0) {
++		source->disable();   /* nothing pending, again and again: the links poll from now on */
++	}
++	return false;
++}
++
++void
++PandoraIpcc::irqAction(IOInterruptEventSource *, int)
++{
++}
++
++void
++PandoraIpcc::startInterrupt(void)
++{
++	/* As PandoraAdrenoGpu::startInterrupt: this matches on IOResources and may start before the GIC
++	 * controller and the /arm-io nubs exist. */
++	OSDictionary *want = IOService::serviceMatching("SweetGIC");
++	IOService *gic = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
++	OSSafeReleaseNULL(want);
++	want = IOService::nameMatching("ipcc");
++	IOService *nub = want == nullptr ? nullptr : IOService::waitForMatchingService(want, 10ull * NSEC_PER_SEC);
++	OSSafeReleaseNULL(want);
++	OSSafeReleaseNULL(gic);
++	if (nub == nullptr || !sweet_gic_ready() || nub->getProperty("IOInterruptSpecifiers") == nullptr) {
++		IOLog("PANDORA IPCC: no interrupt (node %d, controller %d): the links poll\n", nub != nullptr,
++		    sweet_gic_ready());
++		OSSafeReleaseNULL(nub);
++		return;
++	}
++	gPandoraIpccLoop = IOWorkLoop::workLoop();
++	gPandoraIpccIrq = gPandoraIpccLoop == nullptr ? nullptr : IOFilterInterruptEventSource::filterInterruptEventSource(this,
++	    OSMemberFunctionCast(IOInterruptEventSource::Action, this, &PandoraIpcc::irqAction),
++	    OSMemberFunctionCast(IOFilterInterruptEventSource::Filter, this, &PandoraIpcc::irqFilter), nub, 0);
++	if (gPandoraIpccIrq == nullptr || gPandoraIpccLoop->addEventSource(gPandoraIpccIrq) != kIOReturnSuccess) {
++		IOLog("PANDORA IPCC: interrupt source refused: the links poll\n");
++		OSSafeReleaseNULL(gPandoraIpccIrq);
++		OSSafeReleaseNULL(nub);
++		return;
++	}
++	gPandoraIpccIrq->disable();
++	IOLog("PANDORA IPCC: interrupt source on %s, enabled when the links are mapped\n", nub->getName());
++	pandora_ipcc_irq_attach(pandora_ipcc_irq_enable);
++	OSSafeReleaseNULL(nub);
++}
++
++static void
++pandora_ipcc_irq_thread(void *arg, wait_result_t)
++{
++	static_cast<PandoraIpcc *>(arg)->startInterrupt();
++}
++
++bool
++PandoraIpcc::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	thread_t thread;
++	if (kernel_thread_start(pandora_ipcc_irq_thread, this, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return true;
++}
++#endif /* PANDORA */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index e3a3154..259647e 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -70,6 +70,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = PandoraAdrenoGpu;"
+     "   },"
+     "   {"
++    "     'IOClass'         = PandoraIpcc;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = PandoraIpcc;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AGXAccelerator;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = AGXAccelerator;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 7745d33..0eef20b 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokit
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/PandoraPMGRNub.cpp                              optional iokitcpp
+ iokit/Kernel/arm/PandoraAdrenoGpu.cpp                            optional iokitcpp
++iokit/Kernel/arm/PandoraIpcc.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

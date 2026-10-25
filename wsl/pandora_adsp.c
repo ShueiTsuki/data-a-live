@@ -936,24 +936,30 @@ smem_crash_reason(struct edge *e)
 	printf("PANDORA %s: crash reason: \"%s\"\n", e->name, text);
 }
 
-/* Takes and counts what rang (the links are serviced on every pass whatever rang). */
-static void
+/*
+ * Takes and counts what rang; returns how many. The links are serviced on every pass of the thread
+ * whatever rang. Called by the thread and, with the interrupt on, at interrupt time
+ * (pandora_ipcc_irq): the counters are atomic.
+ */
+static unsigned
 ipcc_poll(void)
 {
+	unsigned taken = 0;
 	for (int n = 0; n < 32; n++) {
 		uint32_t id = ad_rd(ad_ipcc, IPCC_RECV_ID);
 		if (id == IPCC_NONE) {
 			break;
 		}
 		ad_wr(ad_ipcc, IPCC_RECV_CLEAR, id);
+		taken++;
 		bool known = false;
 		for (unsigned i = 0; i < 2 && !known; i++) {
 			struct edge *e = ad_edges[i];
 			if (id == ((e->client << 16) | IPCC_SIG_SMP2P)) {
-				e->bells[0]++;
+				__atomic_fetch_add(&e->bells[0], 1, __ATOMIC_RELAXED);
 				known = true;
 			} else if (id == ((e->client << 16) | IPCC_SIG_GLINK)) {
-				e->bells[1]++;
+				__atomic_fetch_add(&e->bells[1], 1, __ATOMIC_RELAXED);
 				known = true;
 			}
 		}
@@ -961,12 +967,95 @@ ipcc_poll(void)
 			continue;
 		}
 		if (id == IPCC_AOP_QMP) {
-			ad_ipcc_aop++;
+			__atomic_fetch_add(&ad_ipcc_aop, 1, __ATOMIC_RELAXED);
 		} else {
-			ad_ipcc_other++;
+			__atomic_fetch_add(&ad_ipcc_other, 1, __ATOMIC_RELAXED);
 			ad_ipcc_last = id;
 		}
 	}
+	return taken;
+}
+
+/*
+ * 0232: the IPCC interrupt (iokit/Kernel/arm/PandoraIpcc.cpp, INTID 278 level). Its filter calls
+ * pandora_ipcc_irq, which takes what rang (clearing it lowers the line) and wakes the thread
+ * (ad_wait). 64 interrupts in a row with nothing pending turn it off for good, as the GPU's does,
+ * and the thread polls again. Until the source is there and the window is mapped, the thread polls.
+ */
+static volatile uint32_t ad_irq_pending;
+static void (*ad_irq_enable)(void);
+static int ad_irq_state;                 /* 0 off, 1 starting, 2 on, 3 given up */
+static uint32_t ad_irq_count, ad_irq_empty, ad_irq_empty_run;
+
+int pandora_ipcc_irq(void);
+int
+pandora_ipcc_irq(void)
+{
+	ad_irq_count++;
+	if (!ad_ipcc || !ipcc_poll()) {
+		ad_irq_empty++;
+		if (++ad_irq_empty_run >= 64) {
+			__atomic_store_n(&ad_irq_state, 3, __ATOMIC_RELEASE);
+			thread_wakeup((event_t)&ad_irq_pending);
+			return 1;
+		}
+		return 0;
+	}
+	ad_irq_empty_run = 0;
+	__atomic_store_n(&ad_irq_pending, 1, __ATOMIC_RELEASE);
+	thread_wakeup((event_t)&ad_irq_pending);
+	return 0;
+}
+
+/* Once both the window (rproc_map) and the event source (PandoraIpcc::start) are there. */
+static void
+ad_irq_start(void)
+{
+	int on = 1;
+	(void)PE_parse_boot_argn("pandora_ipcc_irq", &on, sizeof(on));
+	if (!ad_mapped || !ad_irq_enable || !on) {
+		return;
+	}
+	int expect = 0;
+	if (!__atomic_compare_exchange_n(&ad_irq_state, &expect, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	ad_irq_enable();
+	__atomic_store_n(&ad_irq_state, 2, __ATOMIC_RELEASE);
+	printf("PANDORA ADSP: IPCC interrupt on: the links' thread sleeps until a doorbell\n");
+}
+
+/* PandoraIpcc.cpp: its event source exists (still disabled); ENABLE turns the line on. */
+void pandora_ipcc_irq_attach(void (*enable)(void));
+void
+pandora_ipcc_irq_attach(void (*enable)(void))
+{
+	ad_irq_enable = enable;
+	ad_irq_start();
+}
+
+static bool
+ad_irq_on(void)
+{
+	return __atomic_load_n(&ad_irq_state, __ATOMIC_ACQUIRE) == 2;
+}
+
+/* Until a doorbell (the interrupt) or ms pass. */
+static void
+ad_wait(unsigned ms)
+{
+	if (__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL)) {
+		return;
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline((event_t)&ad_irq_pending, THREAD_UNINT, deadline);
+	if (__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL)) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		return;
+	}
+	thread_block(THREAD_CONTINUE_NULL);
+	(void)__atomic_exchange_n(&ad_irq_pending, 0, __ATOMIC_ACQ_REL);
 }
 
 /* ---- SMP2P ---------------------------------------------------------------------------- */
@@ -1177,10 +1266,11 @@ gl_report(struct edge *e, bool force)
 	e->gl.unknown_names[sizeof(e->gl.unknown_names) - 1] = 0;
 	printf("PANDORA %s: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
 	    "serves %u (%s); FIFOs ours %u/%u theirs %u/%u (tail/head); doorbells SMP2P %u GLINK %u; AOP %u other %u "
-	    "(last %#x)\n", e->name, ad_ms(e->t0), e->gl.version_agreed ? "agreed" : "not agreed",
-	    e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages, e->gl.tx_messages, e->gl.rx_data, e->gl.dropped,
-	    e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail, *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head,
-	    e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other, ad_ipcc_last);
+	    "(last %#x); IPCC interrupt state %d, %u interrupts, %u empty\n", e->name, ad_ms(e->t0),
+	    e->gl.version_agreed ? "agreed" : "not agreed", e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages,
+	    e->gl.tx_messages, e->gl.rx_data, e->gl.dropped, e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail,
+	    *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head, e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other,
+	    ad_ipcc_last, ad_irq_state, ad_irq_count, ad_irq_empty);
 }
 
 /* ---- the audio DSP's GPR channel ------------------------------------------------------- */
@@ -1819,6 +1909,8 @@ adsp_thread(void *arg, wait_result_t result)
 	bool adsp_done = mode < 2, batt_done = !battery;
 	if (rproc_map()) {
 		adsp_done = batt_done = true;
+	} else {
+		ad_irq_start();
 	}
 	for (;;) {
 		uint64_t now = mach_absolute_time();
@@ -1846,7 +1938,12 @@ adsp_thread(void *arg, wait_result_t result)
 		if (now >= next_report) {
 			clock_interval_to_deadline(now < fast_until ? 5000 : 60000, NSEC_PER_MSEC, &next_report);
 		}
-		ad_sleep(now < fast_until ? 1 : 50);
+		/* With the interrupt a doorbell wakes the thread; the timeout serves the request timers. */
+		if (ad_irq_on()) {
+			ad_wait(now < fast_until ? 20 : 500);
+		} else {
+			ad_sleep(now < fast_until ? 1 : 50);
+		}
 	}
 }
 

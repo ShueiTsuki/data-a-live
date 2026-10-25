@@ -310,6 +310,15 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
             ('compatible', cstr('qcom,adreno-840') + cstr('qcom,adreno-gpu-gen8-2-1')),
             ('interrupt-parent', u32(gic_phandle)),
             ('interrupts', u32(32 + 300) + u32(4)),
+        ]),
+        # The IPCC (patch 0232): the remote processors' doorbells for PandoraIpcc.cpp and
+        # bsd/dev/pandora_adsp.c. The phone's DT qcom,ipcc@1106000 gives <GIC_SPI 246
+        # IRQ_TYPE_LEVEL_HIGH> = INTID 278.
+        node('ipcc', [
+            ph(),
+            ('compatible', cstr('qcom,ipcc')),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 246) + u32(4)),
         ])])
 
     fbcon = node('sweet-fbcon', [
