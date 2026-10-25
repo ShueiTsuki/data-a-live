@@ -87,6 +87,15 @@ fi
 if [ -n "${GPUPOOL:-}" ]; then
 	ADTFLAGS="$ADTFLAGS --gpu-pool $GPUPOOL"
 fi
+# Wall clock (patch 0214): the PMK8850 RTC only counts and Android keeps wall time as that count plus an
+# offset of its own, in encrypted storage. Measure the offset here; the kernel adds it to the RTC.
+read -r rtc_count android_now <<< "$(su "cat /sys/class/rtc/rtc0/since_epoch; date +%s" | tr '\n' ' ')"
+case "$rtc_count$android_now" in
+*[!0-9]* | "") echo "rtc: no reading ($rtc_count / $android_now), iOS keeps 1970" ;;
+*)
+	CMDLINE="$CMDLINE pandora_rtc_offset=$((android_now - rtc_count))"
+	echo "rtc: counter $rtc_count, Android $android_now, offset $((android_now - rtc_count))" ;;
+esac
 
 echo "== 2. payload (WSL, /opt/work/run$RUN)"
 # KERNEL=/opt/work/plk/kN-amfi.macho (tools/mkprelink.py) and TRUSTCACHE="IPSW trust cache..."
