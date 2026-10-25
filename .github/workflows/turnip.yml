@@ -63,6 +63,8 @@ jobs:
             echo "== $p"
             git -C mesa apply --whitespace=nowarn "$PWD/unixnu/$p"
           done
+          # How each render pass is drawn (GMEM or sysmem, with Turnip's reason), for the Metal plugin's log.
+          python3 tools/turnip/pandora_rpstats.py mesa
           ls nativeadreno/NativeAdrenoABI.h
           # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
           python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h

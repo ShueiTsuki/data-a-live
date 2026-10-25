@@ -31,6 +31,7 @@
 #include <string.h>
 
 extern char *proc_name_address(void *p);   /* bsd/kern/kern_proc.c */
+extern void pandora_idle_log(void);         /* osfmk/arm/pandora_cpu_idle.c (0215) */
 
 #define PCTL_CPUS       8
 #define PCTL_THREADS    4096               /* power of two */
@@ -322,4 +323,5 @@ pandora_perfctl_log(void)
 	}
 	printf("PANDORA PCTL: %llu switches, %llu work interval notes, %llu instance calls, %llu threads not counted (table full)\n",
 	    pctl_switches, pctl_notifies, pctl_ctls, pctl_dropped);
+	pandora_idle_log();
 }

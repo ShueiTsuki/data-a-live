@@ -1,0 +1,270 @@
+/*
+ * PANDORA display controller, read only (patch 0215): what the ABL left running, before the display
+ * scans out the GPU's frames itself (docs/GPU_PLAN.md item 9). Nothing is written.
+ *
+ * SM8850's MDSS has a DPU 13.0 (qcom,sde-hw-version 0xd0000000). Register names and offsets are the ones
+ * of Qualcomm's mainline Linux driver (drivers/gpu/drm/msm/disp/dpu1: catalog/dpu_13_0_kaanapali.h,
+ * dpu_hw_sspp_v13.c, dpu_hw_ctl.c, dpu_hw_lm.c, dpu_hw_intf.c, dpu_hw_interrupts.c). Catalog offsets
+ * count from the "mdp" region, MDSS + 0x1000; the phone's DT (qcom,sde-*-off) counts from MDSS and
+ * gives the same addresses. On v13 a source pipe's registers sit in its rectangle blocks REC0 (+0x1000)
+ * and REC1 (+0x3000), not at the pipe's base, which is why step 1's reads at the DT offsets saw zeros.
+ *
+ * Only registers inside the DT's block sizes (qcom,sde-*-size) or ones mainline reads on v13 are touched.
+ *
+ * Logged once, from the framebuffer's start (boot-arg pandora_dpu_probe=0 skips it):
+ *   - MDSS and DPU versions;
+ *   - each control path (CTL) in use: interfaces, pipes and mixers it drives;
+ *   - each source pipe with an address or size: format, sizes, position, stride, the address it fetches;
+ *   - mixers 0-3 and the DSI interfaces (timing engine, command-mode trigger, tear check, autorefresh,
+ *     interrupt enables), then a second look 100 ms later at the counters, to see the panel refresh;
+ *   - the apps SMMU route of the display's stream (DT qcom,smmu_sde_unsec_cb: iommus 0x800 mask 0x2):
+ *     stream match, context bank, its translation, and the walk of the address the active pipe fetches.
+ */
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
+#include <machine/machine_routines.h>
+
+#if defined(PANDORA)
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void ml_io_unmap(vm_offset_t, vm_size_t);
+extern void IOSleep(unsigned int milliseconds);
+
+#define DPU_MDSS_PA   0x09800000u
+#define DPU_MDSS_LEN  0x001c8800u
+#define DPU_MDP       0x1000u                       /* the catalog's base */
+#define DPU_CTL(n)    (DPU_MDP + 0x1f000u + 0x1000u * (n))
+#define DPU_LM(n)     (DPU_MDP + 0x103000u + 0x8000u * (n))
+#define DPU_INTF(n)   (DPU_MDP + 0x18d000u + 0x1000u * (n))   /* tear check and autorefresh are here on v13 */
+#define DPU_TEARI(n)  (DPU_MDP + 0x18d800u + 0x1000u * (n))
+#define DPU_REC0      0x1000u
+#define DPU_REC1      0x3000u
+#define DPU_SMMU_PA   0x15000000u
+#define DPU_SID       0x800u
+
+static const struct {
+	const char *name;
+	uint32_t base;
+} dpu_sspp[] = {
+	{ "vig0", 0x2b000 }, { "vig1", 0x34000 }, { "vig2", 0x3d000 }, { "vig3", 0x46000 },
+	{ "dma0", 0x97000 }, { "dma1", 0xa0000 }, { "dma2", 0xa9000 }, { "dma3", 0xb2000 },
+	{ "dma4", 0xbb000 }, { "dma5", 0xc4000 },
+};
+
+static vm_offset_t dpu_va;
+
+static inline uint32_t
+dpu_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(dpu_va + off);
+}
+
+static inline uint32_t
+io_rd(vm_offset_t va, uint32_t off)
+{
+	return *(volatile uint32_t *)(va + off);
+}
+
+static uint64_t
+phys_rd64(uint64_t pa)
+{
+	vm_offset_t va = ml_io_map(pa & ~0xfffull, 0x1000);
+	if (!va) {
+		return 0;
+	}
+	uint64_t v = *(volatile uint64_t *)(va + (pa & 0xff8));
+	ml_io_unmap(va, 0x1000);
+	return v;
+}
+
+/* Stage-1 walk of IOVA with a 4 KB granule from TTBR0 (TCR.T0SZ): the output address, or ~0 when not mapped. */
+static uint64_t
+dpu_walk(uint64_t ttbr, uint32_t tcr, uint64_t iova, uint64_t *tables, unsigned *levels)
+{
+	const unsigned t0sz = tcr & 0x3f, bits = 64 - t0sz;
+	unsigned level = bits > 39 ? 0 : bits > 30 ? 1 : 2;
+	uint64_t table = ttbr & 0x0000fffffffff000ull;
+	*levels = 0;
+	if (((tcr >> 14) & 3) != 0) {
+		return ~0ull;   /* not a 4 KB granule */
+	}
+	for (; level <= 3; level++) {
+		const unsigned shift = 12 + 9 * (3 - level);
+		const uint64_t d = phys_rd64(table + 8 * ((iova >> shift) & 0x1ff));
+		tables[(*levels)++] = table;
+		if ((d & 1) == 0) {
+			return ~0ull;
+		}
+		if (level < 3 && (d & 2) == 0) {   /* block */
+			return (d & 0x0000fffffffff000ull & ~((1ull << shift) - 1)) | (iova & ((1ull << shift) - 1));
+		}
+		if (level == 3) {
+			return (d & 0x0000fffffffff000ull) | (iova & 0xfff);
+		}
+		table = d & 0x0000fffffffff000ull;
+	}
+	return ~0ull;
+}
+
+/* The apps SMMU route for the display stream, and where FETCH (an address an active pipe reads) lands. */
+static void
+dpu_smmu(uint64_t fetch, uint64_t fb)
+{
+	vm_offset_t gr0 = ml_io_map(DPU_SMMU_PA, 0x1000);
+	if (!gr0) {
+		printf("PANDORA DPU: apps SMMU not mapped\n");
+		return;
+	}
+	const uint32_t id1 = io_rd(gr0, 0x24), nsmr = io_rd(gr0, 0x20) & 0xff;
+	const uint64_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
+	const uint64_t numpage = 1ull << (((id1 >> 28) & 7) + 1);
+	bool any = false;
+	for (unsigned i = 0; i < nsmr; i++) {
+		const uint32_t smr = io_rd(gr0, 0x800 + 4 * i);
+		if (!(smr & 0x80000000u) || ((DPU_SID ^ smr) & ~(smr >> 16) & 0x7fff) != 0) {
+			continue;
+		}
+		any = true;
+		const uint32_t s2cr = io_rd(gr0, 0xc00 + 4 * i), type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
+		printf("PANDORA DPU: SMMU SMR %u %08x (id %#x mask %#x) S2CR %08x (%s, bank %u)\n", i, smr, smr & 0x7fff,
+		    (smr >> 16) & 0x7fff, s2cr, type == 0 ? "translate" : type == 1 ? "bypass" : "fault", cb);
+		if (type != 0) {
+			continue;
+		}
+		vm_offset_t gr1 = ml_io_map(DPU_SMMU_PA + page, 0x1000);
+		vm_offset_t cbv = ml_io_map(DPU_SMMU_PA + numpage * page + cb * page, 0x1000);
+		if (!gr1 || !cbv) {
+			printf("PANDORA DPU: SMMU bank %u not mapped\n", cb);
+			continue;
+		}
+		const uint32_t cbar = io_rd(gr1, 4 * cb), cba2r = io_rd(gr1, 0x800 + 4 * cb);
+		const uint32_t sctlr = io_rd(cbv, 0x0), tcr = io_rd(cbv, 0x30);
+		const uint64_t ttbr0 = io_rd(cbv, 0x20) | (uint64_t)io_rd(cbv, 0x24) << 32;
+		printf("PANDORA DPU: SMMU bank %u: cbar %08x cba2r %08x sctlr %08x actlr %08x tcr %08x tcr2 %08x ttbr0 %#llx "
+		    "mair0 %08x mair1 %08x fsr %08x far %#llx\n", cb, cbar, cba2r, sctlr, io_rd(cbv, 0x4), tcr, io_rd(cbv, 0x10),
+		    ttbr0, io_rd(cbv, 0x38), io_rd(cbv, 0x3c), io_rd(cbv, 0x58),
+		    io_rd(cbv, 0x60) | (uint64_t)io_rd(cbv, 0x64) << 32);
+		if ((sctlr & 1) && fetch) {
+			uint64_t tables[4] = {};
+			unsigned levels = 0;
+			const uint64_t pa = dpu_walk(ttbr0, tcr, fetch, tables, &levels);
+			printf("PANDORA DPU: SMMU walk %#llx -> %#llx (%s; tables %#llx %#llx %#llx %#llx); the boot framebuffer is %#llx\n",
+			    fetch, pa, pa == ~0ull ? "not mapped" : pa == fetch ? "identity" : "translated", tables[0], tables[1],
+			    tables[2], tables[3], fb);
+		} else if (fetch) {
+			printf("PANDORA DPU: SMMU bank %u has translation off: the pipe fetches %#llx as it is\n", cb, fetch);
+		}
+		ml_io_unmap(gr1, 0x1000);
+		ml_io_unmap(cbv, 0x1000);
+	}
+	if (!any) {
+		printf("PANDORA DPU: no SMMU stream match for %#x (of %u entries)\n", DPU_SID, nsmr);
+	}
+	ml_io_unmap(gr0, 0x1000);
+}
+
+/* What changes in 100 ms: frame and line counters, the CTL flush, the address each active rectangle reads. */
+static void
+dpu_sample(const char *when, uint32_t pipes)
+{
+	printf("PANDORA DPU: %s: intf1 frame %u line %u tear-line %u status %08x intr %08x tear-intr %08x | "
+	    "intf2 frame %u tear-line %u | ctl0 flush %08x\n", when,
+	    dpu_rd(DPU_INTF(1) + 0xac), dpu_rd(DPU_INTF(1) + 0xb0), dpu_rd(DPU_INTF(1) + 0x2b0),
+	    dpu_rd(DPU_INTF(1) + 0x26c), dpu_rd(DPU_INTF(1) + 0x1c4), dpu_rd(DPU_TEARI(1) + 0x4),
+	    dpu_rd(DPU_INTF(2) + 0xac), dpu_rd(DPU_INTF(2) + 0x2b0), dpu_rd(DPU_CTL(0) + 0x18));
+	for (unsigned p = 0; p < sizeof(dpu_sspp) / sizeof(dpu_sspp[0]); p++) {
+		if (pipes & (1u << p)) {
+			const uint32_t b = DPU_MDP + dpu_sspp[p].base;
+			printf("PANDORA DPU: %s: %s current %08x / %08x\n", when, dpu_sspp[p].name,
+			    dpu_rd(b + DPU_REC0 + 0x64), dpu_rd(b + DPU_REC1 + 0x64));
+		}
+	}
+}
+
+void pandora_dpu_probe(uint64_t fb);
+void
+pandora_dpu_probe(uint64_t fb)
+{
+	int on = 1;
+	PE_parse_boot_argn("pandora_dpu_probe", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	dpu_va = ml_io_map(DPU_MDSS_PA, DPU_MDSS_LEN);
+	if (!dpu_va) {
+		printf("PANDORA DPU: MDSS not mapped\n");
+		return;
+	}
+	printf("PANDORA DPU: MDSS hw %08x, DPU top %08x %08x %08x %08x\n", dpu_rd(0), dpu_rd(DPU_MDP), dpu_rd(DPU_MDP + 4),
+	    dpu_rd(DPU_MDP + 8), dpu_rd(DPU_MDP + 0xc));
+
+	for (unsigned n = 0; n < 6; n++) {
+		const uint32_t c = DPU_CTL(n);
+		const uint32_t intf = dpu_rd(c + 0xf4), fetch = dpu_rd(c + 0xfc), pipe = dpu_rd(c + 0x12c);
+		if (intf == 0 && fetch == 0 && pipe == 0) {
+			continue;
+		}
+		printf("PANDORA DPU: ctl%u: top %08x flush %08x start %08x prepare %08x intf %08x master %08x fetch %08x "
+		    "pipe %08x layer %08x merge3d %08x dsc %08x layer0 %08x\n", n, dpu_rd(c + 0x14), dpu_rd(c + 0x18),
+		    dpu_rd(c + 0x1c), dpu_rd(c + 0xd0), intf, dpu_rd(c + 0x134), fetch, pipe, dpu_rd(c + 0x130),
+		    dpu_rd(c + 0xe4), dpu_rd(c + 0xe8), dpu_rd(c + 0x0));
+	}
+
+	uint32_t pipes = 0;
+	uint64_t fetch = 0;
+	for (unsigned p = 0; p < sizeof(dpu_sspp) / sizeof(dpu_sspp[0]); p++) {
+		const uint32_t b = DPU_MDP + dpu_sspp[p].base;
+		for (unsigned r = 0; r < 2; r++) {
+			const uint32_t q = b + (r ? DPU_REC1 : DPU_REC0);
+			const uint32_t size = dpu_rd(q + 0x14), addr = dpu_rd(q + 0x4c), cur = dpu_rd(q + 0x64);
+			if (size == 0 && addr == 0 && cur == 0) {
+				continue;
+			}
+			pipes |= 1u << p;
+			if (!fetch && cur) {
+				fetch = cur;
+			}
+			printf("PANDORA DPU: %s rec%u: format %08x unpack %08x op %08x img %08x src %08x xy %08x out %08x "
+			    "out-xy %08x addr %08x %08x stride %08x current %08x active %08x flush %08x\n", dpu_sspp[p].name, r,
+			    dpu_rd(q + 0x0), dpu_rd(q + 0x4), dpu_rd(q + 0x8), dpu_rd(q + 0x10), size, dpu_rd(q + 0x18),
+			    dpu_rd(q + 0x1c), dpu_rd(q + 0x20), addr, dpu_rd(q + 0x50), dpu_rd(q + 0x5c), cur,
+			    dpu_rd(q + 0xc8), dpu_rd(q + 0xd4));
+		}
+		if (pipes & (1u << p)) {
+			printf("PANDORA DPU: %s common: clk %08x multirect %08x addr-config %08x status %08x%s\n",
+			    dpu_sspp[p].name, dpu_rd(b + 0x0), dpu_rd(b + 0x10), dpu_rd(b + 0x14), dpu_rd(b + 0x44),
+			    p < 4 ? "" : " (dma: no scaler)");
+			if (p < 4) {
+				printf("PANDORA DPU: %s scaler: %08x %08x %08x %08x\n", dpu_sspp[p].name, dpu_rd(b + 0x2000),
+				    dpu_rd(b + 0x2004), dpu_rd(b + 0x2008), dpu_rd(b + 0x200c));
+			}
+		}
+	}
+	if (!pipes) {
+		printf("PANDORA DPU: no source pipe has an address or size\n");
+	}
+
+	for (unsigned n = 0; n < 4; n++) {
+		const uint32_t m = DPU_LM(n);
+		printf("PANDORA DPU: lm%u: op %08x out %08x bg-sel %08x border %08x %08x stage0 op %08x fg-sel %08x alpha %08x "
+		    "stage1 op %08x fg-sel %08x\n", n, dpu_rd(m + 0x0), dpu_rd(m + 0x4), dpu_rd(m + 0x14), dpu_rd(m + 0x1c),
+		    dpu_rd(m + 0x20), dpu_rd(m + 0x40), dpu_rd(m + 0x44), dpu_rd(m + 0x48), dpu_rd(m + 0x70), dpu_rd(m + 0x74));
+	}
+	for (unsigned n = 1; n <= 2; n++) {
+		const uint32_t i = DPU_INTF(n);
+		printf("PANDORA DPU: intf%u (dsi%u): engine %08x config %08x config2 %08x format %08x cmd-trigger %08x mux %08x "
+		    "status %08x count-en %08x | tear: vsync-sel %08x check %08x sync %08x height %08x init %08x start %08x "
+		    "rd-ptr %08x autorefresh %08x | intr en %08x tear-intr en %08x\n", n, n - 1, dpu_rd(i + 0x0), dpu_rd(i + 0x4),
+		    dpu_rd(i + 0x60), dpu_rd(i + 0x90), dpu_rd(i + 0x84), dpu_rd(i + 0x25c), dpu_rd(i + 0x26c), dpu_rd(i + 0xa8),
+		    dpu_rd(i + 0x280), dpu_rd(i + 0x284), dpu_rd(i + 0x288), dpu_rd(i + 0x28c), dpu_rd(i + 0x294),
+		    dpu_rd(i + 0x2a0), dpu_rd(i + 0x2a4), dpu_rd(i + 0x2b4), dpu_rd(i + 0x1c0), dpu_rd(DPU_TEARI(n) + 0x0));
+	}
+
+	dpu_sample("t0", pipes);
+	IOSleep(100);
+	dpu_sample("t0+100ms", pipes);
+	dpu_smmu(fetch, fb);
+}
+#endif /* PANDORA */

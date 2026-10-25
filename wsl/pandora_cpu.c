@@ -71,6 +71,7 @@ extern processor_t thread_bind(processor_t processor);   /* kern/sched_prim.h, n
 extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_cpu_idle.c */
 extern void pandora_perfctl_start(void);                    /* osfmk/arm/pandora_perfctl.c */
 extern void pandora_perfctl_log(void);
+extern void pandora_idle_start(void);                       /* osfmk/arm/pandora_cpu_idle.c (0215) */
 
 #define PDP_MBOX_TX_PA          0x19980000ull   /* qcom,pdp0 "tx" registers */
 #define PDP_MBOX_TX_CMD(ch)     (0x100u + (ch) * 8u + 4u)
@@ -773,6 +774,7 @@ cpu_thread(__unused void *arg, __unused wait_result_t wr)
 			    t->clusters[c].cpu_mask);
 		}
 	}
+	pandora_idle_start();
 	cpu_clocks("at 3 s");
 	cpu_scmi_probe();
 	int mode = 1;
