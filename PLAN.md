@@ -200,7 +200,7 @@
 - DeepSeek 按 `D:\DeepSeekHarness\regcheck\TASK.md` 做了核对表（`RESULT.md`，WiFi 40 项、ADSP/音频 36 项），我逐条对照原文复核（`VERIFY.md`）：大多数正确；改正 W08（pandora ATU 是 `0x410000000`）、A16/A28（GLINK 的 SMEM 项和 APM 端口是协议常数，两边相同）、W16 的时钟投票（寄存器和比特相同，多 phy_aux `0x52018` bit31、cfg_noc_pcie_anoc_ahb `0x52000` bit20）；W09 配置空间和 W31 MSI 只能上机确认。
 - 结论：ADSP 通信（SMEM、SMP2P、GLINK、GPR）两边编号一样，最好搬，接在我们已有的 `pandora_adsp.c` 后面；出声还要自己做播放图和两颗 CS35L43（sheng 也没做到）；WiFi 芯片不同（`cnss-peach`，PCIe ID `0x110e`，不是 WCN7850，主线 ath12k 也不认），固件和 MHI 配置要从手机自己的分区查。
 
-## ADSP 通信（2026-10-25，内核 0226/0227）
+## ADSP 通信（2026-10-25/26，内核 0226–0228）
 - 用户定：先做 ADSP 通信，WiFi 只调查；固件先用单独的测试包，再做正式的（从手机自己的固件分区读，和安卓、UniXNU 一样）。
 - 0226：sheng 的 SMEM、SMP2P、GLINK、GPR 四个库原样放进 `bsd/dev/qcom/`（许可证 BSD-2-Clause-Patent，`wsl/qcom/SOURCE.txt` 记了来源提交号；上游自带的 PC 测试在我们的副本上通过，4183 + 37 项）。`pandora_adsp.c` 在原来的启动步骤上加了：
   1. 启动前：建我们的 SMP2P 项 429（加 TCSR 互斥锁 3），加 "master-kernel" 条目，打开 IPCC 门铃；
@@ -212,6 +212,9 @@
 - 0227：所有安全世界调用（ADSP 和 GPU 共用 `scm_smc`）加互斥锁，一次一个，和 Linux 以前的 qcom_scm_lock 一样；如果还是收到"排队"，照 Linux 的 waitq 流程处理：轮询 GET_WQ_CTX，代替中断（SPI 962），再发 WAITQ_RESUME。
 - adsp2（0227）：加锁后 GPU 正常（vktest PASS 16，没有失败），安全世界没再排队。ADSP 两个镜像第一次都校验通过、放开复位（主镜像 33.8 MB，auth_and_reset 用了 96 ms），但 5 秒内 DSP 没建它的 SMP2P 项 443，门铃一次没响，SMEM 里也没有崩溃原因。
 - 0228：照 Linux qcom_q6v5_prepare，在启动前给 DSP 到内存的总线（DT "rproc_ddr"）投最大带宽。按主线 kaanapali 总线驱动，这条路上只有 LP0 是 LPASS 专用的，所以只投 LP0（SH0、MC0、ACV 是主处理器自己的内存通路，不动），交接或失败时撤掉。启动顺序改成 Linux 的：总线票、load_state、LCX/LMX；失败时 load_state 关。`pandora_adsp_wait=毫秒` 可以把等就绪的时间拉长，用来分清是起得慢还是没起来。
+- **adsp3（0228）：ADSP 通了。** LP0 总线票一投，DSP 放开复位后 434 ms 建出 SMP2P 项 443，626 ms 报就绪，653 ms 交接（电压和总线票按 Linux 撤掉）。GLINK 版本协商成功，DSP 打开 "adsp_apps"，我们这边 667 ms 通道就绪；问 APM，第一次没回音（1 秒超时），第二次回"框架就绪"，离通道就绪 1001 ms。和 sheng 走到的位置一样。GPU 同时正常（vktest PASS 16，没有失败）。
+- DSP 还打开了 8 个我们没接的通道：glink_ssr、pcie_drv、mhi_sat、IPCRTR（QRTR 路由，安卓上音频服务、传感器都走它）、fastrpcglink-apps-dsp、adsp_apps2、sleepmonglink-apps-adsp，统计里丢掉的 92 条消息是发到这些通道的。
+- 下一步（用户已定）：固件改成正式做法，从手机自己的固件分区读（安卓的 /vendor/firmware_mnt，FAT），不再放进测试包。
 
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
