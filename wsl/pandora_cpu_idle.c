@@ -18,3 +18,14 @@ pandora_cpu_idle_mach(int cpu)
 	recount_processor_usage(&p->pr_recount, &usage, &idle);
 	return idle;
 }
+
+/*
+ * Patch 0213: the cores the scheduler may use, as Apple's performance controller sets them for heat
+ * (reason CLPC system; the boot CPU is always kept). For bsd/dev/pandora_cpu.c's thermal control.
+ */
+void pandora_cpu_recommend(uint64_t cores);
+void
+pandora_cpu_recommend(uint64_t cores)
+{
+	sched_perfcontrol_update_recommended_cores_reason(cores, REASON_CLPC_SYSTEM, 0);
+}

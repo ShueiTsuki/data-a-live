@@ -3111,8 +3111,14 @@ gpu_watch(void)
  *     of max(2 x the current frequency, 578 MHz) for 50 ms (msm_devfreq_active's boost);
  *   - bandwidth: the level's DT bus-freq index, in the same HFI_H2F_MSG_GX_BW_PERF_VOTE.
  * Off with pandora_gpu_perf (a fixed level, 0196); pandora_gpu_perf_max caps it (default 18). A line
- * every 10 s: busy share, the levels used, changes, boosts. No temperature limit yet.
+ * every 10 s: busy share, the levels used, changes, boosts.
+ * Patch 0213: a temperature cap. bsd/dev/pandora_cpu.c reads the GPU's sensors and, as the phone's
+ * DT asks for (gpuss-N tj_cfg 95 C, step_wise on the kgsl cooling device), lowers
+ * pandora_gpu_thermal_top one level every 100 ms above 95 C and raises it below; the level asked
+ * for, the boost floor included, never goes over it.
  */
+uint32_t pandora_gpu_thermal_top;           /* 0213: highest level allowed, 0 = no temperature cap */
+const uint32_t pandora_gpu_level_count = NGPU - 1;   /* levels 1 .. this */
 #define GMU_AO_GPU_CX_BUSY_MASK       0x23b0eu
 #define GMU_POWER_COUNTER_ENABLE_A8   0x1fc10u
 #define GMU_POWER_COUNTER_SELECT_XO0  0x1fc40u
@@ -3246,6 +3252,10 @@ gpu_dcvs_thread(void *arg, wait_result_t result)
 			idle_since = t;
 		}
 		want = MAX(want, floor);
+		const uint32_t tcap = __atomic_load_n(&pandora_gpu_thermal_top, __ATOMIC_RELAXED);
+		if (tcap != 0 && want > tcap) {
+			want = tcap;    /* 0213: temperature cap, over every other reason */
+		}
 		if (want != cur) {
 			if (gpu_vote(want)) {
 				hold = want > cur ? 1 : 0;
