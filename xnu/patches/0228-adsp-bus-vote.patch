@@ -1,0 +1,154 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index c285fb2..cd27c47 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -28,7 +28,8 @@
+  * SMP2P and 0 for GLINK. No interrupt yet (a plain BSD file has no SPI attach): this thread
+  * reads IPCC RECV_ID every 1 ms (every 20 ms after the first 30 s) and services SMP2P and
+  * GLINK on every pass. pandora_adsp_gpr=2: we open "adsp_apps" (default: the DSP opens it).
+- * Not done yet: interconnect votes, the IPCRTR router channel. PLAN.md "扬声器路线".
++ * The DSP's bus vote (bcm_vote): LP0 only, see there; pandora_adsp_wait=MS waits longer than
++ * Linux's 5 s for the ready bit. Not done yet: the IPCRTR router channel. PLAN.md "扬声器路线".
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -423,6 +424,32 @@ arc_vote(const char *res, uint32_t vlvl)
+ 	return err;
+ }
+ 
++/* BCM vote (include/soc/qcom/tcs.h BCM_TCS_CMD): commit, valid, x average, y peak, 14 bits each. */
++#define BCM_CMD(commit, valid, x, y) \
++	(((uint32_t)(commit) << 30) | ((uint32_t)(valid) << 29) | (((uint32_t)(x) & 0x3fff) << 14) | ((uint32_t)(y) & 0x3fff))
++#define BCM_VOTE_MAX     0x3fffu
++
++/*
++ * The DSP's way to DDR (DT "rproc_ddr": lpass_lpicx_noc MASTER_LPASS_PROC -> mc_virt SLAVE_EBI1).
++ * qcom_q6v5_prepare votes it 0/UINT_MAX before load_state and the handover takes it back. On that
++ * path (Linux drivers/interconnect/qcom/kaanapali.c) only LP0 (qnm_lpass_lpinoc, qns_lpass_aggnoc)
++ * serves LPASS alone; SH0 and MC0 are keepalive BCMs the apps' own DDR traffic needs, and ACV is the
++ * apps' DDR mask, so those are left as the boot stages set them. UINT_MAX saturates the vote.
++ */
++static int
++bcm_vote(const char *res, uint32_t peak)
++{
++	uint32_t addr = 0, aux = 0, len = 0;
++	int err = cmddb_find(res, &addr, &aux, &len);
++	if (err) {
++		printf("PANDORA ADSP: cmd-db %s not found\n", res);
++		return err;
++	}
++	err = rpmh_write1(addr, BCM_CMD(1, 1, 0, peak));
++	printf("PANDORA ADSP: BCM %s addr %#x: peak vote %#x -> %d\n", res, addr, peak, err);
++	return err;
++}
++
+ /* ---- firmware pack and MDT --------------------------------------------------------- */
+ 
+ struct fw_ent {
+@@ -707,6 +734,25 @@ smem_item(uint16_t item, uint32_t *size)
+ 	return (volatile uint8_t *)ad_smem_va + at;
+ }
+ 
++/* Which of our items the partition apps-ADSP holds, item:size. */
++static void
++smem_survey(const char *when)
++{
++	static const uint16_t items[5] = {AD_ITEM_P2P_IN, AD_ITEM_P2P_OUT, AD_ITEM_GL_DESC, AD_ITEM_GL_TX, AD_ITEM_GL_RX};
++	char have[64];
++	have[0] = 0;
++	for (unsigned i = 0; i < 5; i++) {
++		uint32_t size = 0;
++		if (smem_item(items[i], &size)) {
++			char one[16];
++			snprintf(one, sizeof(one), " %u:%u", items[i], size);
++			strlcat(have, one, sizeof(have));
++		}
++	}
++	printf("PANDORA ADSP: SMEM %s: partition at %#x size %#x hosts %u/%u, cacheline %u; items there:%s\n", when,
++	    ad_part.offset, ad_part.size, ad_part.host0, ad_part.host1, ad_part.cacheline, have[0] ? have : " none");
++}
++
+ /* The DSP's crash text (global partition item 423, qcom_q6v5.c q6v5_fatal_interrupt). */
+ static void
+ smem_crash_reason(void)
+@@ -797,10 +843,11 @@ p2p_service(void)
+ 		smem_crash_reason();
+ 	}
+ 	if ((value & SLAVE_HANDOVER) && !ad_handed) {
+-		/* qcom_pas_handover: the proxy votes go, the DSP holds its own now. */
++		/* qcom_pas_handover and q6v5_handover_interrupt: the proxy votes go, the DSP holds its own now. */
+ 		ad_handed = true;
+ 		(void)arc_vote("lcx.lvl", 0);
+ 		(void)arc_vote("lmx.lvl", 0);
++		(void)bcm_vote("LP0", 0);
+ 	}
+ }
+ 
+@@ -1020,19 +1067,7 @@ adsp_comms_setup(void)
+ 		printf("PANDORA ADSP: no SMEM partition apps-ADSP: %d\n", rc);
+ 		return ENODEV;
+ 	}
+-	static const uint16_t items[5] = {AD_ITEM_P2P_IN, AD_ITEM_P2P_OUT, AD_ITEM_GL_DESC, AD_ITEM_GL_TX, AD_ITEM_GL_RX};
+-	char have[64];
+-	have[0] = 0;
+-	for (unsigned i = 0; i < 5; i++) {
+-		uint32_t size = 0;
+-		if (smem_item(items[i], &size)) {
+-			char one[16];
+-			snprintf(one, sizeof(one), " %u:%u", items[i], size);
+-			strlcat(have, one, sizeof(have));
+-		}
+-	}
+-	printf("PANDORA ADSP: SMEM partition at %#x size %#x hosts %u/%u, cacheline %u; items there:%s\n", ad_part.offset,
+-	    ad_part.size, ad_part.host0, ad_part.host1, ad_part.cacheline, have[0] ? have : " none");
++	smem_survey("before the start");
+ 	volatile uint8_t *in = smem_item(AD_ITEM_P2P_IN, NULL);
+ 	if (in) {
+ 		QcomSmp2p view;
+@@ -1069,14 +1104,18 @@ adsp_comms_setup(void)
+ static void
+ adsp_talk(int open_gpr)
+ {
++	/* qcom_q6v5_wait_for_start: 5 s; pandora_adsp_wait=MS waits longer, to tell slow from dead. */
+ 	uint64_t until;
+-	clock_interval_to_deadline(5000, NSEC_PER_MSEC, &until);
++	unsigned wait_ms = 5000;
++	(void)PE_parse_boot_argn("pandora_adsp_wait", &wait_ms, sizeof(wait_ms));
++	clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &until);
+ 	while (!(ad_slave & (SLAVE_READY | SLAVE_FATAL)) && mach_absolute_time() < until) {
+ 		(void)ipcc_poll();
+ 		p2p_service();
+ 		ad_sleep(1);
+ 	}
+ 	gl_report(true);
++	smem_survey("after the wait");
+ 	if (!(ad_slave & SLAVE_READY) || (ad_slave & SLAVE_FATAL)) {
+ 		printf("PANDORA ADSP: not ready after %llu ms (slave-kernel %#x)\n", ad_ms(ad_t0), ad_slave);
+ 		smem_crash_reason();
+@@ -1114,11 +1153,14 @@ adsp_boot(void)
+ 	if ((err = fw_dir()) || (err = adsp_comms_setup())) {
+ 		return;
+ 	}
+-	(void)arc_vote("lcx.lvl", 384);
+-	(void)arc_vote("lmx.lvl", 384);
++	/* qcom_pas_start's order: qcom_q6v5_prepare (bus vote, load_state), then the proxy power
++	 * domains (DT cx/mx-supply, cx/mx-uV-uA 384). */
++	(void)bcm_vote("LP0", BCM_VOTE_MAX);
+ 	if ((err = qmp_send("{class: image, res: load_state, name: adsp, val: on}"))) {
+ 		printf("PANDORA ADSP: load_state failed %d\n", err);
+ 	}
++	(void)arc_vote("lcx.lvl", 384);
++	(void)arc_vote("lmx.lvl", 384);
+ 	/* Images the boot loaders may have left running (x1e80100: "lite" ADSP pas 0x1f and
+ 	 * DTB 0x29), and our own ids: shut down first, as qcom_pas_load does for lite ids. */
+ 	static const unsigned stop[] = {0x1f, 0x29, AD_PAS_MAIN, AD_PAS_DTB};
+@@ -1153,7 +1195,9 @@ adsp_boot(void)
+ 	if (!ad_handed) {
+ 		(void)arc_vote("lcx.lvl", 0);
+ 		(void)arc_vote("lmx.lvl", 0);
++		(void)bcm_vote("LP0", 0);
+ 	}
++	(void)qmp_send("{class: image, res: load_state, name: adsp, val: off}");   /* qcom_q6v5_unprepare */
+ 	(void)b_main;
+ 	(void)b_dtb;
+ }

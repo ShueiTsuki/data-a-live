@@ -210,6 +210,8 @@
 - 测试：`tools/adsp_test.sh 名字 --tc r2q --write-pack --args "pandora_gpu_metal=1"`。测试包是 GPU 固件加 ADSP 镜像，57 个文件 34.4 MB；手机上的 GPU 文件保持 r2q 的样子。之后再跑 gpu_test.sh 要带 `--write-pack`，因为两个包加起来放不进 40 MiB 的固定文件。
 - adsp1（0226）失败，GPU 也没起来：开机 0.18 秒，ADSP 线程的启动查询和 GPU 的 GPU_INIT_REGS 同时进了安全世界。GPU 那个调用返回 2（WAITQ_SLEEP，固件让它排队），没人让它继续，之后整次开机的所有安全世界调用都返回 2：GPU 停在第 3 级，ADSP 停在 init_image。以前从没撞上，是因为 GPU 测试不开 ADSP，10 月 22 日测 ADSP 时 GPU 没开到这一级。
 - 0227：所有安全世界调用（ADSP 和 GPU 共用 `scm_smc`）加互斥锁，一次一个，和 Linux 以前的 qcom_scm_lock 一样；如果还是收到"排队"，照 Linux 的 waitq 流程处理：轮询 GET_WQ_CTX，代替中断（SPI 962），再发 WAITQ_RESUME。
+- adsp2（0227）：加锁后 GPU 正常（vktest PASS 16，没有失败），安全世界没再排队。ADSP 两个镜像第一次都校验通过、放开复位（主镜像 33.8 MB，auth_and_reset 用了 96 ms），但 5 秒内 DSP 没建它的 SMP2P 项 443，门铃一次没响，SMEM 里也没有崩溃原因。
+- 0228：照 Linux qcom_q6v5_prepare，在启动前给 DSP 到内存的总线（DT "rproc_ddr"）投最大带宽。按主线 kaanapali 总线驱动，这条路上只有 LP0 是 LPASS 专用的，所以只投 LP0（SH0、MC0、ACV 是主处理器自己的内存通路，不动），交接或失败时撤掉。启动顺序改成 Linux 的：总线票、load_state、LCX/LMX；失败时 load_state 关。`pandora_adsp_wait=毫秒` 可以把等就绪的时间拉长，用来分清是起得慢还是没起来。
 
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
@@ -338,6 +340,8 @@
 - **内存**：iOS 用 5 GiB 那块内存里的约 4 GiB（扣 1 MiB 崩溃日志、1 GiB GPU 内存池）；高地址那块约 3.9 GiB 还没给 iOS。
 - **帧率**：屏幕 120 Hz 刷新，iOS 按 iPhone X 的 60 Hz 画；要 120 帧得让 iOS 把屏幕当高刷屏，另做。
 - **未解决**：mtltest 第 9 部分（9a–9c，填充三角形 992/4096 像素没画到）在 r2f、r2g、r2h 一样失败，不是这轮改出来的，待查；r1c 照片小组件"无可用内容"一段时间乱码：用户说之后可能已不再出现，没再看到就不追（GMEM 测试已排除 GMEM）。
+- **待查（2026-10-26 用户报）**：在后台（多任务界面）划掉 App 时，整个界面几秒点不动。adsp2 测试进行中报的，还没确认是不是只在这次出现。普通 App 不是 GPU 客户端（只有 NativeAdrenoMetal.clients 里的 bluetoothd、vktest、mtltest、backboardd 拿 GPU），所以不是 App 的 GPU 地址空间拆除；adsp2 日志里没有对应的超时记录，要开分析器专门测。
+- **待查（2026-10-26 用户报）**：电池一直显示"充电中 100%"。现在的电池是 ios-sweet 带来的替身服务 `SweetBattery.cpp`，数字是写死的，不读硬件（它的真实读数路径是 sweet 的 PM6150，不是这台手机）。pandora 的电量由 SOCCP 管，不是 ADSP：设备树 `pmic-glink` 走 GLINK 通道 "PMIC_RTR_SOCCP_APPS"，SOCCP 的 remote-pid 19，IPCC 客户端 13 信号 0，还有小米的 `mca,adsp_glink`。和 ADSP 用的是同一套 SMEM/GLINK 代码，ADSP 通了以后可以接着做；sheng 的 ShengBattmgr.c（高通 battmgr 协议）可参考。要先查 SOCCP 开机时是不是已经由引导程序启动了。
 
 ### iOS 显示接口调查（2026-10-25，QuartzCore + IOMobileFramebuffer 反汇编，原版 iPhone X 内核）
 - **帧节奏**：CA 的 `CADeviceUseVBL` 按 MobileGestalt `ChipID` 决定用不用硬件垂直同步，只有 0x7000、0x8000–0x8004、0x8010（A8–A10）用；A11（iPhone X，0x8015）不用，CA 自己开定时器（EAGLServer 里 0x30d 标志第 1 位为 0 → add_vsync_source 走定时器）。所以 CA 不需要我们的垂直同步通知；显示中断只给我们自己的上屏线程用。
