@@ -747,6 +747,14 @@ pandora_scanout_current(uint32_t addr)
 	return dpu_rd(sc_rec[0] + SC_CURRENT0) == want && dpu_rd(sc_rec[1] + SC_CURRENT0) == want;
 }
 
+/* 0218: whether CTL0 has taken the last flush (its bits clear at the frame that latches them), without waiting. */
+bool pandora_scanout_flushed(void);
+bool
+pandora_scanout_flushed(void)
+{
+	return !sc.ready || (dpu_rd(DPU_CTL(0) + 0x18) & SC_FLUSH) == 0;
+}
+
 bool pandora_scanout_ready(void);
 bool
 pandora_scanout_ready(void)
