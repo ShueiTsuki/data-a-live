@@ -223,7 +223,13 @@
 - **fw1（0229，完整 GPU 包 + ADSP 从分区读）：都正常。** 内核在 LUN 4 找到 modem_b（FAT16，16 KiB 簇），33.8 MB 主镜像从分区读进固件区约 70 ms；DSP 409 ms 建 SMP2P 项，602 ms 就绪，628 ms 交接；APM 就绪。GPU 同一次开机里正常：vktest PASS 17，没有失败，没有重启。GLINK 丢弃的消息从 92 条降到 16 条（新版 GLINK 不再丢 DSP 的接收缓冲）。第一次问 APM 仍然没回音，第二次（1 秒后）回"就绪"，猜测是 DSP 那边的服务还没注册好；重试能处理，暂不追。
 - 测试包从此只装 GPU 的东西，`tools/adsp_test.sh` 只在要强制用测试包里的 ADSP 固件时才用。
 
-## 扬声器路线（调查结果，2026-10-22，未开始）
+## 扬声器路线（调查结果，2026-10-22；2026-10-26 开始）
+- 用户定的目标（2026-10-26）：音质做到和安卓原生一样、不额外损失，同时按 iOS 的方式接好。上游 sheng 的做法、两边的差别、安卓上实测的做法见 `docs/SPEAKER_RESEARCH.md`（安卓那部分由 DeepSeek 在手机上查，我已核实）。
+- 分步（2026-10-26 按安卓实测重排）：
+  1. 先出声，证明整条路是通的：两颗功放按安卓的 TDM 设置（32 位槽、T 槽 0 / B 槽 1、DSP_A、功放做从机），功放先用直通、不加载固件、低增益；DSP 上搭"共享内存端点 → PCM 解码 → PCM 转换 → TDM 端点"，48 kHz / 32 位 / 2 声道。还要补查两件事：安卓放音时发给 DSP 的 PRM 时钟请求是什么内容；给 DSP 用的共享缓冲放在哪、SMMU 怎么配。
+  2. 和安卓一致：功放加载扬声器保护固件、两颗各自的系数、出厂校准和 music 调音，`PCM Source = DSP`，DSP 流程里加 SPR，增益 18，噪声门照安卓设。功放的这些文件在 odm 分区（不是 FAT），先放进固定固件包。
+  3. 接 iOS：音频插件和内核接口，CoreAudio 的主机时钟问题（sheng 修过），喇叭 / 听筒切换（GPIO174），音量放在主处理器这侧。
+  4. 做不到的：安卓主处理器这侧的 Dolby DAP 是闭源的用户空间音效，搬不过来。从 HAL 往下（DSP 流程、TDM、功放固件、校准、增益）能做到和安卓一样。
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
 1. 固件：/vendor/firmware_mnt/image/adsp.mdt + adsp.b00–b40（约 30 MB）和 adsp_dtb.mdt，装进 pinned 文件，内核按扩展区读入保留内存（adspslpi_region@0xa1400000、q6_adsp_dtb_region@0xa1380000）。
 2. 安全世界启动：SCM PAS 调用（init_image / mem_setup / auth_and_reset，两个镜像），这代芯片的元数据缓冲要先通过 SHM bridge 登记；通过 AOP 的 QMP 消息给 ADSP 上电，RPMh 投 LCX/LMX 电压。
