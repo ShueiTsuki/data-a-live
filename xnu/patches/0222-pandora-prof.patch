@@ -20,10 +20,10 @@ index 9c22f03..28b00a1 100644
  	int mode = 1;
 diff --git a/osfmk/arm/pandora_prof.c b/osfmk/arm/pandora_prof.c
 new file mode 100644
-index 0000000..0a59f4a
+index 0000000..9c254b4
 --- /dev/null
 +++ b/osfmk/arm/pandora_prof.c
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,270 @@
 +/*
 + * PANDORA sampling profiler (patch 0222): where one process's threads are, about 1000 times a second, as Apple's kperf
 + * samples on its timers. Boot-arg pandora_prof=NAME (the process, e.g. backboardd; off without it), pandora_prof_hz
@@ -156,8 +156,7 @@ index 0000000..0a59f4a
 +{
 +	static const char kinds[3] = { 'U', 'E', 'K' };
 +	printf("PANDORA PROF: %u s of %s: %llu in user code, %llu in the kernel (%llu interrupts sent, %llu refused, "
-+	    "%llu samples dropped)
-+", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
++	    "%llu samples dropped)\n", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
 +	    pprof_dropped);
 +	/* Every PC counted (a hot function's samples spread over its instructions; tools/prof.py sums them by function),
 +	 * at most PPROF_LINES of each kind. */
@@ -166,8 +165,7 @@ index 0000000..0a59f4a
 +		unsigned lines = 0;
 +		for (uint32_t i = 0; i < PPROF_SLOTS && lines < PPROF_LINES; i++) {
 +			if (t[i].n) {
-+				printf("PANDORA PROF %c %#llx %u
-+", kinds[kind], t[i].pc, t[i].n);
++				printf("PANDORA PROF %c %#llx %u\n", kinds[kind], t[i].pc, t[i].n);
 +				lines++;
 +			}
 +		}

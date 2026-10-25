@@ -130,8 +130,7 @@ pprof_report(unsigned secs)
 {
 	static const char kinds[3] = { 'U', 'E', 'K' };
 	printf("PANDORA PROF: %u s of %s: %llu in user code, %llu in the kernel (%llu interrupts sent, %llu refused, "
-	    "%llu samples dropped)
-", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
+	    "%llu samples dropped)\n", secs, pprof_name, pprof_totals[0], pprof_totals[1], pprof_sent, pprof_refused,
 	    pprof_dropped);
 	/* Every PC counted (a hot function's samples spread over its instructions; tools/prof.py sums them by function),
 	 * at most PPROF_LINES of each kind. */
@@ -140,8 +139,7 @@ pprof_report(unsigned secs)
 		unsigned lines = 0;
 		for (uint32_t i = 0; i < PPROF_SLOTS && lines < PPROF_LINES; i++) {
 			if (t[i].n) {
-				printf("PANDORA PROF %c %#llx %u
-", kinds[kind], t[i].pc, t[i].n);
+				printf("PANDORA PROF %c %#llx %u\n", kinds[kind], t[i].pc, t[i].n);
 				lines++;
 			}
 		}
