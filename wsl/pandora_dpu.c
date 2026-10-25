@@ -10,6 +10,7 @@
  * and REC1 (+0x3000), not at the pipe's base, which is why step 1's reads at the DT offsets saw zeros.
  *
  * Only registers inside the DT's block sizes (qcom,sde-*-size) or ones mainline reads on v13 are touched.
+ * Mappings stay (a few pages, once): r1b panicked in ml_io_unmap ("Attempting to remove permanent VM map entry").
  *
  * Logged once, from the framebuffer's start (boot-arg pandora_dpu_probe=0 skips it):
  *   - MDSS and DPU versions;
@@ -29,7 +30,6 @@
 #if defined(PANDORA)
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern void IOSleep(unsigned int milliseconds);
 
 #define DPU_MDSS_PA   0x09800000u
@@ -75,7 +75,6 @@ phys_rd64(uint64_t pa)
 		return 0;
 	}
 	uint64_t v = *(volatile uint64_t *)(va + (pa & 0xff8));
-	ml_io_unmap(va, 0x1000);
 	return v;
 }
 
@@ -156,24 +155,22 @@ dpu_smmu(uint64_t fetch, uint64_t fb)
 		} else if (fetch) {
 			printf("PANDORA DPU: SMMU bank %u has translation off: the pipe fetches %#llx as it is\n", cb, fetch);
 		}
-		ml_io_unmap(gr1, 0x1000);
-		ml_io_unmap(cbv, 0x1000);
 	}
 	if (!any) {
 		printf("PANDORA DPU: no SMMU stream match for %#x (of %u entries)\n", DPU_SID, nsmr);
 	}
-	ml_io_unmap(gr0, 0x1000);
 }
 
 /* What changes in 100 ms: frame and line counters, the CTL flush, the address each active rectangle reads. */
 static void
 dpu_sample(const char *when, uint32_t pipes)
 {
-	printf("PANDORA DPU: %s: intf1 frame %u line %u tear-line %u status %08x intr %08x tear-intr %08x | "
-	    "intf2 frame %u tear-line %u | ctl0 flush %08x\n", when,
+	printf("PANDORA DPU: %s: intf1 frame %u line %u tear-line %u status %08x intr %08x tear-intr %08x\n", when,
 	    dpu_rd(DPU_INTF(1) + 0xac), dpu_rd(DPU_INTF(1) + 0xb0), dpu_rd(DPU_INTF(1) + 0x2b0),
-	    dpu_rd(DPU_INTF(1) + 0x26c), dpu_rd(DPU_INTF(1) + 0x1c4), dpu_rd(DPU_TEARI(1) + 0x4),
-	    dpu_rd(DPU_INTF(2) + 0xac), dpu_rd(DPU_INTF(2) + 0x2b0), dpu_rd(DPU_CTL(0) + 0x18));
+	    dpu_rd(DPU_INTF(1) + 0x26c), dpu_rd(DPU_INTF(1) + 0x1c4), dpu_rd(DPU_TEARI(1) + 0x4));
+	printf("PANDORA DPU: %s: intf2 frame %u line %u tear-line %u intr %08x tear-intr %08x | ctl0 flush %08x ctl1 flush %08x\n",
+	    when, dpu_rd(DPU_INTF(2) + 0xac), dpu_rd(DPU_INTF(2) + 0xb0), dpu_rd(DPU_INTF(2) + 0x2b0), dpu_rd(DPU_INTF(2) + 0x1c4),
+	    dpu_rd(DPU_TEARI(2) + 0x4), dpu_rd(DPU_CTL(0) + 0x18), dpu_rd(DPU_CTL(1) + 0x18));
 	for (unsigned p = 0; p < sizeof(dpu_sspp) / sizeof(dpu_sspp[0]); p++) {
 		if (pipes & (1u << p)) {
 			const uint32_t b = DPU_MDP + dpu_sspp[p].base;
@@ -255,11 +252,12 @@ pandora_dpu_probe(uint64_t fb)
 	for (unsigned n = 1; n <= 2; n++) {
 		const uint32_t i = DPU_INTF(n);
 		printf("PANDORA DPU: intf%u (dsi%u): engine %08x config %08x config2 %08x format %08x cmd-trigger %08x mux %08x "
-		    "status %08x count-en %08x | tear: vsync-sel %08x check %08x sync %08x height %08x init %08x start %08x "
-		    "rd-ptr %08x autorefresh %08x | intr en %08x tear-intr en %08x\n", n, n - 1, dpu_rd(i + 0x0), dpu_rd(i + 0x4),
-		    dpu_rd(i + 0x60), dpu_rd(i + 0x90), dpu_rd(i + 0x84), dpu_rd(i + 0x25c), dpu_rd(i + 0x26c), dpu_rd(i + 0xa8),
-		    dpu_rd(i + 0x280), dpu_rd(i + 0x284), dpu_rd(i + 0x288), dpu_rd(i + 0x28c), dpu_rd(i + 0x294),
-		    dpu_rd(i + 0x2a0), dpu_rd(i + 0x2a4), dpu_rd(i + 0x2b4), dpu_rd(i + 0x1c0), dpu_rd(DPU_TEARI(n) + 0x0));
+		    "status %08x count-en %08x\n", n, n - 1, dpu_rd(i + 0x0), dpu_rd(i + 0x4), dpu_rd(i + 0x60), dpu_rd(i + 0x90),
+		    dpu_rd(i + 0x84), dpu_rd(i + 0x25c), dpu_rd(i + 0x26c), dpu_rd(i + 0xa8));
+		printf("PANDORA DPU: intf%u tear: vsync-sel %08x check %08x sync %08x height %08x init %08x start %08x rd-ptr %08x "
+		    "autorefresh %08x | intr en %08x tear-intr en %08x\n", n, dpu_rd(i + 0x280), dpu_rd(i + 0x284), dpu_rd(i + 0x288),
+		    dpu_rd(i + 0x28c), dpu_rd(i + 0x294), dpu_rd(i + 0x2a0), dpu_rd(i + 0x2a4), dpu_rd(i + 0x2b4), dpu_rd(i + 0x1c0),
+		    dpu_rd(DPU_TEARI(n) + 0x0));
 	}
 
 	dpu_sample("t0", pipes);
