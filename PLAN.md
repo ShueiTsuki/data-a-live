@@ -367,3 +367,8 @@
 - **插件**：启动参数 `pandora_m2v_padded=alias` 才启用 Alias；每 10 秒的统计多打 `pandora-metal W` 行（运行时工作计数的变化：影子纹理、影子拷贝次数、拷回像素数、提交次数等）。mtltest 新增 part 4b：1125×64、行跨度 4608 的 IOSurface，两遍渲染后检查像素和行间空隙字节。
 - **下次上手机（需用户同意）**：r2o 默认策略（量 0002 的 CPU 和影子拷贝数，part 4b 应通过）；r2p 加 `pandora_m2v_padded=alias`（part 4b 判断 Turnip 是否碰行间空隙；比较影子拷贝、GPU 等待帧数、帧率和温度）。part 4b 不过就不用 Alias。
 - **Turnip 等围栏改成单次最多 100 ms（tools/turnip/pandora_wait.py，local216，待上手机）**：UniXNU 的 darwin 后端 `dw_wait_fence_raw` 每次只向内核要 1 ms，等一帧 GPU 工作要来回 IOKit 好几趟（r2n：backboardd 每秒约 420 次短轮询超时）。内核从 0216 起就睡到 GPU 围栏中断为止，照 Linux msm 后端 MSM_WAIT_FENCE 一次给整个超时的做法，改为每次给剩余时间、封顶 100 ms（内核等待不可中断，与翻译层自己的 100 ms 粒度一致）。CI 的 turnip.yml 同步加了这一步。
+
+### CPU 深度休眠：分析（2026-10-25，未动代码）
+- **核心级“ret”已在 0215 做了**（PSCI CPU_SUSPEND 0x4，按下一次定时器远近选 ret 或 WFI）。没做的是簇级和整机级，设备树层级：cpu0–5 → cluster-pd0（ret-pll-off 0x1000054，最短停留约 9.1 ms），cpu6–7 → cluster-pd1（同上），两簇 → cluster-pd2（apps-pc 0x200c354，约 10.2 ms）；要 PSCI OS 协调模式（已确认固件支持）。
+- **结论：现在做簇级休眠对发热几乎没用。** 滑动时每 10 ms 一帧，簇里所有核同时空闲 9 ms 以上的机会很少；静止时 vmd 占约 93% 的一个核、服务反复拉起，簇里总有核在忙。它要等“服务反复查询”解决后，对待机和静止画面的功耗才有意义。
+- **滑动时更直接的是调度**：测试一直开着 `pandora_bigfirst=1`，线程优先放 4.4 GHz 的大核。下一步可对比关掉大核优先（或换苹果自己的大小核调度）时的温度、帧率、CPU 占用（要上手机，需用户同意）。
