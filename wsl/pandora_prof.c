@@ -14,7 +14,7 @@
  *
  * Each period the log gets every kernel chain ("PANDORA PROF KC <n> <pc> <lr> <return>..."), every user call stack
  * ("PANDORA PROF S <user n> <kernel n> <lr> <pc> <return>...", hex; lr is the leaf's return when the first record
- * does not hold it, else 0), and, whenever the task has loaded more images, dyld's all-image info (each image outside
+ * does not hold it, else 0), and dyld's all-image info (each image outside
  * the shared cache with its load address and path, the shared cache's slide, the kernel's slide), so tools/prof.py
  * can name them and sum the stacks by function (own and inclusive time, callers). The PCs alone (0222's U/E/K lines)
  * are in these: a user sample's stack starts at its PC, a kernel sample's at the user PC it entered from (the thread
@@ -348,23 +348,23 @@ pprof_report(unsigned secs)
 	bzero(pprof_stack_table, PPROF_STACKS * sizeof(*pprof_stack_table));
 }
 
-/* The task's images outside the shared cache (load address, path), from dyld's all-image info; their count. */
-static uint32_t
-pprof_images(task_t task, uint32_t logged)
+/* The task's images outside the shared cache (load address, path), from dyld's all-image info, with every report:
+ * the log keeps only its last 4 MiB, and r2l lost the one list a busy run logged first. */
+static void
+pprof_images(task_t task)
 {
 	struct user64_dyld_all_image_infos infos;
 	vm_map_t map = get_task_map_reference(task);
-	uint32_t count = 0;
 	if (map == VM_MAP_NULL) {
-		return logged;
+		return;
 	}
 	if (task->all_image_info_addr == 0 ||
 	    vm_map_read_user(map, task->all_image_info_addr, &infos, sizeof(infos)) != KERN_SUCCESS) {
 		vm_map_deallocate(map);
-		return logged;
+		return;
 	}
-	count = infos.infoArrayCount;
-	if (count != logged && infos.infoArray != 0) {
+	const uint32_t count = infos.infoArrayCount;
+	if (infos.infoArray != 0) {
 		printf("PANDORA PROF IMAGES %u, shared cache base %#llx slide %#llx, kernel slide %#lx\n", count,
 		    infos.sharedCacheBaseAddress, infos.sharedCacheSlide, (unsigned long)vm_kernel_slide);
 		const uint64_t cache = infos.sharedCacheBaseAddress;
@@ -383,7 +383,6 @@ pprof_images(task_t task, uint32_t logged)
 		}
 	}
 	vm_map_deallocate(map);
-	return count;
 }
 
 static task_t
@@ -406,7 +405,7 @@ pprof_find(void)
 static void
 pprof_thread(__unused void *arg, __unused wait_result_t wr)
 {
-	uint32_t hz = 1000, secs = 10, images = 0;
+	uint32_t hz = 1000, secs = 10;
 	PE_parse_boot_argn("pandora_prof_hz", &hz, sizeof(hz));
 	PE_parse_boot_argn("pandora_prof_secs", &secs, sizeof(secs));
 	hz = hz < 10 ? 10 : (hz > 4000 ? 4000 : hz);
@@ -420,7 +419,6 @@ pprof_thread(__unused void *arg, __unused wait_result_t wr)
 					task_t old = pprof_task;
 					pprof_task = TASK_NULL;
 					task_deallocate(old);
-					images = 0;
 				}
 				pprof_task = pprof_find();
 			}
@@ -443,7 +441,7 @@ pprof_thread(__unused void *arg, __unused wait_result_t wr)
 			pprof_drain();
 		}
 		if (tick % per_report == 0) {
-			images = pprof_images(pprof_task, images);
+			pprof_images(pprof_task);
 			pprof_report(secs);
 		}
 	}
