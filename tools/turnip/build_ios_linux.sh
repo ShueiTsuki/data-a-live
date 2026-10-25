@@ -55,6 +55,9 @@ ninja -C "$B/tu" src/freedreno/vulkan/libvulkan_freedreno.dylib
 LIB=$OUT/libvulkan_freedreno.dylib
 cp "$B/tu/src/freedreno/vulkan/libvulkan_freedreno.dylib" "$LIB"
 "$LLVM/llvm-install-name-tool" -id /usr/lib/libvulkan_freedreno.dylib "$LIB"
+# data-a-live: a copy with its local symbols, for tools/prof.py to name the phone's samples (never installed;
+# strip -x moves no code, so its addresses are the installed library's).
+cp "$LIB" "$OUT/libvulkan_freedreno.symbols"
 "$LLVM/llvm-strip" -x "$LIB"
 "$LLVM/llvm-nm" -g --defined-only "$LIB" | grep -q ' T _vk_icdGetInstanceProcAddr' || { echo "no vk_icdGetInstanceProcAddr"; exit 1; }
 glslangValidator -V --target-env vulkan1.1 --vn fill_spv -o "$B/fill_spv.h" "$ROOT/tools/vktest/fill.comp"

@@ -340,3 +340,9 @@
 - **PSCI**：1.1，CPU_SUSPEND 特性 0x3（支持 OS 协调模式、扩展状态号），SET_SUSPEND_MODE 支持，STAT_RESIDENCY 不支持 → 簇级/整机级休眠按 Linux cpuidle-psci-domain 做。
 - **显示中断（只读）**：100 ms 内各 14 次：INTR bit 8、10（pingpong 0/2 完成），INTR2 bit 9（CTL0 开始一帧）、bit 10（CTL1，背屏），INTF1 bit 11，INTF1 tear bit 0–3、6。CTL0 开始一帧可代替上屏线程的轮询。
 - **被忽略接口的参数**：17 伽马表全 0、55 颜色矩阵为单位阵、68 参数 6=0 和 7=0x200000、79 数据块 0x4d（1580 字节）和 0x40（40 字节）、84 对比度 0、thermalmonitord 78 数据块 2（1788 字节）。
+
+### 帧开始中断和手机上的采样分析（2026-10-25，k0221–k0223，日志 r2j）
+- **帧开始中断（0221）**：MDSS 中断线（SPI 83）接进 GIC，CTL0 开始一帧时唤醒上屏线程，代替轮询；r2j 里 1189 次帧开始，漏的很少。
+- **采样分析器（0222）**：启动参数 `pandora_prof=backboardd`，每秒约 1000 次记下 backboardd 各线程停在哪；`tools/prof.py` 按函数名汇总。r2j 用户态：插件 34%、QuartzCore 18%、malloc 17%、Turnip 11%、memmove/memset 8%、mach_absolute_time 3%（插件给每个调用计时引起的）；另有约 19% 在内核，其中 GPU 调用里等 SMMU TLB 刷新完成的读寄存器循环和关中断的区段最多。
+- **Turnip 带符号重看 r2j**：时间很分散，最大的单个函数 0.5%；排前面的不少是每个命令缓冲都要重来的开销（tu_cs_reset、ResetCommandBuffer、tu6_init_static_regs、tu_init_hw）→ 减少命令缓冲数量（几个渲染遍合成一次提交）值得做。
+- **调用栈（0223，待上手机）**：内核样本记下 5 层调用者；每个样本让线程回用户态前走一遍用户栈（最多 16 层，照 kperf 的做法用 AST），按样本数加权；日志只剩 4 MiB 循环缓冲，所以不再单独打逐地址统计（由栈推算）。插件计时改为随机抽 1/16 的调用计时，等待类调用全计。
