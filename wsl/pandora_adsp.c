@@ -37,6 +37,7 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <kern/locks.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <vm/vm_kern.h>
@@ -139,7 +140,7 @@ struct scm_res {
 };
 
 static void
-scm_smc(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+scm_smc_raw(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
     struct scm_res *res)
 {
 	uint64_t a0 = fn, a6 = 0;
@@ -168,6 +169,56 @@ scm_smc(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, ui
 	}
 }
 
+#define SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | ((cmd) & 0xff))
+#define SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
+#define SCM_RW            2u
+#define SCM_WAITQ_SLEEP   2u               /* x0: the firmware queued the call (x1 queue, x2 call context) */
+#define SCM_SVC_WAITQ     0x24u
+#define SCM_WAITQ_RESUME  0x02u
+#define SCM_WAITQ_GET_CTX 0x03u
+#define SCM_WAKE_ONE      1u
+
+/*
+ * Every SCM call of this kernel (the ADSP here, the GPU through pandora_scm_call) goes through
+ * scm_smc, one at a time, as Linux's qcom_scm-smc.c held qcom_scm_lock around each call. adsp1:
+ * the ADSP thread's shm_bridge_enable and the GPU's is_call_avail met in TrustZone at 0.18 s; the
+ * GPU's call came back WAITQ_SLEEP, nothing resumed it, and every later call came back 2.
+ * A call queued all the same (another VM holding the firmware's lock) continues as
+ * __scm_smc_do_quirk_handle_waitq: the wake-up is the DT qcom_scm interrupt (SPI 962), which this
+ * file cannot take, so GET_WQ_CTX is asked every millisecond until it names a context to wake
+ * (qcom_scm_irq_handler: flags WAKE_ONE), then WAITQ_RESUME with the call context goes on.
+ */
+LCK_GRP_DECLARE(ad_scm_grp, "pandora_scm");
+LCK_MTX_DECLARE(ad_scm_lock, &ad_scm_grp);
+
+static void
+scm_smc(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+    struct scm_res *res)
+{
+	static unsigned logged;
+	lck_mtx_lock(&ad_scm_lock);
+	scm_smc_raw(fn, arginfo, x2, x3, x4, x5, res);
+	for (unsigned n = 0; res->a0 == SCM_WAITQ_SLEEP && n < 16; n++) {
+		uint64_t queue = res->a1, call = res->a2;
+		struct scm_res w = {0, 0, 0, 0};
+		unsigned ms = 0;
+		for (; ms < 5000; ms++) {
+			scm_smc_raw(SCM_FN(SCM_SVC_WAITQ, SCM_WAITQ_GET_CTX), SCM_ARGS(0), 0, 0, 0, 0, &w);
+			if (w.a0 == 0 && w.a2 == SCM_WAKE_ONE) {
+				break;
+			}
+			delay(1000);
+		}
+		if (logged < 16) {
+			logged++;
+			printf("PANDORA SCM: fn %#llx queued (queue %#llx, call %#llx); GET_WQ_CTX after %u ms -> a0 %#llx "
+			    "ctx %#llx flags %#llx more %#llx\n", fn, queue, call, ms, w.a0, w.a1, w.a2, w.a3);
+		}
+		scm_smc_raw(SCM_FN(SCM_SVC_WAITQ, SCM_WAITQ_RESUME), SCM_ARGS(1), call, 0, 0, 0, res);
+	}
+	lck_mtx_unlock(&ad_scm_lock);
+}
+
 /* For bsd/dev/pandora_gpu.c: an SCM call, results in a0 and a1. */
 void pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t *a0,
     uint64_t *a1);
@@ -181,10 +232,6 @@ pandora_scm_call(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64
 	*a0 = r.a0;
 	*a1 = r.a1;
 }
-
-#define SCM_FN(svc, cmd)  ((1ULL << 30) | (2ULL << 24) | (((uint64_t)(svc) & 0xff) << 8) | ((cmd) & 0xff))
-#define SCM_ARGS(n)       ((uint64_t)(n) & 0xf)
-#define SCM_RW            2u
 
 static int
 scm_call_avail(unsigned svc, unsigned cmd)

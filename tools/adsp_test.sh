@@ -11,13 +11,13 @@
 #      it raw (tools/pinfile rawwrite), then hashes it back (as gpu_test.sh step 4)
 #   3. boots iOS (tools/ios_test.sh) as gpu_test.sh does, with RUN's trust cache
 #      (/opt/work/gputest/RUN.tc, for the files it installed) and pandora_adsp=2
-#   4. prints the PANDORA ADSP lines of device/logs/NAME.txt
+#   4. prints the PANDORA ADSP and SCM lines of device/logs/NAME.txt, and how far the GPU came
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1; shift
-WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0226-amfi.macho ARGS= TCRUN= HZ=60
+WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0227-amfi.macho ARGS= TCRUN= HZ=60
 while [ $# -gt 0 ]; do
 	case $1 in
 	--tc) TCRUN=$2; shift 2 ;;
@@ -68,4 +68,5 @@ SWEETFB_HZ=$HZ GPUPOOL=1024 KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/t
 
 echo "== 4. results"
 L=$ROOT/device/logs/$NAME.txt
-grep -aE "PANDORA ADSP|panic\(" "$L" | cut -c1-300 | head -150 || true
+grep -aE "PANDORA ADSP|PANDORA SCM|PANDORA GPU: (hw_init rest|self-test|.*failed)|panic\(" "$L" | cut -c1-300 | head -150 || true
+echo "GPU: $(grep -acE 'PANDORA GPU: .*(failed|NOT ACKED)' "$L" || true) failure lines, VKTEST PASS $(grep -ac 'VKTEST: PASS' "$L" || true) (r2q: 6), MTLTEST lines $(grep -ac 'MTLTEST:' "$L" || true)"

@@ -200,7 +200,7 @@
 - DeepSeek 按 `D:\DeepSeekHarness\regcheck\TASK.md` 做了核对表（`RESULT.md`，WiFi 40 项、ADSP/音频 36 项），我逐条对照原文复核（`VERIFY.md`）：大多数正确；改正 W08（pandora ATU 是 `0x410000000`）、A16/A28（GLINK 的 SMEM 项和 APM 端口是协议常数，两边相同）、W16 的时钟投票（寄存器和比特相同，多 phy_aux `0x52018` bit31、cfg_noc_pcie_anoc_ahb `0x52000` bit20）；W09 配置空间和 W31 MSI 只能上机确认。
 - 结论：ADSP 通信（SMEM、SMP2P、GLINK、GPR）两边编号一样，最好搬，接在我们已有的 `pandora_adsp.c` 后面；出声还要自己做播放图和两颗 CS35L43（sheng 也没做到）；WiFi 芯片不同（`cnss-peach`，PCIe ID `0x110e`，不是 WCN7850，主线 ath12k 也不认），固件和 MHI 配置要从手机自己的分区查。
 
-## ADSP 通信（2026-10-25，内核 0226，未上机）
+## ADSP 通信（2026-10-25，内核 0226/0227）
 - 用户定：先做 ADSP 通信，WiFi 只调查；固件先用单独的测试包，再做正式的（从手机自己的固件分区读，和安卓、UniXNU 一样）。
 - 0226：sheng 的 SMEM、SMP2P、GLINK、GPR 四个库原样放进 `bsd/dev/qcom/`（许可证 BSD-2-Clause-Patent，`wsl/qcom/SOURCE.txt` 记了来源提交号；上游自带的 PC 测试在我们的副本上通过，4183 + 37 项）。`pandora_adsp.c` 在原来的启动步骤上加了：
   1. 启动前：建我们的 SMP2P 项 429（加 TCSR 互斥锁 3），加 "master-kernel" 条目，打开 IPCC 门铃；
@@ -208,6 +208,8 @@
   3. 就绪后建 GLINK（SMEM 478/479/480），开 "adsp_apps" 通道，问 APM 音频框架是否就绪（1 秒等回答，100 毫秒重试，最多 100 次）。
 - 还没有中断：内核线程每 1 毫秒读一次 IPCC（30 秒后改 20 毫秒）。85 MiB 的固件区和各寄存器窗口改用 `ml_io_map_unmappable`，固件拷完就取消映射。
 - 测试：`tools/adsp_test.sh 名字 --tc r2q --write-pack --args "pandora_gpu_metal=1"`。测试包是 GPU 固件加 ADSP 镜像，57 个文件 34.4 MB；手机上的 GPU 文件保持 r2q 的样子。之后再跑 gpu_test.sh 要带 `--write-pack`，因为两个包加起来放不进 40 MiB 的固定文件。
+- adsp1（0226）失败，GPU 也没起来：开机 0.18 秒，ADSP 线程的启动查询和 GPU 的 GPU_INIT_REGS 同时进了安全世界。GPU 那个调用返回 2（WAITQ_SLEEP，固件让它排队），没人让它继续，之后整次开机的所有安全世界调用都返回 2：GPU 停在第 3 级，ADSP 停在 init_image。以前从没撞上，是因为 GPU 测试不开 ADSP，10 月 22 日测 ADSP 时 GPU 没开到这一级。
+- 0227：所有安全世界调用（ADSP 和 GPU 共用 `scm_smc`）加互斥锁，一次一个，和 Linux 以前的 qcom_scm_lock 一样；如果还是收到"排队"，照 Linux 的 waitq 流程处理：轮询 GET_WQ_CTX，代替中断（SPI 962），再发 WAITQ_RESUME。
 
 ## 扬声器路线（调查结果，2026-10-22，未开始）
 功放 CS35L43 的音频输入（TDM0，GPIO 122–125）只能接 LPASS I2S0，由音频 DSP（ADSP）驱动。要让喇叭出声，至少要做完下面这些，每一步都是独立的大块工作：
