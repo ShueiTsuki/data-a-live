@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/pandora_dpu.c b/bsd/dev/pandora_dpu.c
-index 24d842f..02e496f 100644
+index 24d842f..b2dd1c9 100644
 --- a/bsd/dev/pandora_dpu.c
 +++ b/bsd/dev/pandora_dpu.c
-@@ -265,4 +265,485 @@ pandora_dpu_probe(uint64_t fb)
+@@ -265,4 +265,493 @@ pandora_dpu_probe(uint64_t fb)
  	dpu_sample("t0+100ms", pipes);
  	dpu_smmu(fetch, fb);
  }
@@ -38,6 +38,7 @@ index 24d842f..02e496f 100644
 +#include "adreno/ArmSmmu4KMmio.h"
 +
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* as bsd/dev/pandora_gpu.c */
++extern bool pandora_log_sync(void);                          /* bsd/dev/sweet_ufs.c: the log file written now */
 +
 +#define SC_SMMU_BYTES     0x100000u          /* DT apps-smmu@15000000 reg */
 +#define SC_SMR_VALID      (1u << 31)
@@ -232,6 +233,8 @@ index 24d842f..02e496f 100644
 +		return ENODEV;
 +	}
 +	sc.panel_addr = a0;
++	printf("PANDORA SCANOUT: init at the first frame: panel memory %#llx-%#llx, main %#x\n", lo, hi, a0);
++	(void)pandora_log_sync();
 +
 +	/* The stream's route, and a free bank: not enabled, never configured, not named by any S2CR. */
 +	const uint32_t id0 = sc_rd(0x20), id1 = sc_rd(0x24), id2 = sc_rd(0x28), nsmr = id0 & 0xff, ncb = id1 & 0xff;
@@ -291,6 +294,9 @@ index 24d842f..02e496f 100644
 +	if (ArmSmmu4KBindMmio(&sc.mmio, &sc.io) != ArmSmmu4KSuccess) {
 +		return EIO;
 +	}
++	printf("PANDORA SCANOUT: stream match %u (S2CR %08x), programming free bank %u of %u, %zu table pages\n", sc.smr,
++	    sc.panel_s2cr, sc.bank, ncb, sc.tables.table_pages);
++	(void)pandora_log_sync();
 +	sc_wr(sc.cb_off + 4, SC_ACTLR);
 +	sc.ctx = (ArmSmmu4KContextConfig){ &sc.tcfg, NULL, &sc.tables, NULL, id0, id2, 1, 0, 0, 0 };
 +	ArmSmmu4KProgramResult prog;
@@ -304,6 +310,8 @@ index 24d842f..02e496f 100644
 +	}
 +
 +	/* The switch: one S2CR write. Then 100 ms of frames must go by without a fault in the bank. */
++	printf("PANDORA SCANOUT: switching the display stream to bank %u\n", sc.bank);
++	(void)pandora_log_sync();
 +	const uint32_t f0 = dpu_rd(DPU_INTF(1) + 0xac);
 +	sc_wr(0xc00 + 4 * sc.smr, (sc.panel_s2cr & ~0xffu) | sc.bank);
 +	IOSleep(100);
@@ -488,8 +496,33 @@ index 24d842f..02e496f 100644
 +	*faults = sc.faults;
 +}
  #endif /* PANDORA */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2bcb2ca..9804e60 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2165,6 +2165,20 @@ pl_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/* 0217: write the ring to the log file now (thread context; false when there is no log file). */
++bool pandora_log_sync(void);
++bool
++pandora_log_sync(void)
++{
++	if (!pl_ready) {
++		return false;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = pl_flush();
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error == 0;
++}
++
+ static void
+ pandora_log_start(void)
+ {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index b5faef8..d7ddfea 100644
+index b5faef8..a7280b6 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -58,6 +58,16 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -509,12 +542,14 @@ index b5faef8..d7ddfea 100644
  
  /* Dump header (block 0 of the dump area); frames follow at 4096, BGRA, tightly packed. */
  struct pandora_fbdump_head {
-@@ -281,12 +291,29 @@ public:
+@@ -281,12 +291,31 @@ public:
  	uint32_t      fPendingSeq;    /* PANDORA: GPU fence issued when fPending was swapped (0: none) */
  	bool          fGpuDeferred;   /* PANDORA: the last flush tick waited for that fence */
  	uint32_t      fStatGpuWait;   /* PANDORA: flush ticks that waited for the GPU */
 +#if defined(PANDORA)
 +	/* 0217: scanout. Each of shown / queued holds one retain and one IOSurface use count. */
++	bool          fScanWanted;    /* Metal on and pandora_scanout not 0: try at the first frame that fits */
++	bool          fScanTried;
 +	bool          fScanOn;
 +	bool          fScanToPanel;   /* the pipes were sent back to the panel memory; holds go when that shows */
 +	SweetSurface *fScanShown;     /* the surface the pipes read */
@@ -539,16 +574,18 @@ index b5faef8..d7ddfea 100644
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -646,6 +673,8 @@ AppleCLCD::start(IOService *provider)
+@@ -646,6 +675,10 @@ AppleCLCD::start(IOService *provider)
  	}
  #if defined(PANDORA)
  	pandora_dpu_probe(fPhys);
-+	/* 0217: with Metal the frames are GPU-written (in memory, not in CPU caches): the pipes can read them. */
-+	fScanOn = sweetfb_gpu_frames() && pandora_scanout_init() == 0;
++	/* 0217: with Metal the frames are GPU-written (in memory, not in CPU caches): the pipes can read them.
++	 * The display's SMMU route is switched at the first frame that fits (scanPresent), when the log file
++	 * is being written, not here. */
++	fScanWanted = sweetfb_gpu_frames();
  #endif
  	int native = 0;
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
-@@ -789,6 +818,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -789,6 +822,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
     IOLockLock(fb->fLock); fb->fDirty = true; IOLockUnlock(fb->fLock);
    }
   }
@@ -561,7 +598,7 @@ index b5faef8..d7ddfea 100644
  #endif
  	IOLockLock(fb->fLock);
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
-@@ -938,6 +973,164 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -938,6 +977,174 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  }
  
@@ -648,8 +685,18 @@ index b5faef8..d7ddfea 100644
 +bool
 +AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
 +{
-+	if (!fScanOn || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
++	if (!fScanWanted || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
 +		return false;
++	}
++	if (!fScanOn) {
++		if (fScanTried) {
++			return false;
++		}
++		fScanTried = true;
++		fScanOn = pandora_scanout_init() == 0;
++		if (!fScanOn) {
++			return false;
++		}
 +	}
 +	uint32_t layer = SWEET_FB_LAYERS, layers = 0;
 +	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
@@ -726,7 +773,7 @@ index b5faef8..d7ddfea 100644
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -1018,6 +1211,20 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1018,6 +1225,20 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -747,7 +794,7 @@ index b5faef8..d7ddfea 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -1065,6 +1272,13 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1065,6 +1286,13 @@ AppleCLCD::present(const uint8_t *rec)
  			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
  			    get32(a, 12), dx, dy, w, h);
  		}
@@ -761,7 +808,7 @@ index b5faef8..d7ddfea 100644
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
-@@ -1208,7 +1422,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1208,7 +1436,8 @@ AppleCLCD::present(const uint8_t *rec)
  		    layers);
  	}
  	if (dh != NULL) {
@@ -771,7 +818,7 @@ index b5faef8..d7ddfea 100644
  		    (uintptr_t)fPixels, fRowBytes, fWidth, fHeight, &ow, &oh);
  		if (n) {
  			uint32_t i = dh->frames;
-@@ -1241,6 +1456,13 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1241,6 +1470,13 @@ AppleCLCD::present(const uint8_t *rec)
  		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
  		    "%u swaps, %u not shown, %u waited for the GPU\n", fStatFrames, span_ns / 1000000,
  		    avg_ns / 1000, max_ns / 1000, swaps, dropped, gpuWait);

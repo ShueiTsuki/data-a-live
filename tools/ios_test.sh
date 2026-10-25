@@ -18,7 +18,7 @@ BASE="ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_
 mkdir -p "$ROOT/device/logs"
 bash "$ROOT/tools/boot_ios.sh" --file /data/local/tmp/iosroot.img --run "$RUN" --rd ufsroot0 --check hfsx \
 	--log /data/local/tmp/ioslog.img --debug 0x8 ${FW:+--fw "$FW"} \
-	--cmdline "$BASE pandora_reboot_after=$SECS $EXTRA" 2>&1 | tail -5
+	--cmdline "$BASE pandora_reboot_after=$SECS $EXTRA" 2>&1 | tail -12
 start=$(date +%s)
 echo "== waiting for Android (up to $((SECS + 600)) s)"
 sleep 60

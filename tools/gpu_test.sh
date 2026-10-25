@@ -153,8 +153,9 @@ fi
 
 echo "== 5. boot"
 TC="/opt/work/ipsw/Firmware/087-86698-044.dmg.trustcache /opt/work/ipsw/Firmware/087-86593-047.dmg.trustcache+/opt/work/ipsw/Firmware/087-86715-047.dmg.trustcache+/opt/work/gputest/$NAME.tc"
+# The whole boot step goes to device/logs/NAME-boot.txt (r2b: the last 4 lines hid what fastboot did).
 SWEETFB_HZ=${HZ:-30} GPUPOOL=${POOL#0} KERNEL=$KERNEL TRUSTCACHE=$TC FW=$FILE bash "$ROOT/tools/ios_test.sh" "$NAME" 51 "$SECS" \
-	"pandora_gpu=$LEVEL $SWAP $ARGS" 2>&1 | grep -v NodeJS | tail -4
+	"pandora_gpu=$LEVEL $SWAP $ARGS" 2>&1 | grep -v NodeJS | tee "$ROOT/device/logs/$NAME-boot.txt" | tail -4
 
 echo "== 6. results"
 L=$ROOT/device/logs/$NAME.txt

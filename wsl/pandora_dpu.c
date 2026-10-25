@@ -297,6 +297,7 @@ pandora_dpu_probe(uint64_t fb)
 #include "adreno/ArmSmmu4KMmio.h"
 
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);   /* as bsd/dev/pandora_gpu.c */
+extern bool pandora_log_sync(void);                          /* bsd/dev/sweet_ufs.c: the log file written now */
 
 #define SC_SMMU_BYTES     0x100000u          /* DT apps-smmu@15000000 reg */
 #define SC_SMR_VALID      (1u << 31)
@@ -491,6 +492,8 @@ pandora_scanout_init(void)
 		return ENODEV;
 	}
 	sc.panel_addr = a0;
+	printf("PANDORA SCANOUT: init at the first frame: panel memory %#llx-%#llx, main %#x\n", lo, hi, a0);
+	(void)pandora_log_sync();
 
 	/* The stream's route, and a free bank: not enabled, never configured, not named by any S2CR. */
 	const uint32_t id0 = sc_rd(0x20), id1 = sc_rd(0x24), id2 = sc_rd(0x28), nsmr = id0 & 0xff, ncb = id1 & 0xff;
@@ -550,6 +553,9 @@ pandora_scanout_init(void)
 	if (ArmSmmu4KBindMmio(&sc.mmio, &sc.io) != ArmSmmu4KSuccess) {
 		return EIO;
 	}
+	printf("PANDORA SCANOUT: stream match %u (S2CR %08x), programming free bank %u of %u, %zu table pages\n", sc.smr,
+	    sc.panel_s2cr, sc.bank, ncb, sc.tables.table_pages);
+	(void)pandora_log_sync();
 	sc_wr(sc.cb_off + 4, SC_ACTLR);
 	sc.ctx = (ArmSmmu4KContextConfig){ &sc.tcfg, NULL, &sc.tables, NULL, id0, id2, 1, 0, 0, 0 };
 	ArmSmmu4KProgramResult prog;
@@ -563,6 +569,8 @@ pandora_scanout_init(void)
 	}
 
 	/* The switch: one S2CR write. Then 100 ms of frames must go by without a fault in the bank. */
+	printf("PANDORA SCANOUT: switching the display stream to bank %u\n", sc.bank);
+	(void)pandora_log_sync();
 	const uint32_t f0 = dpu_rd(DPU_INTF(1) + 0xac);
 	sc_wr(0xc00 + 4 * sc.smr, (sc.panel_s2cr & ~0xffu) | sc.bank);
 	IOSleep(100);

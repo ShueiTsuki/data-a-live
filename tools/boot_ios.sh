@@ -110,6 +110,12 @@ echo "cmdline: $strings_cmd"
 
 echo "== 3. fastboot boot"
 "$ADB" reboot bootloader
-for _ in $(seq 1 30); do sleep 2; "$FB" devices | grep -q fastboot && break; done
+seen=0
+for _ in $(seq 1 30); do sleep 2; "$FB" devices | grep -q fastboot && { seen=1; break; }; done
+# Without fastboot the phone goes on booting by itself (into the boot_b menu): stop here, nothing was booted.
+[ $seen = 1 ] || { echo "no fastboot device after 60 s: not booted"; exit 1; }
 [ "$("$FB" getvar product 2>&1 | sed -n 's/^product: //p' | tr -d '\r')" = pandora ] || { echo "fastboot device is not pandora"; exit 1; }
-"$FB" boot "$(cygpath -w "$ROOT/shim/loader/out/loader-boot.img")"
+out=$("$FB" boot "$(cygpath -w "$ROOT/shim/loader/out/loader-boot.img")" 2>&1) || { echo "$out"; echo "fastboot boot failed"; exit 1; }
+echo "$out"
+echo "$out" | grep -q "^Booting.*OKAY" || { echo "fastboot boot did not report Booting OKAY"; exit 1; }
+echo "booted $(sha256sum "$ROOT/shim/loader/out/loader-boot.img" | cut -c1-16) at $(date +%H:%M:%S)"

@@ -18,6 +18,29 @@ def edit(path, old, new):
 # next frame elsewhere; a hold goes at the vsync tick that sees the pipes on the next frame. Console, display
 # off, several layers or other surfaces: the pipes go back to the panel memory and the copy runs as before.
 copy('pandora_dpu.c', 'bsd/dev/pandora_dpu.c')
+
+# The log file written now, from a thread (pandora_dpu.c before it switches the display's SMMU route): r2b's
+# kernel died early without a trace, and a hang leaves the last seconds of the ring unwritten.
+U = 'bsd/dev/sweet_ufs.c'
+edit(U, '''static void
+pandora_log_start(void)
+{''', '''/* 0217: write the ring to the log file now (thread context; false when there is no log file). */
+bool pandora_log_sync(void);
+bool
+pandora_log_sync(void)
+{
+	if (!pl_ready) {
+		return false;
+	}
+	lck_mtx_lock(&sweet_ufs_lock);
+	int error = pl_flush();
+	lck_mtx_unlock(&sweet_ufs_lock);
+	return error == 0;
+}
+
+static void
+pandora_log_start(void)
+{''')
 F = 'iokit/Kernel/arm/SweetFramebuffer.cpp'
 edit(F, '''extern "C" void pandora_dpu_probe(uint64_t fb);                 /* bsd/dev/pandora_dpu.c (0215) */''',
      '''extern "C" void pandora_dpu_probe(uint64_t fb);                 /* bsd/dev/pandora_dpu.c (0215) */
@@ -35,6 +58,8 @@ edit(F, '''	uint32_t      fStatGpuWait;   /* PANDORA: flush ticks that waited fo
 ''', '''	uint32_t      fStatGpuWait;   /* PANDORA: flush ticks that waited for the GPU */
 #if defined(PANDORA)
 	/* 0217: scanout. Each of shown / queued holds one retain and one IOSurface use count. */
+	bool          fScanWanted;    /* Metal on and pandora_scanout not 0: try at the first frame that fits */
+	bool          fScanTried;
 	bool          fScanOn;
 	bool          fScanToPanel;   /* the pipes were sent back to the panel memory; holds go when that shows */
 	SweetSurface *fScanShown;     /* the surface the pipes read */
@@ -60,8 +85,10 @@ edit(F, '''#if defined(PANDORA)
 	pandora_dpu_probe(fPhys);
 #endif''', '''#if defined(PANDORA)
 	pandora_dpu_probe(fPhys);
-	/* 0217: with Metal the frames are GPU-written (in memory, not in CPU caches): the pipes can read them. */
-	fScanOn = sweetfb_gpu_frames() && pandora_scanout_init() == 0;
+	/* 0217: with Metal the frames are GPU-written (in memory, not in CPU caches): the pipes can read them.
+	 * The display's SMMU route is switched at the first frame that fits (scanPresent), when the log file
+	 * is being written, not here. */
+	fScanWanted = sweetfb_gpu_frames();
 #endif''')
 edit(F, '''	IOLockLock(fb->fLock);
 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {''', '''#if defined(PANDORA)
@@ -157,8 +184,18 @@ AppleCLCD::scanIova(SweetSurface *s)
 bool
 AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
 {
-	if (!fScanOn || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
+	if (!fScanWanted || !fConsolePaused || fPowerOff || sweet_fb_dim < 256) {
 		return false;
+	}
+	if (!fScanOn) {
+		if (fScanTried) {
+			return false;
+		}
+		fScanTried = true;
+		fScanOn = pandora_scanout_init() == 0;
+		if (!fScanOn) {
+			return false;
+		}
 	}
 	uint32_t layer = SWEET_FB_LAYERS, layers = 0;
 	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
