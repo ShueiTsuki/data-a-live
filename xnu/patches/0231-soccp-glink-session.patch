@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 56b58c9..530959f 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -806,6 +806,7 @@ struct edge {
+ 	QcomSmemPartition part;
+ 	QcomSmp2p p2p;
+ 	bool p2p_on, gl_on;
++	int out_entry;                           /* our "master-kernel" entry */
+ 	uint32_t slave;
+ 	uint64_t t0;                             /* what this link's log times count from */
+ 	QcomGlink gl;
+@@ -1010,6 +1011,7 @@ p2p_setup(struct edge *e, const char *when)
+ 	/* As qcom_smp2p_alloc_outbound_item, an item already there is made fresh. */
+ 	qcom_smp2p_init_out(&e->p2p, (volatile uint32_t *)out, 0, e->pid);
+ 	int stop = qcom_smp2p_add_entry(&e->p2p, "master-kernel");
++	e->out_entry = stop;
+ 	ad_wr(ad_ipcc, IPCC_RECV_ENABLE, (e->client << 16) | IPCC_SIG_SMP2P);
+ 	ad_wr(ad_ipcc, IPCC_RECV_ENABLE, (e->client << 16) | IPCC_SIG_GLINK);
+ 	e->p2p_on = true;
+@@ -1085,16 +1087,31 @@ gl_kick(void *ctx)
+ 	ad_wr(ad_ipcc, IPCC_SEND, (e->client << 16) | IPCC_SIG_GLINK);
+ }
+ 
+-/* qcom_glink_smem_register: the descriptor and our FIFO (an earlier session's are reused), fresh indices. */
++/*
++ * qcom_glink_smem_register: the descriptor and our FIFO (an earlier session's are reused), our two
++ * indices zeroed (our FIFO's head, the remote FIFO's tail). That assumes the remote's indices are 0
++ * as well, which holds for a remote we start (the ADSP). A remote that is running already (the
++ * SOCCP: attached) keeps the indices of the boot loaders' session. bat1: our FIFO's tail (the
++ * SOCCP's read index) was 8, so a head of 0 left 8 - 16 bytes of room (the phone's
++ * glink_smem_tx_avail keeps 16 back) and VERSION never went out; the SOCCP's 16 bytes waited for
++ * a VERSION_ACK that could not go out either (DeepSeek's soccpcheck RESULT.md, checked against
++ * qcom_glink_smem.ko). attached: our head goes on from the remote's read index (anything the boot
++ * loaders wrote and the remote did not read is dropped) and our read index stays where the boot
++ * loaders left it (what the remote sent them is read now), or skips to the remote's head when it
++ * cannot be a FIFO position.
++ */
+ static int
+-gl_start(struct edge *e)
++gl_start(struct edge *e, bool attached)
+ {
+-	uint32_t dsize = 0, tsize = 0;
++	uint32_t dsize = 0, tsize = 0, was[4] = {0, 0, 0, 0};
+ 	volatile uint8_t *old = smem_item(e, AD_ITEM_GL_DESC, &dsize);
+ 	if (old && dsize >= 16) {
+ 		const volatile uint32_t *w = (const volatile uint32_t *)old;
+-		printf("PANDORA %s: GLINK descriptor from an earlier session: ours tail %u head %u, theirs tail %u head %u\n",
+-		    e->name, w[0], w[1], w[2], w[3]);
++		for (unsigned i = 0; i < 4; i++) {
++			was[i] = w[i];
++		}
++		printf("PANDORA %s: GLINK descriptor from an earlier session: our FIFO tail %u head %u, theirs tail %u "
++		    "head %u\n", e->name, was[0], was[1], was[2], was[3]);
+ 	}
+ 	int err = smem_alloc(e, AD_ITEM_GL_DESC, 32);
+ 	if (!err) {
+@@ -1110,6 +1127,15 @@ gl_start(struct edge *e)
+ 	volatile uint32_t *d = (volatile uint32_t *)desc;
+ 	QcomGlinkFifo tx = {&d[1], &d[0], txf, tsize}, rx = {&d[3], &d[2], NULL, 0};
+ 	qcom_glink_init(&e->gl, tx, rx, gl_kick, e);
++	if (attached && old) {
++		bool keep = was[2] < AD_GL_FIFO && !(was[2] & 7u);
++		d[1] = d[0];
++		d[2] = keep ? was[2] : d[3];
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("PANDORA %s: GLINK goes on from the earlier session (%s): our FIFO tail %u head %u, theirs tail %u "
++		    "head %u\n", e->name, keep ? "our read index kept" : "our read index unusable, their FIFO skipped",
++		    d[0], d[1], d[2], d[3]);
++	}
+ 	e->gl_on = true;
+ 	return 0;
+ }
+@@ -1150,10 +1176,11 @@ gl_report(struct edge *e, bool force)
+ 	e->shown.bells = bells;
+ 	e->gl.unknown_names[sizeof(e->gl.unknown_names) - 1] = 0;
+ 	printf("PANDORA %s: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
+-	    "serves %u (%s); doorbells SMP2P %u GLINK %u; AOP %u other %u (last %#x)\n", e->name, ad_ms(e->t0),
+-	    e->gl.version_agreed ? "agreed" : "not agreed", e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages,
+-	    e->gl.tx_messages, e->gl.rx_data, e->gl.dropped, e->gl.unknown_opens, e->gl.unknown_names, e->bells[0],
+-	    e->bells[1], ad_ipcc_aop, ad_ipcc_other, ad_ipcc_last);
++	    "serves %u (%s); FIFOs ours %u/%u theirs %u/%u (tail/head); doorbells SMP2P %u GLINK %u; AOP %u other %u "
++	    "(last %#x)\n", e->name, ad_ms(e->t0), e->gl.version_agreed ? "agreed" : "not agreed",
++	    e->gl.broken ? ", LINK BROKEN" : "", e->gl.rx_messages, e->gl.tx_messages, e->gl.rx_data, e->gl.dropped,
++	    e->gl.unknown_opens, e->gl.unknown_names, *e->gl.tx.tail, *e->gl.tx.head, *e->gl.rx.tail, *e->gl.rx.head,
++	    e->bells[0], e->bells[1], ad_ipcc_aop, ad_ipcc_other, ad_ipcc_last);
+ }
+ 
+ /* ---- the audio DSP's GPR channel ------------------------------------------------------- */
+@@ -1584,7 +1611,38 @@ pandora_battery_get(struct pandora_battery *b, size_t size)
+ 	return b->valid != 0;
+ }
+ 
+-/* The SOCCP is running already: its partition, our SMP2P item, GLINK and the battery channel. */
++/*
++ * The phone's adsp_attach (qcom_q6v5_pas.ko) checks the remote is alive before GLINK starts:
++ * ping_subsystem (qcom_q6v5.ko) sets the "ping" bit of master-kernel (DT qcom,smem-states: bit 8;
++ * the whole entry is written, mask ~0), waits up to 125 jiffies for the "pong" interrupt
++ * (slave-kernel bit 9) and clears the ping bit. The phone panics without a pong; here it is logged.
++ */
++#define SO_PING_BIT      (1u << 8)
++#define SO_PONG_BIT      (1u << 9)
++
++static void
++soccp_ping(struct edge *e)
++{
++	uint32_t before = e->slave;
++	uint64_t t = mach_absolute_time(), until;
++	if (qcom_smp2p_update(&e->p2p, e->out_entry, ~0u, SO_PING_BIT)) {
++		p2p_kick(e);
++	}
++	clock_interval_to_deadline(1500, NSEC_PER_MSEC, &until);
++	while (!((e->slave ^ before) & SO_PONG_BIT) && mach_absolute_time() < until) {
++		ad_sleep(1);
++		ipcc_poll();
++		p2p_service(e);
++	}
++	bool pong = ((e->slave ^ before) & SO_PONG_BIT) != 0;
++	if (qcom_smp2p_update(&e->p2p, e->out_entry, SO_PING_BIT, 0)) {
++		p2p_kick(e);
++	}
++	printf("PANDORA SOCCP: ping -> %s after %llu ms (slave-kernel %#x before, %#x now)\n",
++	    pong ? "pong" : "NO pong", ad_ms(t), before, e->slave);
++}
++
++/* The SOCCP is running already: its partition, our SMP2P item, the ping, GLINK and the battery channel. */
+ static void
+ soccp_attach(void)
+ {
+@@ -1597,7 +1655,8 @@ soccp_attach(void)
+ 	/* qcom_pas_attach: a running SOCCP shows ready and no fatal or stop. */
+ 	printf("PANDORA SOCCP: slave-kernel %#x at attach (%s)\n", e->slave,
+ 	    (e->slave & SLAVE_FATAL) ? "FATAL" : (e->slave & SLAVE_READY) ? "ready" : "not ready");
+-	if (gl_start(e)) {
++	soccp_ping(e);
++	if (gl_start(e, true)) {
+ 		return;
+ 	}
+ 	int open_now = 0;
+@@ -1633,7 +1692,7 @@ adsp_ready(int open_gpr)
+ 		return false;
+ 	}
+ 	printf("PANDORA ADSP: ready after %llu ms\n", ad_ms(ad_t0));
+-	if (gl_start(&ed_adsp)) {
++	if (gl_start(&ed_adsp, false)) {
+ 		return false;
+ 	}
+ 	static const QcomGlinkClient client = {gpr_state, gpr_receive};
