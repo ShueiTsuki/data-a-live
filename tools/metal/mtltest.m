@@ -407,9 +407,10 @@ sweep(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
  *   d: cleared white, fetch_tex_fs over an all-red ASTC 1125x2436 image -> red
  *   e: two attachments cleared red and blue, fetch2_fs -> swapped
  * mtltest runs again and again in a boot (launchd restarts it with vktest); each launch takes the next TU_DEBUG of
- * kTuDebug (main), so one boot shows the cases under each. */
-static const char *const kTuDebug[] = { "sysmem,nocb", "sysmem,nocb,noubwc", "sysmem,nocb,flushall", "sysmem,nocb,rast_order",
-	"sysmem,nocb,syncdraw", "nocb", "sysmem,nocb,noubwc,flushall" };
+ * kTuDebug (main), so one boot shows the cases under each. Since 2026-10-25 backboardd runs with "nocb" (Turnip's
+ * autotune picks GMEM or sysmem per pass): the rotation is that, GMEM forced wherever possible ("gmem"), with and
+ * without UBWC and with every flush, and sysmem as the reference (r1c showed a widget garbled for a while). */
+static const char *const kTuDebug[] = { "nocb", "nocb,gmem", "sysmem,nocb", "nocb,gmem,noubwc", "nocb,gmem,flushall" };
 
 static void
 fetchTests(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
