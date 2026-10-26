@@ -1,0 +1,594 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 96af842..091e113 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/fuxi_touch.c			standard
+ bsd/dev/pandora_touch.c			standard
+ bsd/dev/pandora_amp.c			standard
+ bsd/dev/pandora_csfw.c			standard
++bsd/dev/pandora_gpi.c			standard
+ bsd/dev/pandora_selftest.c		standard
+ bsd/dev/pandora_adsp.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 9d9fe66..b9e01a4 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -23,6 +23,8 @@
+  * Boot-arg pandora_amp=1 turns it on (default off).
+  * pandora_gauge=1 looks at the fuel gauge's bus (wrapper 1 SE5, 0xa94000) without using it: who
+  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
++ * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
++ * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -37,6 +39,7 @@
+ #include <vm/pmap.h>
+ #include <kern/kalloc.h>
+ #include "pandora_csfw.h"
++#include "pandora_gpi.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+@@ -91,6 +94,11 @@ void pandora_amp_init(void);
+ #define PG_SE_PA     0x00a94000u
+ #define PG_VOTE      0x52008u
+ #define PG_VOTE_BITS ((0xfu << 18) | (1u << 27))   /* wrapper 1 core (18, 19), m_axi (20), s_ahb (21); SE5 (27) */
++/* qcom,gpi-dma@a00000: 12 GPIIs, qcom,gpii-mask 0x1f, qcom,gpi-ee-offset 0x10000; the bus's dmas: SE 5, protocol 3 */
++#define PG_GPI_PA    0x00a00000u
++#define PG_GPI_LEN   0x60000u
++#define PG_GPI_EE    0x10000u
++#define PG_GPII_MASK 0x1fu
+ 
+ static vm_offset_t pa_gcc, pa_se, pa_tlmm;
+ static int pa_chan;
+@@ -633,6 +641,44 @@ out:
+ 	}
+ }
+ 
++/*
++ * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
++ * 2-byte little-endian read after writing the command byte. SCL timing as the SE holds it now (the
++ * last configuration Android's i2c-5 sent before the reboot), else i2c-qcom-geni's 400 kHz entry.
++ */
++static void
++pa_gauge_read(vm_offset_t se)
++{
++	static const struct {
++		uint8_t cmd;
++		const char *what;
++	} q[] = {{0x08, "voltage mV"}, {0x0c, "current mA (+ charging)"}, {0x06, "temperature 0.1 K"},
++	         {0x2c, "state of charge %"}, {0x10, "remaining mAh"}, {0x12, "full charge mAh"},
++	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
++	const uint32_t mclk = pa_rd(se, SE_MCLK), scl = pa_rd(se, SE_SCL);
++	PgpiI2cClock clk = {(uint8_t)((mclk >> 4) & 0xfffu), (uint8_t)((scl >> 20) & 0x3ffu),
++	                    (uint8_t)((scl >> 10) & 0x3ffu), (uint8_t)(scl & 0x3ffu)};
++	if (!clk.clk_div || !clk.t_cycle) {
++		clk = (PgpiI2cClock){2, 5, 12, 24};
++	}
++	static PandoraGpi g;
++	int e = EBUSY;
++	for (uint32_t n = 0; n < 12 && e == EBUSY; n++) {
++		if (PG_GPII_MASK & (1u << n)) {
++			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, n, 5, 3);
++		}
++	}
++	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
++	    clk.t_cycle);
++	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && !e; i++) {
++		uint8_t v[2] = {0, 0};
++		e = pandora_gpi_i2c(&g, &clk, 0x55, &q[i].cmd, 1, v, 2);
++		printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, (unsigned)(v[0] | v[1] << 8),
++		    (unsigned)(v[0] | v[1] << 8), e);
++	}
++	pandora_gpi_close(&g);
++}
++
+ /*
+  * The fuel gauge's bus, looked at and not used. Android drives it from the apps processor
+  * (i2c@a94000, qcom,shared, GSI command word 0x00300001), but the SOCCP's device tree has this SE's
+@@ -680,6 +726,9 @@ pa_gauge(void)
+ 		}
+ 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
+ 		    busy, changed);
++		if (pa_gauge_level >= 2 && !busy && !changed) {
++			pa_gauge_read(se);
++		}
+ 		ml_io_unmap(se, 0x4000);
+ 	}
+ 	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~vote));
+diff --git a/bsd/dev/pandora_gpi.c b/bsd/dev/pandora_gpi.c
+new file mode 100644
+index 0000000..a962740
+--- /dev/null
++++ b/bsd/dev/pandora_gpi.c
+@@ -0,0 +1,354 @@
++/*
++ * Qualcomm GPI DMA engine for one GPII, polled (pandora_gpi.h). Sequences as Linux 6.6 gpi.c:
++ * gpi_ch_init (event ring allocated and programmed, then both channels allocated, programmed and
++ * started), gpi_issue_pending (TREs copied to the ring, doorbell = next free element),
++ * gpi_process_events (the event ring's hardware pointer in its context word 4, events consumed,
++ * doorbell = last element handed back), and the I2C split of i2c-qcom-geni.c geni_i2c_gpi_xfer.
++ * Command completion is read from the channel state in context word 0 instead of the interrupt.
++ */
++#if defined(PANDORA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "pandora_gpi.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/* Registers (GPII n, channel k), relative to block - ee_offset. */
++#define CH_CNTXT(n, k)     (0x20000u + 0x4000u * (n) + 0x80u * (k))
++#define CH_QOS(n, k)       (0x2005cu + 0x4000u * (n) + 0x80u * (k))
++#define CH_SCRATCH(n, k, i) (0x20060u + 0x4000u * (n) + 0x80u * (k) + 4u * (i))
++#define EV_CNTXT(n)        (0x21000u + 0x4000u * (n))
++#define CH_DB(n, k)        (0x22000u + 0x4000u * (n) + 0x8u * (k))
++#define EV_DB(n)           (0x22100u + 0x4000u * (n))
++#define CH_CMD(n)          (0x23008u + 0x4000u * (n))
++#define EV_CMD(n)          (0x23010u + 0x4000u * (n))
++#define TYPE_IRQ(n)        (0x23080u + 0x4000u * (n))
++#define TYPE_IRQ_MSK(n)    (0x23088u + 0x4000u * (n))
++#define SRC_CH_IRQ(n)      (0x23090u + 0x4000u * (n))
++#define SRC_EV_IRQ(n)      (0x23094u + 0x4000u * (n))
++#define SRC_CH_IRQ_MSK(n)  (0x23098u + 0x4000u * (n))
++#define SRC_EV_IRQ_MSK(n)  (0x2309cu + 0x4000u * (n))
++#define SRC_CH_IRQ_CLR(n)  (0x230a0u + 0x4000u * (n))
++#define SRC_EV_IRQ_CLR(n)  (0x230a4u + 0x4000u * (n))
++#define IEOB_IRQ_MSK(n)    (0x230b8u + 0x4000u * (n))
++#define IEOB_IRQ_CLR(n)    (0x230c0u + 0x4000u * (n))
++#define GLOB_IRQ_STTS(n)   (0x23100u + 0x4000u * (n))
++#define GLOB_IRQ_EN(n)     (0x23108u + 0x4000u * (n))
++#define GLOB_IRQ_CLR(n)    (0x23110u + 0x4000u * (n))
++#define GPII_IRQ_STTS(n)   (0x23118u + 0x4000u * (n))
++#define GPII_IRQ_EN(n)     (0x23120u + 0x4000u * (n))
++#define GPII_IRQ_CLR(n)    (0x23128u + 0x4000u * (n))
++#define INTSET(n)          (0x23180u + 0x4000u * (n))
++#define MSI_LSB(n)         (0x23188u + 0x4000u * (n))
++#define MSI_MSB(n)         (0x2318cu + 0x4000u * (n))
++#define ERROR_LOG(n)       (0x23200u + 0x4000u * (n))
++#define CNTXT_SCRATCH(n, i) (0x23400u + 0x4000u * (n) + 4u * (i))
++
++/* Context words. */
++#define CX_CONFIG     0x00u
++#define CX_LENGTH     0x04u
++#define CX_BASE_LSB   0x08u
++#define CX_BASE_MSB   0x0cu
++#define CX_RP_LSB     0x10u
++#define CX_INT_MOD    0x20u
++#define CX_MSI_LSB    0x28u
++#define CX_MSI_MSB    0x2cu
++#define CX_RPU_LSB    0x30u
++#define CX_RPU_MSB    0x34u
++
++/* Commands: opcode << 24 | channel. */
++#define OP_ALLOCATE   0u
++#define OP_START      1u
++#define OP_STOP       2u
++#define OP_RESET      9u
++#define OP_DEALLOC    10u
++#define ST_NOT_ALLOC  0u
++#define ST_ALLOCATED  1u
++#define ST_STARTED    2u
++#define ST_STOPPED    3u
++
++/* Memory: TX ring, RX ring (64 TREs each), event ring (128 events, ev-factor 1), bounce buffers.
++ * Each ring sits at a multiple of its own (power of two) length, as gpi_alloc_ring aligns them. */
++#define RING_LEN      (64u * PGPI_EL_SIZE)
++#define EV_LEN        (128u * PGPI_EL_SIZE)
++#define TX_RING       0x0000u
++#define RX_RING       0x0400u
++#define EV_RING       0x0800u
++#define TX_BUF        0x1000u
++#define RX_BUF        0x1800u
++#define BUF_MAX       0x800u
++#define MEM_LEN       0x2000u
++
++#define PROTO_GPI     2u      /* channel context protocol: GPI */
++#define CMD_TIMEOUT_MS 250u
++#define XFER_TIMEOUT_MS 100u
++
++static uint32_t
++rd(const PandoraGpi *g, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(g->regs + off - g->ee_offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(const PandoraGpi *g, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(g->regs + off - g->ee_offset) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* A command, then its channel (or the event ring) in STATE; the control interrupt status cleared. */
++static int
++command(PandoraGpi *g, bool ev, uint32_t op, uint32_t chid, uint32_t state)
++{
++	const uint32_t n = g->gpii, cx = ev ? EV_CNTXT(n) : CH_CNTXT(n, chid);
++	wr(g, ev ? EV_CMD(n) : CH_CMD(n), op << 24 | (ev ? 0u : chid));
++	uint32_t now = 0;
++	for (unsigned t = 0; t < CMD_TIMEOUT_MS * 10u; t++) {
++		now = (rd(g, cx + CX_CONFIG) >> 20) & 0xfu;
++		if (now == state) {
++			break;
++		}
++		delay(100);
++	}
++	wr(g, ev ? SRC_EV_IRQ_CLR(n) : SRC_CH_IRQ_CLR(n), ev ? 1u : 1u << chid);
++	if (now != state) {
++		printf("PANDORA GPI: gpii %u %s %u opcode %u: state %u, wanted %u (type irq %#x glob %#x gpii %#x log %#x)\n", n,
++		    ev ? "event ring" : "channel", chid, op, now, state, rd(g, TYPE_IRQ(n)), rd(g, GLOB_IRQ_STTS(n)),
++		    rd(g, GPII_IRQ_STTS(n)), rd(g, ERROR_LOG(n)));
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++static void
++put_tre(PandoraGpi *g, bool rx, const PgpiTre *t)
++{
++	uint32_t *wp = rx ? &g->rx_wp : &g->tx_wp;
++	memcpy((void *)(g->mem + (rx ? RX_RING : TX_RING) + *wp), t, sizeof(*t));
++	*wp = (*wp + PGPI_EL_SIZE) % RING_LEN;
++}
++
++static void
++doorbell(PandoraGpi *g, bool rx)
++{
++	const uint32_t base = rx ? RX_RING : TX_RING, wp = rx ? g->rx_wp : g->tx_wp;
++	clean_dcache64((addr64_t)(g->mem_pa + base), RING_LEN, TRUE);
++	wr(g, CH_DB(g->gpii, rx ? 1u : 0u), (uint32_t)(g->mem_pa + base + wp));
++}
++
++/* Events until one completes channel CHID's transfer (IEOT); 0, EIO on an error code, ETIMEDOUT. */
++static int
++wait_done(PandoraGpi *g, uint32_t chid, uint32_t *len)
++{
++	const uint32_t n = g->gpii;
++	for (unsigned t = 0; t < XFER_TIMEOUT_MS * 10u; t++) {
++		const uint32_t hw = (uint32_t)(rd(g, EV_CNTXT(n) + CX_RP_LSB) - (uint32_t)(g->mem_pa + EV_RING));
++		if (hw == g->ev_rp) {
++			delay(100);
++			continue;
++		}
++		flush_dcache64((addr64_t)(g->mem_pa + EV_RING), EV_LEN, TRUE);
++		int result = -1;
++		while (g->ev_rp != hw) {
++			const PgpiEvent e = pgpi_event((const uint32_t *)(g->mem + EV_RING + g->ev_rp));
++			printf("PANDORA GPI: event type %#x channel %u code %u status %#x length %u tre %#llx\n", e.type, e.chid,
++			    e.code, e.status, e.length, e.tre);
++			if (e.type == PGPI_EV_XFER_DONE && e.chid == chid && result < 0) {
++				result = e.code == PGPI_CODE_ERROR ? EIO : 0;
++				*len = e.length;
++			}
++			g->ev_rp = (g->ev_rp + PGPI_EL_SIZE) % EV_LEN;
++			g->ev_wp = (g->ev_wp + PGPI_EL_SIZE) % EV_LEN;
++		}
++		wr(g, EV_DB(n), (uint32_t)(g->mem_pa + EV_RING + g->ev_wp));
++		wr(g, IEOB_IRQ_CLR(n), 1);
++		if (result >= 0) {
++			return result;
++		}
++	}
++	printf("PANDORA GPI: gpii %u channel %u: no completion in %u ms (type irq %#x glob %#x gpii %#x log %#x, "
++	    "tx state %u rx state %u)\n", n, chid, XFER_TIMEOUT_MS, rd(g, TYPE_IRQ(n)), rd(g, GLOB_IRQ_STTS(n)),
++	    rd(g, GPII_IRQ_STTS(n)), rd(g, ERROR_LOG(n)), (rd(g, CH_CNTXT(n, 0)) >> 20) & 0xfu,
++	    (rd(g, CH_CNTXT(n, 1)) >> 20) & 0xfu);
++	return ETIMEDOUT;
++}
++
++int
++pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
++    uint32_t seid, uint32_t proto)
++{
++	bzero(g, sizeof(*g));
++	g->ee_offset = ee_offset;
++	g->gpii = gpii;
++	g->seid = seid;
++	g->proto = proto;
++	g->regs = ml_io_map_unmappable((vm_offset_t)block_pa, block_len, VM_WIMG_IO);
++	if (!g->regs) {
++		return ENOMEM;
++	}
++	const uint32_t n = gpii;
++	printf("PANDORA GPI: gpii %u before: tx %#x rx %#x event %#x, type irq %#x, masks %#x/%#x/%#x\n", n,
++	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), rd(g, TYPE_IRQ(n)), rd(g, TYPE_IRQ_MSK(n)),
++	    rd(g, SRC_CH_IRQ_MSK(n)), rd(g, IEOB_IRQ_MSK(n)));
++	if (((rd(g, CH_CNTXT(n, 0)) | rd(g, CH_CNTXT(n, 1)) | rd(g, EV_CNTXT(n))) >> 20) & 0xfu) {
++		printf("PANDORA GPI: gpii %u is in use; left alone\n", n);
++		ml_io_unmap(g->regs, block_len);
++		g->regs = 0;
++		return EBUSY;
++	}
++	if (kmem_alloc_contig(kernel_map, &g->mem, MEM_LEN, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	g->mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)g->mem));
++	clean_dcache64((addr64_t)g->mem_pa, MEM_LEN, TRUE);
++
++	/* interrupts as gpi_config_interrupts; nothing takes them, the status is polled */
++	wr(g, TYPE_IRQ_MSK(n), 0x4fu);          /* general, IEOB, global, event and channel control */
++	wr(g, IEOB_IRQ_MSK(n), 1);
++	wr(g, SRC_CH_IRQ_MSK(n), 3);
++	wr(g, SRC_EV_IRQ_MSK(n), 1);
++	wr(g, GLOB_IRQ_EN(n), 0xf);
++	wr(g, GPII_IRQ_EN(n), 0xf);
++	wr(g, MSI_LSB(n), 0);
++	wr(g, MSI_MSB(n), 0);
++	wr(g, CNTXT_SCRATCH(n, 0), 0);
++	wr(g, CNTXT_SCRATCH(n, 1), 0);
++	wr(g, INTSET(n), 1);
++	wr(g, ERROR_LOG(n), 0);
++
++	/* event ring (gpi_alloc_ev_chan) */
++	int e = command(g, true, OP_ALLOCATE, 0, ST_ALLOCATED);
++	if (e) {
++		return e;
++	}
++	const uint64_t ev = g->mem_pa + EV_RING;
++	wr(g, EV_CNTXT(n) + CX_CONFIG, PGPI_EL_SIZE << 24 | 1u << 16 | 2u);   /* IRQ interrupt type, GPI event ring */
++	wr(g, EV_CNTXT(n) + CX_LENGTH, EV_LEN);
++	wr(g, EV_CNTXT(n) + CX_BASE_LSB, (uint32_t)ev);
++	wr(g, EV_CNTXT(n) + CX_BASE_MSB, (uint32_t)(ev >> 32));
++	wr(g, EV_DB(n) + 4, (uint32_t)(ev >> 32));
++	wr(g, EV_CNTXT(n) + CX_INT_MOD, 0);
++	wr(g, EV_CNTXT(n) + CX_MSI_LSB, 0);
++	wr(g, EV_CNTXT(n) + CX_MSI_MSB, 0);
++	wr(g, EV_CNTXT(n) + CX_RPU_LSB, 0);
++	wr(g, EV_CNTXT(n) + CX_RPU_MSB, 0);
++	g->ev_wp = EV_LEN - PGPI_EL_SIZE;   /* every element handed to the hardware */
++	wr(g, EV_DB(n), (uint32_t)(ev + g->ev_wp));
++
++	/* channels (gpi_alloc_chan): 0 = TX (direction out), 1 = RX */
++	for (uint32_t k = 0; k < 2 && !e; k++) {
++		const uint64_t ring = g->mem_pa + (k ? RX_RING : TX_RING);
++		e = command(g, false, OP_ALLOCATE, k, ST_ALLOCATED);
++		if (e) {
++			break;
++		}
++		wr(g, CH_CNTXT(n, k) + CX_CONFIG, PGPI_EL_SIZE << 24 | 0u << 14 | (k ? 0u : 1u) << 3 | PROTO_GPI);
++		wr(g, CH_CNTXT(n, k) + CX_LENGTH, RING_LEN);
++		wr(g, CH_CNTXT(n, k) + CX_BASE_LSB, (uint32_t)ring);
++		wr(g, CH_CNTXT(n, k) + CX_BASE_MSB, (uint32_t)(ring >> 32));
++		wr(g, CH_DB(n, k) + 4, (uint32_t)(ring >> 32));
++		wr(g, CH_SCRATCH(n, k, 0), (1u - k) << 16 | (proto & 0xfu) << 4 | (seid & 7u));
++		wr(g, CH_SCRATCH(n, k, 1), 0);
++		wr(g, CH_SCRATCH(n, k, 2), 0);
++		wr(g, CH_SCRATCH(n, k, 3), 0);
++		wr(g, CH_QOS(n, k), 1);
++	}
++	for (uint32_t k = 0; k < 2 && !e; k++) {
++		e = command(g, false, OP_START, k, ST_STARTED);
++	}
++	printf("PANDORA GPI: gpii %u for SE %u: rings at %#llx, tx %#x rx %#x event %#x, err %d\n", n, seid, g->mem_pa,
++	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), e);
++	g->open = e == 0;
++	return e;
++}
++
++int
++pandora_gpi_i2c(PandoraGpi *g, const PgpiI2cClock *clk, uint8_t addr, const uint8_t *w, unsigned nw, uint8_t *r,
++    unsigned nr)
++{
++	if (!g->open || nw > BUF_MAX || nr > BUF_MAX || (!nw && !nr)) {
++		return EINVAL;
++	}
++	uint32_t len = 0;
++	int e = 0;
++	bool config = true;
++	if (nw) {
++		/* the write: config, GO (write, no STOP when a read follows), DMA from the TX buffer */
++		memcpy((void *)(g->mem + TX_BUF), w, nw);
++		clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
++		PgpiTre t = pgpi_i2c_config0(clk);
++		put_tre(g, false, &t);
++		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, nw, 0);
++		put_tre(g, false, &t);
++		t = pgpi_dma(g->mem_pa + TX_BUF, nw);
++		put_tre(g, false, &t);
++		doorbell(g, false);
++		e = wait_done(g, 0, &len);
++		config = false;
++	}
++	if (!e && nr) {
++		/* the read: (config,) GO (read, linked to RX) on TX, DMA into the RX buffer on RX; RX first */
++		flush_dcache64((addr64_t)(g->mem_pa + RX_BUF), BUF_MAX, TRUE);
++		PgpiTre t = pgpi_dma(g->mem_pa + RX_BUF, nr);
++		put_tre(g, true, &t);
++		if (config) {
++			t = pgpi_i2c_config0(clk);
++			put_tre(g, false, &t);
++		}
++		t = pgpi_i2c_go(PGPI_I2C_READ, addr, 0, nr, 1);
++		put_tre(g, false, &t);
++		doorbell(g, true);
++		doorbell(g, false);
++		e = wait_done(g, 1, &len);
++		flush_dcache64((addr64_t)(g->mem_pa + RX_BUF), BUF_MAX, TRUE);
++		memcpy(r, (const void *)(g->mem + RX_BUF), nr);
++	}
++	return e;
++}
++
++void
++pandora_gpi_close(PandoraGpi *g)
++{
++	if (!g->regs) {
++		return;
++	}
++	const uint32_t n = g->gpii;
++	if (g->open) {
++		for (uint32_t k = 0; k < 2; k++) {
++			(void)command(g, false, OP_STOP, k, ST_STOPPED);
++			(void)command(g, false, OP_RESET, k, ST_ALLOCATED);
++		}
++	}
++	for (uint32_t k = 0; k < 2; k++) {
++		wr(g, CH_CMD(n), OP_DEALLOC << 24 | k);   /* always succeeds; the state is not updated */
++		delay(1000);
++		wr(g, SRC_CH_IRQ_CLR(n), 1u << k);
++	}
++	(void)command(g, true, OP_RESET, 0, ST_ALLOCATED);
++	wr(g, EV_CMD(n), OP_DEALLOC << 24);
++	delay(1000);
++	wr(g, SRC_EV_IRQ_CLR(n), 1);
++	wr(g, TYPE_IRQ_MSK(n), 0);
++	wr(g, IEOB_IRQ_MSK(n), 0);
++	wr(g, SRC_CH_IRQ_MSK(n), 0);
++	wr(g, SRC_EV_IRQ_MSK(n), 0);
++	wr(g, GLOB_IRQ_EN(n), 0);
++	wr(g, GPII_IRQ_EN(n), 0);
++	wr(g, INTSET(n), 0);
++	printf("PANDORA GPI: gpii %u closed: tx %#x rx %#x event %#x\n", n, rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)),
++	    rd(g, EV_CNTXT(n)));
++	g->open = false;
++}
++#endif /* PANDORA */
+diff --git a/bsd/dev/pandora_gpi.h b/bsd/dev/pandora_gpi.h
+new file mode 100644
+index 0000000..5efc2c4
+--- /dev/null
++++ b/bsd/dev/pandora_gpi.h
+@@ -0,0 +1,128 @@
++/*
++ * Qualcomm GPI DMA (the QUP wrappers' GSI engine) for an I2C serial engine that runs in GSI-only mode.
++ * PANDORA's fuel gauge bus (wrapper 1 SE5, 0xa94000) has FIFO_IF_DISABLE set: transfers go as
++ * transfer ring elements (TREs) through one GPII's TX and RX channels, completions come back on its
++ * event ring. Register map, ring contexts, commands and TRE formats as Linux 6.6
++ * drivers/dma/qcom/gpi.c and drivers/i2c/busses/i2c-qcom-geni.c (GPI mode); polled, no interrupts.
++ * The TRE and event encoders here are pure (host-tested, tools/hosttest); the engine is pandora_gpi.c.
++ */
++#ifndef PANDORA_GPI_H
++#define PANDORA_GPI_H
++
++#include <stdint.h>
++
++/* Ring elements: TREs and events are four 32-bit words. */
++#define PGPI_EL_SIZE       16u
++
++/* dword 3 of a TRE */
++#define PGPI_TRE_CHAIN     (1u << 0)
++#define PGPI_TRE_IEOB      (1u << 8)
++#define PGPI_TRE_IEOT      (1u << 9)
++#define PGPI_TRE_BEI       (1u << 10)
++#define PGPI_TRE_LINK      (1u << 11)
++#define PGPI_TRE_DMA       0x10u
++#define PGPI_TRE_GO        0x20u
++#define PGPI_TRE_CONFIG0   0x22u
++
++#define PGPI_I2C_WRITE     1u
++#define PGPI_I2C_READ      2u
++
++/* Events: type in dword 3 bits 23..16, channel in 31..24; code in dword 2 bits 31..24. */
++#define PGPI_EV_XFER_DONE  0x22u
++#define PGPI_EV_IMMEDIATE  0x30u
++#define PGPI_EV_QUP_NOTIF  0x31u
++#define PGPI_CODE_SUCCESS  1u
++#define PGPI_CODE_EOT      2u
++#define PGPI_CODE_EOB      4u
++#define PGPI_CODE_ERROR    16u
++
++typedef struct {
++	uint32_t w[4];
++} PgpiTre;
++
++/* SCL timing in serial-engine clocks after the divider (i2c-qcom-geni's clock table). */
++typedef struct {
++	uint8_t clk_div, t_high, t_low, t_cycle;
++} PgpiI2cClock;
++
++static inline PgpiTre
++pgpi_i2c_config0(const PgpiI2cClock *c)
++{
++	PgpiTre t;
++	t.w[0] = (uint32_t)c->t_low | (uint32_t)c->t_high << 8 | (uint32_t)c->t_cycle << 16 | 3u << 24;   /* TX, RX pack */
++	t.w[1] = 0;
++	t.w[2] = c->clk_div & 0xfffu;
++	t.w[3] = PGPI_TRE_CONFIG0 << 16 | PGPI_TRE_CHAIN;
++	return t;
++}
++
++/* GO: OP to 7-bit ADDR; STRETCH keeps the bus (no STOP, a repeated start follows); RX_LEN bytes for
++ * a read. LINK hands the transfer to the RX channel's DMA TRE, CHAIN to the next TRE on this ring. */
++static inline PgpiTre
++pgpi_i2c_go(uint32_t op, uint8_t addr, int stretch, uint32_t rx_len, int link)
++{
++	PgpiTre t;
++	t.w[0] = (op & 0x1fu) | (uint32_t)(addr & 0x7fu) << 8 | (stretch ? 1u << 26 : 0u);
++	t.w[1] = 0;
++	t.w[2] = rx_len & 0xffffffu;
++	t.w[3] = PGPI_TRE_GO << 16 | (link ? PGPI_TRE_LINK : PGPI_TRE_CHAIN);
++	return t;
++}
++
++static inline PgpiTre
++pgpi_dma(uint64_t pa, uint32_t len)
++{
++	PgpiTre t;
++	t.w[0] = (uint32_t)pa;
++	t.w[1] = (uint32_t)(pa >> 32);
++	t.w[2] = len & 0xffffffu;
++	t.w[3] = PGPI_TRE_DMA << 16 | PGPI_TRE_IEOT;
++	return t;
++}
++
++typedef struct {
++	uint64_t tre;          /* the TRE the event is about (bus address) */
++	uint32_t length, code, status, type, chid;
++} PgpiEvent;
++
++static inline PgpiEvent
++pgpi_event(const uint32_t w[4])
++{
++	PgpiEvent e;
++	e.tre = (uint64_t)w[0] | (uint64_t)w[1] << 32;
++	e.length = w[2] & 0xffffffu;
++	e.code = w[2] >> 24;
++	e.status = w[3] & 0xffffu;
++	e.type = (w[3] >> 16) & 0xffu;
++	e.chid = w[3] >> 24;
++	return e;
++}
++
++#ifdef KERNEL
++#include <stdbool.h>
++#include <mach/vm_types.h>
++
++/* One GPII with a TX and an RX channel for one serial engine. */
++typedef struct {
++	vm_offset_t regs;      /* the mapped GPI block */
++	uint32_t ee_offset;    /* qcom,gpi-ee-offset: registers are at block - ee_offset + offset */
++	uint32_t gpii, seid, proto;
++	vm_offset_t mem;       /* rings and bounce buffers, physically contiguous */
++	uint64_t mem_pa;
++	uint32_t tx_wp, rx_wp; /* next free TRE, bytes into each ring */
++	uint32_t ev_rp;        /* next event to look at, bytes into the event ring */
++	uint32_t ev_wp;        /* last element handed to the hardware */
++	bool open;
++} PandoraGpi;
++
++/* Allocate and start the GPII's event ring and both channels; logs every step. 0 or an errno. */
++int pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
++    uint32_t seid, uint32_t proto);
++/* Write NW bytes (if any) to ADDR, then with a repeated start read NR bytes (if any). 0 or an errno. */
++int pandora_gpi_i2c(PandoraGpi *g, const PgpiI2cClock *clk, uint8_t addr, const uint8_t *w, unsigned nw, uint8_t *r,
++    unsigned nr);
++/* Stop, reset and free both channels and the event ring. */
++void pandora_gpi_close(PandoraGpi *g);
++#endif
++
++#endif

@@ -25,3 +25,8 @@ else
 		-o "$OUT/ar_host" "$H/ar_host.c" "$H/../../wsl/pandora_ar.c"
 fi
 ASAN_OPTIONS=detect_leaks=0 "$OUT/ar_host"
+
+# GPI DMA TRE and event encoders.
+$CC -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+	-o "$OUT/gpi_host" "$H/gpi_host.c"
+ASAN_OPTIONS=detect_leaks=0 "$OUT/gpi_host"

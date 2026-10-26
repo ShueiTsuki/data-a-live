@@ -23,6 +23,8 @@
  * Boot-arg pandora_amp=1 turns it on (default off).
  * pandora_gauge=1 looks at the fuel gauge's bus (wrapper 1 SE5, 0xa94000) without using it: who
  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
+ * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
+ * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -37,6 +39,7 @@
 #include <vm/pmap.h>
 #include <kern/kalloc.h>
 #include "pandora_csfw.h"
+#include "pandora_gpi.h"
 
 extern kern_return_t thread_terminate(thread_t);
 extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
@@ -91,6 +94,11 @@ void pandora_amp_init(void);
 #define PG_SE_PA     0x00a94000u
 #define PG_VOTE      0x52008u
 #define PG_VOTE_BITS ((0xfu << 18) | (1u << 27))   /* wrapper 1 core (18, 19), m_axi (20), s_ahb (21); SE5 (27) */
+/* qcom,gpi-dma@a00000: 12 GPIIs, qcom,gpii-mask 0x1f, qcom,gpi-ee-offset 0x10000; the bus's dmas: SE 5, protocol 3 */
+#define PG_GPI_PA    0x00a00000u
+#define PG_GPI_LEN   0x60000u
+#define PG_GPI_EE    0x10000u
+#define PG_GPII_MASK 0x1fu
 
 static vm_offset_t pa_gcc, pa_se, pa_tlmm;
 static int pa_chan;
@@ -634,6 +642,44 @@ out:
 }
 
 /*
+ * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
+ * 2-byte little-endian read after writing the command byte. SCL timing as the SE holds it now (the
+ * last configuration Android's i2c-5 sent before the reboot), else i2c-qcom-geni's 400 kHz entry.
+ */
+static void
+pa_gauge_read(vm_offset_t se)
+{
+	static const struct {
+		uint8_t cmd;
+		const char *what;
+	} q[] = {{0x08, "voltage mV"}, {0x0c, "current mA (+ charging)"}, {0x06, "temperature 0.1 K"},
+	         {0x2c, "state of charge %"}, {0x10, "remaining mAh"}, {0x12, "full charge mAh"},
+	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
+	const uint32_t mclk = pa_rd(se, SE_MCLK), scl = pa_rd(se, SE_SCL);
+	PgpiI2cClock clk = {(uint8_t)((mclk >> 4) & 0xfffu), (uint8_t)((scl >> 20) & 0x3ffu),
+	                    (uint8_t)((scl >> 10) & 0x3ffu), (uint8_t)(scl & 0x3ffu)};
+	if (!clk.clk_div || !clk.t_cycle) {
+		clk = (PgpiI2cClock){2, 5, 12, 24};
+	}
+	static PandoraGpi g;
+	int e = EBUSY;
+	for (uint32_t n = 0; n < 12 && e == EBUSY; n++) {
+		if (PG_GPII_MASK & (1u << n)) {
+			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, n, 5, 3);
+		}
+	}
+	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
+	    clk.t_cycle);
+	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && !e; i++) {
+		uint8_t v[2] = {0, 0};
+		e = pandora_gpi_i2c(&g, &clk, 0x55, &q[i].cmd, 1, v, 2);
+		printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, (unsigned)(v[0] | v[1] << 8),
+		    (unsigned)(v[0] | v[1] << 8), e);
+	}
+	pandora_gpi_close(&g);
+}
+
+/*
  * The fuel gauge's bus, looked at and not used. Android drives it from the apps processor
  * (i2c@a94000, qcom,shared, GSI command word 0x00300001), but the SOCCP's device tree has this SE's
  * pins and its firmware the clock name, so first: who has its clocks on, how the pins are set, and
@@ -680,6 +726,9 @@ pa_gauge(void)
 		}
 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
 		    busy, changed);
+		if (pa_gauge_level >= 2 && !busy && !changed) {
+			pa_gauge_read(se);
+		}
 		ml_io_unmap(se, 0x4000);
 	}
 	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~vote));
