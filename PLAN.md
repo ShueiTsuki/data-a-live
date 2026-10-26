@@ -228,10 +228,11 @@
 - 用户转告上游开发者的话（2026-10-26）：「上游是模拟speaker，开发者希望我们有更好的方案做doc」，接着「希望我们不要用这个speaker的方案」。上游音频指南（UniXNU `docs/porting/power.md` §3）照的是 sheng 的做法：功放直通、不跑保护固件和校准、增益固定 18，16 位 I2S，手写的最小 DSP 图；iOS 那侧是音频服务器插件造出来的设备，不是 iOS 原生的接口。**所以不用 sheng 的喇叭方案**：它的功放程序（`ShengCs35l43`）、搭图（`ShengAudioReach`）、插件和音频服务都不拿；通信库（SMEM、SMP2P、GLINK、GPR）不属于喇叭方案，照旧用。做通以后写成上游文档（指南加 pandora 设备页），只写真机核实过的。
 - 分步（2026-10-26 按上面改过）：
   1. 硬件准备，和做法无关：apps SMMU 给两个音频数据流加透传表项（最后一个上下文 80 设成不翻译），4 GiB 以下固定留一块 DSP 缓冲（写进 ADT），DSP 登记这块内存；TDM 引脚（GPIO 122–125）；PRM 时钟申请和释放（内容照安卓实测，`D:\DeepSeekHarness\prmcheck\VERIFY.md`）；I2C 驱动从 `pandora_amp.c` 扩出来。
-  2. 第一次出声就按安卓：两颗功放加载扬声器保护固件、各自的系数、出厂校准（运行时从手机 persist 分区读，不进仓库）和 music 调音，`PCM Source = DSP`，寄存器照安卓放音时的实际值（`D:\DeepSeekHarness\speakercheck\raw\during\`，注意文件名 T/B 标反了）；DSP 图照安卓：共享内存端点 → PCM 解码 → PCM 转换 → SPR → TDM 端点，48 kHz / 32 位 / 2 声道，ASPTX 反馈接回 SPR。不做"先直通出声"这一步。功放的文件在 odm 分区（不是 FAT），放进固定固件包。
+  2. 第一次出声就按安卓：两颗功放加载扬声器保护固件、各自的系数、出厂校准（运行时从手机 persist 分区读，不进仓库）和 music 调音，`PCM Source = DSP`，寄存器照安卓放音时的实际值（`D:\DeepSeekHarness\speakercheck\raw\during\`，注意文件名 T/B 标反了）；DSP 图照安卓：共享内存端点 → PCM 解码 → PCM 转换 → SPR → TDM 端点，48 kHz / 32 位 / 2 声道（这只是 AGM 日志里带标签的模块，完整列表要从 ACDB 读；SPR 是会话时间模块，不是保护——2026-10-26 改正）。不做"先直通出声"这一步。功放的文件在 odm 分区（不是 FAT），放进固定固件包。
   3. 接 iOS，照真 iPhone 的方式：先查 iOS 16（iPhone X）自己的音频驱动栈怎么认设备，让 iOS 自己的音频软件直接驱动我们的设备，不另做音频服务器插件。喇叭 / 听筒切换（GPIO174）、音量都按 iOS 的做法。
-  4. 做不到的：安卓主处理器这侧的 Dolby DAP 是闭源的用户空间音效，搬不过来。从 HAL 往下（DSP 流程、TDM、功放固件、校准、增益）能做到和安卓一样。
-- 更好的做法（2026-10-26 用户同意）：DSP 用安卓 AAudio 的 MMAP 放音那条路（`vendor_audio_policy_configuration.xml` 的 `mmap_no_irq_out` 接到 Speaker 和 Earpiece），DSP 自己从环形缓冲取数据、把位置和时刻写回共享内存；iOS 那侧按 iPhone X 内置音频用的 `IOAudio2Family` 写原生设备，iOS 音频服务器混好的声音直接写进 DSP 读的缓冲；端点、槽、时钟、功放、数据流、缓冲都写进 ADT，换机器换描述。要先查的三件交给 DeepSeek：`D:\DeepSeekHarness\mmapcheck`、`iosaudiocheck`、`ampfwcheck`（电池那份是 `battcheck`）。
+  4. 杜比：效果名 `DAP_offload`、驱动 `DlbQdspGefDriver`，可能是跑在高通 DSP 图里的模块（AP 只下参数），不一定是搬不过来的用户空间音效。解析 ACDB 后再定。
+- 更好的做法（2026-10-26 用户同意）：功放跑安卓的保护固件和各自的系数、校准、调音；iOS 那侧按 iPhone X 内置音频用的 `IOAudio2Family` 写原生设备，iOS 音频服务器混好的声音直接写进 DSP 读的缓冲；端点、槽、时钟、功放、数据流、缓冲都写进 ADT，换机器换描述。要先查的三件交给 DeepSeek：`D:\DeepSeekHarness\mmapcheck`、`iosaudiocheck`、`ampfwcheck`（电池那份是 `battcheck`）。
+- DSP 这一段改正（2026-10-26，mmapcheck 复核）：原先说"DSP 用安卓 MMAP 放音那条路"是错的。资源管理器的喇叭设备没有声明 ULL，安卓从不用 MMAP 放喇叭；安卓放喇叭用的是 DEEP_BUFFER 图，阻塞式共享内存（15360 字节 × 2 块），时间由 SPR 给。ACDB 里有一张没人用的 ULL 放音子图 `0xA1000011`。两种选法都要先把 ACDB 解析出来（喇叭设备那几段子图的完整模块、连接和校准值）再定：照安卓实际用的 DEEP_BUFFER 图（安卓验证过，声音一致最有把握），或换成 ULL 那段流子图、设备那段保持和安卓一样（更贴 iOS 的环形缓冲，但安卓没在喇叭上用过）。
 - **spk1（2026-10-26，k0234，`pandora_spk=2`）：第 1 步的硬件准备都通了。**
   - apps SMMU：引导程序配的 7 个表项用的是上下文 0–5，最后一个上下文 80 没人用；固件把写进去的"直通"读回成"报错"（`000200ff`），和 Linux 的 qcom 处理、sheng 遇到的一样，所以上下文 80 设成不翻译（SCTLR 0、CBAR `00010000`），新表项 7（`0x1001`/`0x80`）、8（`0x1041`/`0x20`）指向它，读回都对。
   - DSP 缓冲：ADT `/chosen pandora-dsp-shm` = 0xb0000000 + 1 MiB，写合并映射；APM 登记（地址高位放 1）给了句柄，注销状态 0。
