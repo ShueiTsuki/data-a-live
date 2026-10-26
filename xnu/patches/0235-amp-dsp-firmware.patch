@@ -1,0 +1,682 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5004d8a..96af842 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/fuxi_touch.c			standard
+ bsd/dev/pandora_touch.c			standard
+ bsd/dev/pandora_amp.c			standard
++bsd/dev/pandora_csfw.c			standard
+ bsd/dev/pandora_selftest.c		standard
+ bsd/dev/pandora_adsp.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 6383bda..b7c046f 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -7,6 +7,12 @@
+  * (0x0) and REVID (0x4), a block of the serial-port registers, writes the three interrupt masks
+  * (all masked; nothing listens to the amps' interrupt lines) and reads them back. Audio itself goes
+  * over TDM0 (GPIO 122-125, LPASS I2S0) from the audio DSP; nothing here plays sound.
++ * pandora_amp=2 also writes each amplifier's DSP firmware, its coefficients and the music scene
++ * from the pinned pack (tools/gpu_test.sh --amp-fw; files as Android's /odm/firmware), turned into
++ * register writes by pandora_csfw.c, and reads back what decides whether they landed: the
++ * algorithm list at XM word 0, every unpacked XM coefficient block, the start of PM. The DSP is
++ * not started, no calibration is written and the amplifier stays powered down: how Android starts
++ * the protection firmware is still being read (D:\DeepSeekHarness\ampfwcheck).
+  * SDA GPIO 64, SCL GPIO 65 (function 1, qup3_se0, pull-up). GCC (gcc-kaanapali.c):
+  * wrapper 3 votes 0x52018 bits 8-12, SE0 RCG 0xa8014. I2C FIFO transfers as
+  * bsd/dev/sweet_touch.c (Linux i2c-qcom-geni.c), 100 kHz from XO.
+@@ -23,8 +29,11 @@
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
++#include <kern/kalloc.h>
++#include "pandora_csfw.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
++extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ void pandora_amp_init(void);
+ 
+@@ -56,7 +65,7 @@ void pandora_amp_init(void);
+ #define SE_TX_WM    0x80cu
+ #define SE_HW_TX    0xe24u
+ #define SE_HW_RX    0xe28u
+-#define PA_MAX      64u     /* bytes in one I2C message here */
++#define PA_MAX      128u    /* bytes in one I2C message here: the 32-word FIFOs */
+ #define SE_DONE     (1u << 0)
+ #define SE_NACK     (1u << 10)
+ #define SE_ERRORS   (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | \
+@@ -68,6 +77,7 @@ void pandora_amp_init(void);
+ 
+ static vm_offset_t pa_gcc, pa_se, pa_tlmm;
+ static int pa_chan;
++static int pa_level;
+ static unsigned pa_txw = 1;   /* TX FIFO words per watermark interrupt (depth - 1, as i2c-qcom-geni) */
+ 
+ static uint32_t
+@@ -161,11 +171,17 @@ pa_abort(void)
+ 	pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
+ }
+ 
+-/* One I2C message: write or read up to PA_MAX bytes. stretch: no STOP (repeated start). */
++/*
++ * One I2C message: a write of a header (up to 4 bytes) followed by a body of any length, fed to the
++ * TX FIFO as it drains, or a read of up to PA_MAX bytes. stretch: no STOP (repeated start). The
++ * deadline follows the length: 20 ms plus 200 us a byte (100 kHz moves a byte in 90 us).
++ */
+ static int
+-pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++pa_xfer(uint8_t addr, const uint8_t *hdr, unsigned nh, const uint8_t *body, unsigned nb, uint8_t *rx, unsigned nr,
++    bool stretch)
+ {
+-	if (nt > PA_MAX || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
++	const unsigned nt = nh + nb;
++	if (nh > 4 || nt > (1u << 20) || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
+ 		return EINVAL;
+ 	}
+ 	for (unsigned i = 0; i < 5000 && (pa_rd(pa_se, SE_STATUS) & 1u); i++) {
+@@ -179,7 +195,9 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 	pa_wr(pa_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+ 	pa_wr(pa_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	unsigned got = 0, put = 0;
+-	for (unsigned i = 0; i < 20000; i++) {
++	uint64_t deadline;
++	clock_interval_to_deadline(20000u + 200u * (nt + nr), NSEC_PER_USEC, &deadline);
++	while (mach_absolute_time() < deadline) {
+ 		uint32_t irq = pa_rd(pa_se, SE_IRQ);
+ 		if (irq & SE_ERRORS) {
+ 			int err = (irq & SE_NACK) ? ENXIO : EIO;
+@@ -198,7 +216,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 			for (unsigned k = 0; k < pa_txw && put < nt; k++) {
+ 				uint32_t w = 0;
+ 				for (unsigned j = 0; j < 4 && put < nt; j++, put++) {
+-					w |= (uint32_t)tx[put] << (8u * j);
++					w |= (uint32_t)(put < nh ? hdr[put] : body[put - nh]) << (8u * j);
+ 				}
+ 				pa_wr(pa_se, SE_TX, w);
+ 			}
+@@ -224,6 +242,12 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
+ 	return ETIMEDOUT;
+ }
+ 
++static int
++pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	return pa_xfer(addr, tx, nt > 4 ? 4 : nt, nt > 4 ? tx + 4 : NULL, nt > 4 ? nt - 4 : 0, rx, nr, stretch);
++}
++
+ static void
+ pa_be32(uint8_t *p, uint32_t v)
+ {
+@@ -273,6 +297,177 @@ pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
+ 	return pa_read_regs(addr, reg, val, 1);
+ }
+ 
++/* BYTES (whole registers, big endian as in the DSP files) to the registers from REG on, in one message. */
++static int
++pa_write_block(uint8_t addr, uint32_t reg, const uint8_t *data, unsigned bytes)
++{
++	uint8_t a[4];
++	pa_be32(a, reg);
++	return pa_xfer(addr, a, 4, data, bytes, NULL, 0, false);
++}
++
++/* The registers from REG on compared with BYTES at DATA; returns the number of differing registers. */
++static unsigned
++pa_compare(uint8_t addr, uint32_t reg, const uint8_t *data, unsigned bytes, int *err)
++{
++	unsigned bad = 0;
++	for (unsigned at = 0; at < bytes && !*err; at += PA_MAX) {
++		uint32_t v[PA_MAX / 4];
++		const unsigned n = (bytes - at > PA_MAX ? PA_MAX : bytes - at) / 4;
++		*err = pa_read_regs(addr, reg + at, v, n);
++		for (unsigned i = 0; i < n && !*err; i++) {
++			const uint8_t *d = data + at + 4 * i;
++			bad += v[i] != ((uint32_t)d[0] << 24 | (uint32_t)d[1] << 16 | (uint32_t)d[2] << 8 | d[3]);
++		}
++	}
++	return bad;
++}
++
++/* A file from the pinned firmware pack (tools/mkfwpack.py) into a new kalloc_data buffer. */
++static uint8_t *
++pa_fw_file(const char *name, uint32_t *size)
++{
++	static uint8_t dir[4096];
++	if (pandora_fw_read(0, dir, sizeof(dir)) || memcmp(dir, "PANDFW01", 8)) {
++		printf("PANDORA AMP: no firmware pack\n");
++		return NULL;
++	}
++	uint32_t n;
++	memcpy(&n, dir + 8, 4);
++	for (uint32_t i = 0; i < n && i < 63; i++) {
++		char ename[48];
++		uint64_t off, len;
++		memcpy(ename, dir + 16 + 64 * i, 48);
++		memcpy(&off, dir + 16 + 64 * i + 48, 8);
++		memcpy(&len, dir + 16 + 64 * i + 56, 8);
++		ename[47] = 0;
++		if (strcmp(ename, name) || len == 0 || len > (1u << 20)) {
++			continue;
++		}
++		uint8_t *buf = kalloc_data((vm_size_t)len, Z_WAITOK);
++		if (!buf || pandora_fw_read(off, buf, len)) {
++			printf("PANDORA AMP: %s: read failed\n", name);
++			if (buf) {
++				kfree_data(buf, (vm_size_t)len);
++			}
++			return NULL;
++		}
++		*size = (uint32_t)len;
++		return buf;
++	}
++	printf("PANDORA AMP: %s not in the firmware pack\n", name);
++	return NULL;
++}
++
++/* Every write of one file; with check, unpacked XM blocks are read back. Returns 0 or an errno. */
++static int
++pa_write_file(uint8_t addr, const char *what, const uint8_t *file, uint32_t size, bool coeff, const CsfwInfo *info,
++    bool check)
++{
++	CsfwIter it;
++	CsfwWrite w;
++	int e = coeff ? csfw_coeff_begin(&it, file, size) : csfw_wmfw_begin(&it, file, size);
++	unsigned writes = 0, bytes = 0, checked = 0, bad = 0;
++	int err = 0;
++	uint64_t t0 = mach_absolute_time(), ns;
++	while (e == CsfwOk && !err && (e = csfw_next(&it, info, &w)) == CsfwOk) {
++		err = pa_write_block(addr, w.reg, w.data, w.bytes);
++		writes++;
++		bytes += w.bytes;
++		if (!err && check && w.type == CSFW_XM_T) {
++			bad += pa_compare(addr, w.reg, w.data, w.bytes, &err);
++			checked += w.bytes / 4;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("PANDORA AMP: %#x %s: %u writes, %u bytes in %llu ms, %s%s; %u XM registers read back, %u differ\n", addr,
++	    what, writes, bytes, ns / 1000000, e == CsfwEnd ? "all of it" : "STOPPED", err ? " (I2C error)" : "", checked,
++	    bad);
++	return err ? err : (e == CsfwEnd ? 0 : EINVAL);
++}
++
++/* One amplifier's firmware, coefficients and music scene, checked; the DSP stays stopped. */
++static void
++pa_load(uint8_t addr, char side)
++{
++	static CsfwInfo info;
++	char name[48];
++	uint32_t fw_size = 0, c_size = 0, d_size = 0;
++	uint8_t *fw = pa_fw_file("cs35l43-dsp1-spk-prot.wmfw", &fw_size);
++	snprintf(name, sizeof(name), "%c-cs35l43-dsp1-spk-prot.bin", side);
++	uint8_t *c = pa_fw_file(name, &c_size);
++	snprintf(name, sizeof(name), "%c-cs35l43-delta-music-spk-prot.bin", side);
++	uint8_t *d = pa_fw_file(name, &d_size);
++	if (!fw || !c || !d) {
++		goto out;
++	}
++	int e = csfw_wmfw_info(fw, fw_size, &info);
++	if (e != CsfwOk) {
++		printf("PANDORA AMP: firmware algorithm list unreadable (%d)\n", e);
++		goto out;
++	}
++	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
++	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
++	uint32_t core = 0;
++	int err = pa_reg(addr, 0x2bc1000, &core);   /* HALO_CCM_CORE_CONTROL: the core stays stopped */
++	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
++	if (err || (core & 1u)) {
++		goto out;
++	}
++	if (pa_write_file(addr, "firmware", fw, fw_size, false, &info, false)) {
++		goto out;
++	}
++	/* What the DSP will read as its id header and algorithm list: as decoded from the file. */
++	uint32_t want[10 + 6 * CSFW_MAX_ALGS + 1];
++	const unsigned n = 10 + 6 * info.n_algs + 1;
++	const uint32_t *h = &info.core_id;
++	for (unsigned i = 0; i < 9; i++) {
++		want[i] = h[i];
++	}
++	want[9] = info.n_algs;
++	for (unsigned k = 0; k < 6 * info.n_algs; k++) {
++		want[10 + k] = (&info.algs[k / 6].id)[k % 6];
++	}
++	want[n - 1] = 0xbedead;
++	unsigned bad = 0;
++	for (unsigned at = 0; at < n && !err; at += PA_MAX / 4) {
++		uint32_t v[PA_MAX / 4];
++		const unsigned m = n - at > PA_MAX / 4 ? PA_MAX / 4 : n - at;
++		err = pa_read_regs(addr, CSFW_XM + 4 * at, v, m);
++		for (unsigned i = 0; i < m && !err; i++) {
++			bad += v[i] != want[at + i];
++		}
++	}
++	printf("PANDORA AMP: %#x id header and algorithm list read back: %u words, %u differ (err %d)\n", addr, n, bad, err);
++	/* The first PM instructions, as written (packed). */
++	CsfwIter it;
++	CsfwWrite w;
++	if (!err && csfw_wmfw_begin(&it, fw, fw_size) == CsfwOk) {
++		while (csfw_next(&it, &info, &w) == CsfwOk) {
++			if (w.type == CSFW_PM_PACKED_T) {
++				unsigned pbad = pa_compare(addr, w.reg, w.data, w.bytes < PA_MAX ? w.bytes : PA_MAX, &err);
++				printf("PANDORA AMP: %#x PM at %#x: first %u bytes read back, %u registers differ (err %d)\n", addr,
++				    w.reg, w.bytes < PA_MAX ? w.bytes : PA_MAX, pbad, err);
++				break;
++			}
++		}
++	}
++	if (err || pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
++		goto out;
++	}
++	(void)pa_write_file(addr, "music scene", d, d_size, true, &info, true);
++out:
++	if (fw) {
++		kfree_data(fw, (vm_size_t)fw_size);
++	}
++	if (c) {
++		kfree_data(c, (vm_size_t)c_size);
++	}
++	if (d) {
++		kfree_data(d, (vm_size_t)d_size);
++	}
++}
++
+ static void
+ pa_thread(void *arg, wait_result_t result)
+ {
+@@ -351,6 +546,9 @@ pa_thread(void *arg, wait_result_t result)
+ 		int e5 = pa_read_regs(amps[i], 0x10110, back, 3);
+ 		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
+ 		    back[0], back[1], back[2]);
++		if (pa_level >= 2 && !e1 && devid == 0x35a43) {
++			pa_load(amps[i], i ? 'T' : 'B');
++		}
+ 	}
+ out:
+ 	printf("PANDORA AMP: done\n");
+@@ -367,6 +565,7 @@ pandora_amp_init(void)
+ 	if (!on) {
+ 		return;
+ 	}
++	pa_level = on;
+ 	if (kernel_thread_start(pa_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/bsd/dev/pandora_csfw.c b/bsd/dev/pandora_csfw.c
+new file mode 100644
+index 0000000..0d93469
+--- /dev/null
++++ b/bsd/dev/pandora_csfw.c
+@@ -0,0 +1,273 @@
++/*
++ * Cirrus Logic Halo-core DSP files as register writes (pandora_csfw.h).
++ */
++#include "pandora_csfw.h"
++
++#define WMFW_HEADER   12u     /* magic, header length, rev (16), core, version */
++#define WMFW_SIZES    16u     /* xm, ym, pm, zm */
++#define WMFW_FOOTER   12u     /* timestamp (64), checksum */
++#define WMFW_REGION   8u      /* offset | type << 24, length */
++#define WMDR_HEADER   16u     /* magic, header length, version, core */
++#define WMDR_BLOCK    20u     /* offset (16), type (16), id, version, sample rate, length */
++#define ID_TERMINATOR 0xbedeadu
++
++_Static_assert(sizeof(CsfwAlg) == 6 * sizeof(uint32_t), "CsfwAlg is six words, filled in order");
++
++static uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
++}
++
++uint32_t
++csfw_region_reg(uint32_t type, uint32_t offset)
++{
++	switch (type) {
++	case CSFW_XM_T:
++		return CSFW_XM + offset * 4u;
++	case CSFW_YM_T:
++		return CSFW_YM + offset * 4u;
++	case CSFW_XM_PACKED_T:
++		return (CSFW_XM_PACKED + offset * 3u) & ~3u;
++	case CSFW_YM_PACKED_T:
++		return (CSFW_YM_PACKED + offset * 3u) & ~3u;
++	case CSFW_PM_PACKED_T:
++		return CSFW_PM_PACKED + offset * 5u;
++	default:
++		return 0;
++	}
++}
++
++void
++csfw_unpack(const uint8_t b[12], uint32_t w[4])
++{
++	const uint32_t r0 = be32(b), r1 = be32(b + 4), r2 = be32(b + 8);
++	w[0] = r0 & 0xffffffu;
++	w[1] = (r0 >> 24) | (r1 & 0xffffu) << 8;
++	w[2] = (r1 >> 16) | (r2 & 0xffu) << 16;
++	w[3] = r2 >> 8;
++}
++
++int
++csfw_wmfw_begin(CsfwIter *it, const uint8_t *file, uint32_t size)
++{
++	it->file = file;
++	it->size = size;
++	it->pos = 0;
++	it->coeff = 0;
++	if (size < WMFW_HEADER + WMFW_SIZES + WMFW_FOOTER) {
++		return CsfwShort;
++	}
++	if (file[0] != 'W' || file[1] != 'M' || file[2] != 'F' || file[3] != 'W') {
++		return CsfwBadMagic;
++	}
++	/* core 4 (Halo) at byte 10, file version 3 at byte 11 */
++	if (le32(file + 4) != WMFW_HEADER + WMFW_SIZES + WMFW_FOOTER || file[10] != 4 || file[11] != 3) {
++		return CsfwBadHeader;
++	}
++	it->pos = le32(file + 4);
++	return CsfwOk;
++}
++
++int
++csfw_coeff_begin(CsfwIter *it, const uint8_t *file, uint32_t size)
++{
++	it->file = file;
++	it->size = size;
++	it->pos = 0;
++	it->coeff = 1;
++	if (size < WMDR_HEADER) {
++		return CsfwShort;
++	}
++	if (file[0] != 'W' || file[1] != 'M' || file[2] != 'D' || file[3] != 'R') {
++		return CsfwBadMagic;
++	}
++	const uint32_t hl = le32(file + 4);
++	if (hl < WMDR_HEADER || hl > size) {
++		return CsfwBadHeader;
++	}
++	it->pos = hl;
++	return CsfwOk;
++}
++
++const CsfwAlg *
++csfw_find_alg(const CsfwInfo *info, uint32_t id)
++{
++	for (unsigned i = 0; info && i < info->n_algs; i++) {
++		if (info->algs[i].id == id) {
++			return &info->algs[i];
++		}
++	}
++	return 0;
++}
++
++static int
++next_wmfw(CsfwIter *it, CsfwWrite *w)
++{
++	while (it->pos < it->size) {
++		if (it->size - it->pos < WMFW_REGION) {
++			return CsfwShort;
++		}
++		const uint8_t *r = it->file + it->pos;
++		const uint32_t word = le32(r), bytes = le32(r + 4), type = word >> 24, offset = word & 0xffffffu;
++		if (bytes > it->size - it->pos - WMFW_REGION) {
++			return CsfwShort;
++		}
++		it->pos += WMFW_REGION + bytes;
++		switch (type) {
++		case CSFW_INFO_T:
++		case CSFW_NAME_T:
++		case CSFW_METADATA_T:
++		case CSFW_ALGDATA_T:
++			continue;
++		case CSFW_ABSOLUTE_T:
++			w->reg = offset;
++			break;
++		case CSFW_XM_T:
++		case CSFW_YM_T:
++		case CSFW_XM_PACKED_T:
++		case CSFW_YM_PACKED_T:
++		case CSFW_PM_PACKED_T:
++			w->reg = csfw_region_reg(type, offset);
++			break;
++		default:
++			return CsfwBadRegion;
++		}
++		if (bytes & 3u) {
++			return CsfwBadRegion;          /* whole 32-bit registers only */
++		}
++		w->type = type;
++		w->alg = w->ver = 0;
++		w->data = r + WMFW_REGION;
++		w->bytes = bytes;
++		return CsfwOk;
++	}
++	return CsfwEnd;
++}
++
++static int
++next_coeff(CsfwIter *it, const CsfwInfo *info, CsfwWrite *w)
++{
++	while (it->pos < it->size) {
++		if (it->size - it->pos < WMDR_BLOCK) {
++			return CsfwShort;
++		}
++		const uint8_t *b = it->file + it->pos;
++		const uint32_t offset = le16(b), type = le16(b + 2), id = le32(b + 4), bytes = le32(b + 16);
++		if (bytes > it->size - it->pos - WMDR_BLOCK) {
++			return CsfwShort;
++		}
++		it->pos += (WMDR_BLOCK + bytes + 3u) & ~3u;
++		if (it->pos > it->size) {
++			it->pos = it->size;
++		}
++		/* text, names and metadata carry their type in the upper byte here (cs_dsp_load_coeff) */
++		if (type == CSFW_NAME_T << 8 || type == CSFW_INFO_T << 8 || type == CSFW_METADATA_T << 8) {
++			continue;
++		}
++		if (type == CSFW_ABSOLUTE_T << 8) {
++			w->reg = offset;
++		} else if (type == CSFW_XM_T || type == CSFW_YM_T || type == CSFW_XM_PACKED_T || type == CSFW_YM_PACKED_T) {
++			const CsfwAlg *a = csfw_find_alg(info, id);
++			if (!a) {
++				return CsfwNoAlg;
++			}
++			const uint32_t base = (type == CSFW_YM_T || type == CSFW_YM_PACKED_T) ? a->ym_base : a->xm_base;
++			w->reg = csfw_region_reg(type, base) + offset;
++		} else {
++			return CsfwBadRegion;
++		}
++		if (bytes & 3u) {
++			return CsfwBadRegion;
++		}
++		w->type = type;
++		w->alg = id;
++		w->ver = le32(b + 8);
++		w->data = b + WMDR_BLOCK;
++		w->bytes = bytes;
++		return CsfwOk;
++	}
++	return CsfwEnd;
++}
++
++int
++csfw_next(CsfwIter *it, const CsfwInfo *info, CsfwWrite *w)
++{
++	return it->coeff ? next_coeff(it, info, w) : next_wmfw(it, w);
++}
++
++int
++csfw_wmfw_info(const uint8_t *file, uint32_t size, CsfwInfo *info)
++{
++	CsfwIter it;
++	CsfwWrite w;
++	int e = csfw_wmfw_begin(&it, file, size);
++	if (e != CsfwOk) {
++		return e;
++	}
++	const uint8_t *xm0 = 0;
++	uint32_t xm0_bytes = 0;
++	while ((e = next_wmfw(&it, &w)) == CsfwOk) {
++		if (w.type == CSFW_XM_PACKED_T && w.reg == CSFW_XM_PACKED) {
++			xm0 = w.data;
++			xm0_bytes = w.bytes;
++			break;
++		}
++	}
++	if (!xm0) {
++		return e < 0 ? e : CsfwNoAlg;
++	}
++	/* the words as the DSP reads them: id header (10 words), 6 per algorithm, then the terminator */
++	const uint32_t nwords = xm0_bytes / 12u * 4u;
++	uint32_t hdr[10];
++	if (nwords < 11) {
++		return CsfwShort;
++	}
++	for (unsigned i = 0; i < 10; i++) {
++		uint32_t q[4];
++		csfw_unpack(xm0 + i / 4u * 12u, q);
++		hdr[i] = q[i % 4u];
++	}
++	info->core_id = hdr[0];
++	info->block_rev = hdr[1];
++	info->vendor = hdr[2];
++	info->fw_id = hdr[3];
++	info->fw_ver = hdr[4];
++	info->xm_base = hdr[5];
++	info->xm_size = hdr[6];
++	info->ym_base = hdr[7];
++	info->ym_size = hdr[8];
++	info->n_algs = hdr[9];
++	if (info->n_algs > CSFW_MAX_ALGS) {
++		return CsfwTooMany;
++	}
++	if (10u + 6u * info->n_algs + 1u > nwords) {
++		return CsfwShort;
++	}
++	for (unsigned k = 0; k <= 6u * info->n_algs; k++) {
++		const unsigned i = 10u + k;
++		uint32_t q[4];
++		csfw_unpack(xm0 + i / 4u * 12u, q);
++		if (k == 6u * info->n_algs) {
++			if (q[i % 4u] != ID_TERMINATOR) {
++				return CsfwBadHeader;
++			}
++			break;
++		}
++		uint32_t *f = &info->algs[k / 6u].id;
++		f[k % 6u] = q[i % 4u];
++	}
++	return CsfwOk;
++}
+diff --git a/bsd/dev/pandora_csfw.h b/bsd/dev/pandora_csfw.h
+new file mode 100644
+index 0000000..735161b
+--- /dev/null
++++ b/bsd/dev/pandora_csfw.h
+@@ -0,0 +1,89 @@
++/*
++ * Cirrus Logic Halo-core DSP files for the CS35L43 speaker amplifiers, as the register writes they
++ * turn into. Two files per amplifier: the firmware (.wmfw, "WMFW" version 3, core 4 = Halo) and its
++ * coefficients (.bin, "WMDR"); the coefficient blocks are placed relative to the firmware's
++ * algorithms, whose list the firmware carries at XM word 0 (the id header the DSP itself reports).
++ * File layouts as Linux's include/linux/firmware/cirrus/wmfw.h; register placement as cs_dsp.c's
++ * cs_dsp_halo_region_to_reg and the CS35L41 family's DSP1 memory map. Checked against the phone's
++ * own files: all 27 algorithms decode, every coefficient block of both amplifiers and all five
++ * scene deltas resolves to one of them with the same version, and the decoded id header equals what
++ * the amplifier holds at 0x2800000 during Android playback.
++ * No allocation, no I/O: the caller hands in the file bytes and performs the writes.
++ */
++#ifndef PANDORA_CSFW_H
++#define PANDORA_CSFW_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The DSP1 memories in the amplifier's register space (32-bit registers, byte addresses). */
++#define CSFW_PM_PACKED   0x03800000u   /* 40-bit instructions, 5 bytes each */
++#define CSFW_XM_PACKED   0x02000000u   /* 24-bit words, 4 per 3 registers */
++#define CSFW_YM_PACKED   0x02c00000u
++#define CSFW_XM          0x02800000u   /* 24-bit words, one per register */
++#define CSFW_YM          0x03400000u
++
++/* Region and block types. */
++#define CSFW_XM_T        0x05u
++#define CSFW_YM_T        0x06u
++#define CSFW_PM_PACKED_T 0x10u
++#define CSFW_XM_PACKED_T 0x11u
++#define CSFW_YM_PACKED_T 0x12u
++#define CSFW_ABSOLUTE_T  0xf0u
++#define CSFW_ALGDATA_T   0xf2u
++#define CSFW_METADATA_T  0xfcu
++#define CSFW_NAME_T      0xfeu
++#define CSFW_INFO_T      0xffu
++
++#define CSFW_MAX_ALGS    48u
++
++enum {
++	CsfwOk = 0, CsfwEnd = 1, CsfwBadMagic = -1, CsfwBadHeader = -2, CsfwBadRegion = -3, CsfwNoAlg = -4,
++	CsfwTooMany = -5, CsfwShort = -6
++};
++
++typedef struct {
++	uint32_t id, ver, xm_base, xm_size, ym_base, ym_size;   /* bases and sizes in 24-bit words */
++} CsfwAlg;
++
++typedef struct {
++	uint32_t core_id, block_rev, vendor, fw_id, fw_ver, xm_base, xm_size, ym_base, ym_size;
++	unsigned n_algs;
++	CsfwAlg algs[CSFW_MAX_ALGS];
++} CsfwInfo;
++
++typedef struct {
++	const uint8_t *file;
++	uint32_t size, pos;
++	int coeff;                     /* 0 a .wmfw, 1 a .bin */
++} CsfwIter;
++
++/* One write: bytes at data to the registers from reg on (reg steps by 4 per 4 bytes). */
++typedef struct {
++	uint32_t reg, bytes, type, alg, ver;   /* alg, ver: a coefficient block's algorithm and its version field */
++	const uint8_t *data;
++} CsfwWrite;
++
++/* The register of word OFFSET of memory TYPE (cs_dsp_halo_region_to_reg); 0 for a type with no memory. */
++uint32_t csfw_region_reg(uint32_t type, uint32_t offset);
++/* Four 24-bit words from three 32-bit registers as they are on the wire (big endian): word 0 in
++ * the low bits of the first register. */
++void csfw_unpack(const uint8_t b[12], uint32_t w[4]);
++
++int csfw_wmfw_begin(CsfwIter *it, const uint8_t *file, uint32_t size);
++/* The id header and algorithm list from the firmware's packed XM region at word 0. */
++int csfw_wmfw_info(const uint8_t *file, uint32_t size, CsfwInfo *info);
++int csfw_coeff_begin(CsfwIter *it, const uint8_t *file, uint32_t size);
++/* The next write (text, names, metadata and algorithm descriptions are skipped); CsfwEnd at the
++ * end. For a .bin, info places each block at its algorithm's base. */
++int csfw_next(CsfwIter *it, const CsfwInfo *info, CsfwWrite *w);
++const CsfwAlg *csfw_find_alg(const CsfwInfo *info, uint32_t id);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

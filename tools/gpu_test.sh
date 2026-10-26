@@ -2,7 +2,7 @@
 # One GPU test round on the phone, from Git Bash:
 #
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
-#                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N]
+#                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N] [--amp-fw DIR]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -11,6 +11,9 @@
 #   2. trust cache for vktest and libvulkan_freedreno.dylib (tools/pgputest/mktc.py)
 #   3. the GPU firmware pack (tools/mkfwpack.py): gen80200_{gmu,sqe,zap} from out-root/fwpack_src,
 #      vktest, the Turnip library and files.txt installing them (bsd/dev/pandora_files.c)
+#      --amp-fw DIR: also the speaker amplifiers' firmware from DIR (Android's /odm/firmware:
+#      cs35l43-dsp1-spk-prot.wmfw, T-/B-cs35l43-dsp1-spk-prot.bin, T-/B-cs35l43-delta-music-spk-prot.bin),
+#      read by bsd/dev/pandora_amp.c; copies of phone files, kept outside the repo
 #   4. with --write-pack only: checks the pinned pack file on the phone and writes the new pack
 #      over it raw (tools/pinfile rawwrite), then hashes it back. Without the flag the phone's pack
 #      must already be this pack, or the run stops.
@@ -37,6 +40,7 @@ while [ $# -gt 0 ]; do
 	--hz) HZ=$2; shift 2 ;;                # display copies per second (sweetfb_hz; ios_test.sh default 30)
 	--no-vktest) SWAP=; shift ;;          # vktest not run (launchd restarts it all boot, mtltest with it)
 	--metal-from) METAL_FROM=$2; shift 2 ;;  # a local plugin build (tools/metal/build_plugin_linux.sh OUT, WSL path)
+	--amp-fw) AMP_FW=$2; shift 2 ;;        # the amplifiers' firmware files (Windows-side directory)
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -130,6 +134,12 @@ if [ $HAVE_METAL = 1 ]; then
 		printf 'com.apple.backboardd.plist 600 /private/var/mobile/Library/Preferences/com.apple.backboardd.plist\n' >> "$T/files.txt"
 		PARTS+=("$(winp "$T/com.apple.backboardd.plist")") ;;
 	esac
+fi
+if [ -n "${AMP_FW:-}" ]; then
+	for f in cs35l43-dsp1-spk-prot.wmfw T-cs35l43-dsp1-spk-prot.bin B-cs35l43-dsp1-spk-prot.bin 		T-cs35l43-delta-music-spk-prot.bin B-cs35l43-delta-music-spk-prot.bin; do
+		[ -f "$AMP_FW/$f" ] || { echo "no $AMP_FW/$f"; exit 1; }
+		PARTS+=("$(winp "$AMP_FW/$f")")
+	done
 fi
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"

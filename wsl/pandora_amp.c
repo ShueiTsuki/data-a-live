@@ -7,6 +7,12 @@
  * (0x0) and REVID (0x4), a block of the serial-port registers, writes the three interrupt masks
  * (all masked; nothing listens to the amps' interrupt lines) and reads them back. Audio itself goes
  * over TDM0 (GPIO 122-125, LPASS I2S0) from the audio DSP; nothing here plays sound.
+ * pandora_amp=2 also writes each amplifier's DSP firmware, its coefficients and the music scene
+ * from the pinned pack (tools/gpu_test.sh --amp-fw; files as Android's /odm/firmware), turned into
+ * register writes by pandora_csfw.c, and reads back what decides whether they landed: the
+ * algorithm list at XM word 0, every unpacked XM coefficient block, the start of PM. The DSP is
+ * not started, no calibration is written and the amplifier stays powered down: how Android starts
+ * the protection firmware is still being read (D:\DeepSeekHarness\ampfwcheck).
  * SDA GPIO 64, SCL GPIO 65 (function 1, qup3_se0, pull-up). GCC (gcc-kaanapali.c):
  * wrapper 3 votes 0x52018 bits 8-12, SE0 RCG 0xa8014. I2C FIFO transfers as
  * bsd/dev/sweet_touch.c (Linux i2c-qcom-geni.c), 100 kHz from XO.
@@ -23,8 +29,11 @@
 #include <pexpert/pexpert.h>
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
+#include <kern/kalloc.h>
+#include "pandora_csfw.h"
 
 extern kern_return_t thread_terminate(thread_t);
+extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 void pandora_amp_init(void);
 
@@ -56,7 +65,7 @@ void pandora_amp_init(void);
 #define SE_TX_WM    0x80cu
 #define SE_HW_TX    0xe24u
 #define SE_HW_RX    0xe28u
-#define PA_MAX      64u     /* bytes in one I2C message here */
+#define PA_MAX      128u    /* bytes in one I2C message here: the 32-word FIFOs */
 #define SE_DONE     (1u << 0)
 #define SE_NACK     (1u << 10)
 #define SE_ERRORS   (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | \
@@ -68,6 +77,7 @@ void pandora_amp_init(void);
 
 static vm_offset_t pa_gcc, pa_se, pa_tlmm;
 static int pa_chan;
+static int pa_level;
 static unsigned pa_txw = 1;   /* TX FIFO words per watermark interrupt (depth - 1, as i2c-qcom-geni) */
 
 static uint32_t
@@ -161,11 +171,17 @@ pa_abort(void)
 	pa_wr(pa_se, SE_IRQ_CLR, 0xffffffffu);
 }
 
-/* One I2C message: write or read up to PA_MAX bytes. stretch: no STOP (repeated start). */
+/*
+ * One I2C message: a write of a header (up to 4 bytes) followed by a body of any length, fed to the
+ * TX FIFO as it drains, or a read of up to PA_MAX bytes. stretch: no STOP (repeated start). The
+ * deadline follows the length: 20 ms plus 200 us a byte (100 kHz moves a byte in 90 us).
+ */
 static int
-pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+pa_xfer(uint8_t addr, const uint8_t *hdr, unsigned nh, const uint8_t *body, unsigned nb, uint8_t *rx, unsigned nr,
+    bool stretch)
 {
-	if (nt > PA_MAX || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
+	const unsigned nt = nh + nb;
+	if (nh > 4 || nt > (1u << 20) || nr > PA_MAX || (nt && nr) || (!nt && !nr)) {
 		return EINVAL;
 	}
 	for (unsigned i = 0; i < 5000 && (pa_rd(pa_se, SE_STATUS) & 1u); i++) {
@@ -179,7 +195,9 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 	pa_wr(pa_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
 	pa_wr(pa_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
 	unsigned got = 0, put = 0;
-	for (unsigned i = 0; i < 20000; i++) {
+	uint64_t deadline;
+	clock_interval_to_deadline(20000u + 200u * (nt + nr), NSEC_PER_USEC, &deadline);
+	while (mach_absolute_time() < deadline) {
 		uint32_t irq = pa_rd(pa_se, SE_IRQ);
 		if (irq & SE_ERRORS) {
 			int err = (irq & SE_NACK) ? ENXIO : EIO;
@@ -198,7 +216,7 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 			for (unsigned k = 0; k < pa_txw && put < nt; k++) {
 				uint32_t w = 0;
 				for (unsigned j = 0; j < 4 && put < nt; j++, put++) {
-					w |= (uint32_t)tx[put] << (8u * j);
+					w |= (uint32_t)(put < nh ? hdr[put] : body[put - nh]) << (8u * j);
 				}
 				pa_wr(pa_se, SE_TX, w);
 			}
@@ -222,6 +240,12 @@ pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, b
 	}
 	pa_abort();
 	return ETIMEDOUT;
+}
+
+static int
+pa_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+{
+	return pa_xfer(addr, tx, nt > 4 ? 4 : nt, nt > 4 ? tx + 4 : NULL, nt > 4 ? nt - 4 : 0, rx, nr, stretch);
 }
 
 static void
@@ -271,6 +295,177 @@ static int
 pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
 {
 	return pa_read_regs(addr, reg, val, 1);
+}
+
+/* BYTES (whole registers, big endian as in the DSP files) to the registers from REG on, in one message. */
+static int
+pa_write_block(uint8_t addr, uint32_t reg, const uint8_t *data, unsigned bytes)
+{
+	uint8_t a[4];
+	pa_be32(a, reg);
+	return pa_xfer(addr, a, 4, data, bytes, NULL, 0, false);
+}
+
+/* The registers from REG on compared with BYTES at DATA; returns the number of differing registers. */
+static unsigned
+pa_compare(uint8_t addr, uint32_t reg, const uint8_t *data, unsigned bytes, int *err)
+{
+	unsigned bad = 0;
+	for (unsigned at = 0; at < bytes && !*err; at += PA_MAX) {
+		uint32_t v[PA_MAX / 4];
+		const unsigned n = (bytes - at > PA_MAX ? PA_MAX : bytes - at) / 4;
+		*err = pa_read_regs(addr, reg + at, v, n);
+		for (unsigned i = 0; i < n && !*err; i++) {
+			const uint8_t *d = data + at + 4 * i;
+			bad += v[i] != ((uint32_t)d[0] << 24 | (uint32_t)d[1] << 16 | (uint32_t)d[2] << 8 | d[3]);
+		}
+	}
+	return bad;
+}
+
+/* A file from the pinned firmware pack (tools/mkfwpack.py) into a new kalloc_data buffer. */
+static uint8_t *
+pa_fw_file(const char *name, uint32_t *size)
+{
+	static uint8_t dir[4096];
+	if (pandora_fw_read(0, dir, sizeof(dir)) || memcmp(dir, "PANDFW01", 8)) {
+		printf("PANDORA AMP: no firmware pack\n");
+		return NULL;
+	}
+	uint32_t n;
+	memcpy(&n, dir + 8, 4);
+	for (uint32_t i = 0; i < n && i < 63; i++) {
+		char ename[48];
+		uint64_t off, len;
+		memcpy(ename, dir + 16 + 64 * i, 48);
+		memcpy(&off, dir + 16 + 64 * i + 48, 8);
+		memcpy(&len, dir + 16 + 64 * i + 56, 8);
+		ename[47] = 0;
+		if (strcmp(ename, name) || len == 0 || len > (1u << 20)) {
+			continue;
+		}
+		uint8_t *buf = kalloc_data((vm_size_t)len, Z_WAITOK);
+		if (!buf || pandora_fw_read(off, buf, len)) {
+			printf("PANDORA AMP: %s: read failed\n", name);
+			if (buf) {
+				kfree_data(buf, (vm_size_t)len);
+			}
+			return NULL;
+		}
+		*size = (uint32_t)len;
+		return buf;
+	}
+	printf("PANDORA AMP: %s not in the firmware pack\n", name);
+	return NULL;
+}
+
+/* Every write of one file; with check, unpacked XM blocks are read back. Returns 0 or an errno. */
+static int
+pa_write_file(uint8_t addr, const char *what, const uint8_t *file, uint32_t size, bool coeff, const CsfwInfo *info,
+    bool check)
+{
+	CsfwIter it;
+	CsfwWrite w;
+	int e = coeff ? csfw_coeff_begin(&it, file, size) : csfw_wmfw_begin(&it, file, size);
+	unsigned writes = 0, bytes = 0, checked = 0, bad = 0;
+	int err = 0;
+	uint64_t t0 = mach_absolute_time(), ns;
+	while (e == CsfwOk && !err && (e = csfw_next(&it, info, &w)) == CsfwOk) {
+		err = pa_write_block(addr, w.reg, w.data, w.bytes);
+		writes++;
+		bytes += w.bytes;
+		if (!err && check && w.type == CSFW_XM_T) {
+			bad += pa_compare(addr, w.reg, w.data, w.bytes, &err);
+			checked += w.bytes / 4;
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	printf("PANDORA AMP: %#x %s: %u writes, %u bytes in %llu ms, %s%s; %u XM registers read back, %u differ\n", addr,
+	    what, writes, bytes, ns / 1000000, e == CsfwEnd ? "all of it" : "STOPPED", err ? " (I2C error)" : "", checked,
+	    bad);
+	return err ? err : (e == CsfwEnd ? 0 : EINVAL);
+}
+
+/* One amplifier's firmware, coefficients and music scene, checked; the DSP stays stopped. */
+static void
+pa_load(uint8_t addr, char side)
+{
+	static CsfwInfo info;
+	char name[48];
+	uint32_t fw_size = 0, c_size = 0, d_size = 0;
+	uint8_t *fw = pa_fw_file("cs35l43-dsp1-spk-prot.wmfw", &fw_size);
+	snprintf(name, sizeof(name), "%c-cs35l43-dsp1-spk-prot.bin", side);
+	uint8_t *c = pa_fw_file(name, &c_size);
+	snprintf(name, sizeof(name), "%c-cs35l43-delta-music-spk-prot.bin", side);
+	uint8_t *d = pa_fw_file(name, &d_size);
+	if (!fw || !c || !d) {
+		goto out;
+	}
+	int e = csfw_wmfw_info(fw, fw_size, &info);
+	if (e != CsfwOk) {
+		printf("PANDORA AMP: firmware algorithm list unreadable (%d)\n", e);
+		goto out;
+	}
+	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
+	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
+	uint32_t core = 0;
+	int err = pa_reg(addr, 0x2bc1000, &core);   /* HALO_CCM_CORE_CONTROL: the core stays stopped */
+	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
+	if (err || (core & 1u)) {
+		goto out;
+	}
+	if (pa_write_file(addr, "firmware", fw, fw_size, false, &info, false)) {
+		goto out;
+	}
+	/* What the DSP will read as its id header and algorithm list: as decoded from the file. */
+	uint32_t want[10 + 6 * CSFW_MAX_ALGS + 1];
+	const unsigned n = 10 + 6 * info.n_algs + 1;
+	const uint32_t *h = &info.core_id;
+	for (unsigned i = 0; i < 9; i++) {
+		want[i] = h[i];
+	}
+	want[9] = info.n_algs;
+	for (unsigned k = 0; k < 6 * info.n_algs; k++) {
+		want[10 + k] = (&info.algs[k / 6].id)[k % 6];
+	}
+	want[n - 1] = 0xbedead;
+	unsigned bad = 0;
+	for (unsigned at = 0; at < n && !err; at += PA_MAX / 4) {
+		uint32_t v[PA_MAX / 4];
+		const unsigned m = n - at > PA_MAX / 4 ? PA_MAX / 4 : n - at;
+		err = pa_read_regs(addr, CSFW_XM + 4 * at, v, m);
+		for (unsigned i = 0; i < m && !err; i++) {
+			bad += v[i] != want[at + i];
+		}
+	}
+	printf("PANDORA AMP: %#x id header and algorithm list read back: %u words, %u differ (err %d)\n", addr, n, bad, err);
+	/* The first PM instructions, as written (packed). */
+	CsfwIter it;
+	CsfwWrite w;
+	if (!err && csfw_wmfw_begin(&it, fw, fw_size) == CsfwOk) {
+		while (csfw_next(&it, &info, &w) == CsfwOk) {
+			if (w.type == CSFW_PM_PACKED_T) {
+				unsigned pbad = pa_compare(addr, w.reg, w.data, w.bytes < PA_MAX ? w.bytes : PA_MAX, &err);
+				printf("PANDORA AMP: %#x PM at %#x: first %u bytes read back, %u registers differ (err %d)\n", addr,
+				    w.reg, w.bytes < PA_MAX ? w.bytes : PA_MAX, pbad, err);
+				break;
+			}
+		}
+	}
+	if (err || pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
+		goto out;
+	}
+	(void)pa_write_file(addr, "music scene", d, d_size, true, &info, true);
+out:
+	if (fw) {
+		kfree_data(fw, (vm_size_t)fw_size);
+	}
+	if (c) {
+		kfree_data(c, (vm_size_t)c_size);
+	}
+	if (d) {
+		kfree_data(d, (vm_size_t)d_size);
+	}
 }
 
 static void
@@ -351,6 +546,9 @@ pa_thread(void *arg, wait_result_t result)
 		int e5 = pa_read_regs(amps[i], 0x10110, back, 3);
 		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
 		    back[0], back[1], back[2]);
+		if (pa_level >= 2 && !e1 && devid == 0x35a43) {
+			pa_load(amps[i], i ? 'T' : 'B');
+		}
 	}
 out:
 	printf("PANDORA AMP: done\n");
@@ -367,6 +565,7 @@ pandora_amp_init(void)
 	if (!on) {
 		return;
 	}
+	pa_level = on;
 	if (kernel_thread_start(pa_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
