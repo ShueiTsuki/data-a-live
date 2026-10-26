@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index daf58fd..653b20c 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -7,7 +7,8 @@
+  * (0x0) and REVID (0x4), a block of the serial-port registers, writes the three interrupt masks
+  * (all masked; nothing listens to the amps' interrupt lines) and reads them back. Audio itself goes
+  * over TDM0 (GPIO 122-125, LPASS I2S0) from the audio DSP; nothing here plays sound.
+- * pandora_amp=2 also writes each amplifier's DSP firmware, its coefficients and the music scene
++ * pandora_amp=2 first resets both amps as cs35l43_probe does (they otherwise still run what Android
++ * loaded before the reboot), then writes each amplifier's DSP firmware, its coefficients and the music scene
+  * from the pinned pack (tools/gpu_test.sh --amp-fw; files as Android's /odm/firmware), turned into
+  * register writes by pandora_csfw.c, and reads back what decides whether they landed: the
+  * algorithm list at XM word 0, every unpacked XM coefficient block, the start of PM.
+@@ -676,6 +677,13 @@ pa_thread(void *arg, wait_result_t result)
+ 	}
+ 	pa_gpio(64, 1, 3, 2, -1);
+ 	pa_gpio(65, 1, 3, 2, -1);
++	if (pa_level >= 2) {
++		/* The amps keep power and Android's running DSP across a reboot (spk2: core control 0x81 at
++		 * our probe). cs35l43_probe resets them first: reset low, 2.0-2.1 ms, high, 2.0-2.1 ms. */
++		pa_gpio(10, 0, 0, 16, 0);
++		pa_gpio(54, 0, 0, 16, 0);
++		pa_sleep(3);
++	}
+ 	pa_gpio(10, 0, 0, 16, 1);
+ 	pa_gpio(54, 0, 0, 16, 1);
+ 	pa_sleep(5);
