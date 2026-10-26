@@ -8,9 +8,9 @@
 - 功放跑自己的扬声器保护固件：`/odm/firmware/cs35l43-dsp1-spk-prot.wmfw`，加两颗各自的 `T-/B-cs35l43-dsp1-spk-prot.bin`，再加按场景切换的调音 `T-/B-cs35l43-delta-{music,movie,video,navigation,voice}-spk-prot.bin`，默认 music。
 - 出厂校准：`/mnt/vendor/persist/audio/crus_calr.bin`（每台手机不同，两颗各一个值），由用户空间的 `libcrussp.so` 写进各自的 `DSP Set CAL_R`。
 - 喇叭路径的功放设置：`PCM Source = DSP`、`ASPTX Ref = Ref`、`AMP Enable = 1`、`Noise Gate = 16245`、`Amp Gain = 18`。
-- DSP 上的流程：共享内存端点 → PCM 解码 → PCM 转换 → SPR（扬声器保护）→ TDM 端点（模块 0x0700100E），48 kHz / 32 位 / 2 声道。设备 KV 是 `0xA2000000 = 0xA2000001`、`0xAC000000 = 0xAC000100`。另外还开了一条回声参考的发送图。
+- DSP 上的流程（DEEP_BUFFER 图，AGM 日志里带标签的模块）：共享内存端点 → PCM 解码 → PCM 转换 → 暂停 → SPR（会话时间，不是扬声器保护；2026-10-26 改正）→ TDM 端点（模块 0x0700100E），48 kHz / 32 位 / 2 声道，阻塞式共享内存 15360 字节 × 2 块。没标签的模块要从 ACDB 读。设备 KV 是 `0xA2000000 = 0xA2000001`、`0xAC000000 = 0xAC000100`。另外还开了一条回声参考的发送图。安卓不用 MMAP/ULL 放喇叭（资源管理器的喇叭设备没有声明）。
 - 放音时安卓的内核会向 DSP 发 PRM 的硬件资源申请和释放（0x0100100F / 0x01001010），多半是 TDM 位时钟。内容还没查到。
-- 主处理器这侧开着 Dolby DAP 音效，44.1 kHz 的内容在 AudioFlinger 里先转成 48 kHz。
+- 开着 Dolby DAP 音效（效果名 `DAP_offload`、驱动 `DlbQdspGefDriver`，可能跑在高通 DSP 图里、主处理器只下参数，待 ACDB 确认），44.1 kHz 的内容在 AudioFlinger 里先转成 48 kHz。
 - 听筒：同一颗 T 功放。GPIO174 高是喇叭、低是听筒；听筒路径功放直通，增益 13。
 
 由一个只读的助手读 UniXNU-sheng（HEAD d76556b）的音频代码和我们的设备树后整理（英文原文，未改）。已抽查：pandora 两颗 CS35L43 在 `i2c@1980000`，地址 0x40（"B"，复位 GPIO10，中断 GPIO11）和 0x42（"T"，复位 GPIO54，中断 GPIO47）——与设备树一致。其余条目动手前逐条对照原文核实。
