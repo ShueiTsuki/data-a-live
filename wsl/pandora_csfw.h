@@ -61,6 +61,11 @@ typedef struct {
 	int coeff;                     /* 0 a .wmfw, 1 a .bin */
 } CsfwIter;
 
+/* A firmware control: its register, memory type, word offset from its algorithm's base, length in bytes. */
+typedef struct {
+	uint32_t reg, type, offset, bytes;
+} CsfwCtl;
+
 /* One write: bytes at data to the registers from reg on (reg steps by 4 per 4 bytes). */
 typedef struct {
 	uint32_t reg, bytes, type, alg, ver;   /* alg, ver: a coefficient block's algorithm and its version field */
@@ -81,6 +86,10 @@ int csfw_coeff_begin(CsfwIter *it, const uint8_t *file, uint32_t size);
  * end. For a .bin, info places each block at its algorithm's base. */
 int csfw_next(CsfwIter *it, const CsfwInfo *info, CsfwWrite *w);
 const CsfwAlg *csfw_find_alg(const CsfwInfo *info, uint32_t id);
+/* Control NAME (its short name, e.g. "AUDIO_STATE") of algorithm ALG, from the algorithm
+ * descriptions in the .wmfw (file version 3); ALG may be the firmware's own id, whose controls sit
+ * at the id header's bases. CsfwNoAlg if the algorithm or the control is not there. */
+int csfw_find_ctl(const uint8_t *file, uint32_t size, const CsfwInfo *info, uint32_t alg, const char *name, CsfwCtl *ctl);
 
 #ifdef __cplusplus
 }

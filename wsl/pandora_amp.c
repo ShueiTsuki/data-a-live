@@ -10,13 +10,18 @@
  * pandora_amp=2 also writes each amplifier's DSP firmware, its coefficients and the music scene
  * from the pinned pack (tools/gpu_test.sh --amp-fw; files as Android's /odm/firmware), turned into
  * register writes by pandora_csfw.c, and reads back what decides whether they landed: the
- * algorithm list at XM word 0, every unpacked XM coefficient block, the start of PM. The DSP is
- * not started, no calibration is written and the amplifier stays powered down: how Android starts
- * the protection firmware is still being read (D:\DeepSeekHarness\ampfwcheck).
+ * algorithm list at XM word 0, every unpacked XM coefficient block, the start of PM.
+ * pandora_amp=3 also does what Android does around that at boot (cs35l43_dlkm.ko, read in
+ * D:\DeepSeekHarness\ampfwcheck\VERIFY.md): the register patch and the DSP's sense inputs before the
+ * load, then starts the Halo core (memory ready, MPU opened, core out of reset) and checks it runs:
+ * core control and MPU lock as Android's idle dump, the firmware's HALO_STATE and its heartbeat
+ * counting. The amplifier itself stays powered down (no sound) and no calibration is written yet.
  * SDA GPIO 64, SCL GPIO 65 (function 1, qup3_se0, pull-up). GCC (gcc-kaanapali.c):
  * wrapper 3 votes 0x52018 bits 8-12, SE0 RCG 0xa8014. I2C FIFO transfers as
  * bsd/dev/sweet_touch.c (Linux i2c-qcom-geni.c), 100 kHz from XO.
  * Boot-arg pandora_amp=1 turns it on (default off).
+ * pandora_gauge=1 looks at the fuel gauge's bus (wrapper 1 SE5, 0xa94000) without using it: who
+ * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -35,6 +40,7 @@
 extern kern_return_t thread_terminate(thread_t);
 extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+extern void ml_io_unmap(vm_offset_t, vm_size_t);
 void pandora_amp_init(void);
 
 #define PA_GCC_PA   0x00100000u
@@ -74,10 +80,19 @@ void pandora_amp_init(void);
 #define SE_EVENTS   (SE_DONE | SE_ERRORS | (1u << 26) | (1u << 27) | SE_TX_WM_IRQ)
 #define SE_PACK0    0x0007f8feu
 #define SE_PACK1    0x000ffefeu
+/* The CS35L43's Halo DSP (cs_dsp base 0x2b80000): core control (HALO_CCM_CORE_CONTROL), MPU. */
+#define PA_HALO_CORE 0x2bc1000u
+#define PA_HALO_MPU  0x2bc3000u
+#define PA_MPU_LOCK  (PA_HALO_MPU + 0x140u)
+/* The gauge's bus: wrapper 1 SE5 and its GCC votes (gcc-kaanapali.c; battcheck VERIFY.md). */
+#define PG_SE_PA     0x00a94000u
+#define PG_VOTE      0x52008u
+#define PG_VOTE_BITS ((0xfu << 18) | (1u << 27))   /* wrapper 1 core (18, 19), m_axi (20), s_ahb (21); SE5 (27) */
 
 static vm_offset_t pa_gcc, pa_se, pa_tlmm;
 static int pa_chan;
 static int pa_level;
+static int pa_gauge_level;
 static unsigned pa_txw = 1;   /* TX FIFO words per watermark interrupt (depth - 1, as i2c-qcom-geni) */
 
 static uint32_t
@@ -297,6 +312,12 @@ pa_reg(uint8_t addr, uint32_t reg, uint32_t *val)
 	return pa_read_regs(addr, reg, val, 1);
 }
 
+static int
+pa_write1(uint8_t addr, uint32_t reg, uint32_t val)
+{
+	return pa_write_regs(addr, reg, &val, 1);
+}
+
 /* BYTES (whole registers, big endian as in the DSP files) to the registers from REG on, in one message. */
 static int
 pa_write_block(uint8_t addr, uint32_t reg, const uint8_t *data, unsigned bytes)
@@ -386,7 +407,66 @@ pa_write_file(uint8_t addr, const char *what, const uint8_t *file, uint32_t size
 	return err ? err : (e == CsfwEnd ? 0 : EINVAL);
 }
 
-/* One amplifier's firmware, coefficients and music scene, checked; the DSP stays stopped. */
+/* A firmware control's register (by its short name), or 0. */
+static uint32_t
+pa_ctl(const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info, uint32_t alg, const char *name)
+{
+	CsfwCtl c;
+	int e = csfw_find_ctl(fw, fw_size, info, alg, name, &c);
+	if (e != CsfwOk) {
+		printf("PANDORA AMP: control %#x %s not found (%d)\n", alg, name, e);
+		return 0;
+	}
+	return c.reg;
+}
+
+/*
+ * Start the loaded DSP as Android does at boot: cs35l43_dsp_preload_ev writes PWRMGT_CTL (0x2900)
+ * MEM_RDY, then cs_dsp_run opens the MPU (cs_dsp_halo_configure_mpu: 23 writes, lock_regions
+ * 0xffffffff from cs35l43_dsp_init) and takes the core out of reset (cs_dsp_halo_start_core: set
+ * RESET | EN, then clear RESET). Android's idle dump: core control 0x81, MPU lock reads 0xbeef,
+ * HALO_STATE 2, HALO_HEARTBEAT counting with no audio clock.
+ */
+static void
+pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
+{
+	static const uint16_t group[5] = {0x0, 0x4, 0x8, 0xc, 0x14};   /* XMEM, YMEM, WINDOW, XREG, YREG access */
+	int err = pa_write1(addr, 0x2900, 2);
+	err = err ? err : pa_write1(addr, PA_MPU_LOCK, 0x5555);
+	err = err ? err : pa_write1(addr, PA_MPU_LOCK, 0xaaaa);
+	for (unsigned g = 0; g < 4 && !err; g++) {
+		for (unsigned k = 0; k < 5 && !err; k++) {
+			err = pa_write1(addr, PA_HALO_MPU + 0x18u * g + group[k], 0xffffffffu);
+		}
+	}
+	err = err ? err : pa_write1(addr, PA_MPU_LOCK, 0);
+	uint32_t core = 0;
+	err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+	err = err ? err : pa_write1(addr, PA_HALO_CORE, core | 0x201u);
+	err = err ? err : pa_write1(addr, PA_HALO_CORE, (core | 0x201u) & ~0x200u);
+	if (err) {
+		printf("PANDORA AMP: %#x DSP start: I2C error %d\n", addr, err);
+		return;
+	}
+	pa_sleep(20);
+	const uint32_t r_state = pa_ctl(fw, fw_size, info, info->fw_id, "HALO_STATE");
+	const uint32_t r_beat = pa_ctl(fw, fw_size, info, info->fw_id, "HALO_HEARTBEAT");
+	const uint32_t r_audio = pa_ctl(fw, fw_size, info, 0x5f212, "AUDIO_STATE");
+	uint32_t lock = 0, mem = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
+	err = pa_reg(addr, PA_HALO_CORE, &core);
+	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+	err = err ? err : pa_reg(addr, 0x2900, &mem);
+	err = err || !r_state ? err : pa_reg(addr, r_state, &state);
+	err = err || !r_beat ? err : pa_reg(addr, r_beat, &beat0);
+	pa_sleep(100);
+	err = err || !r_beat ? err : pa_reg(addr, r_beat, &beat1);
+	err = err || !r_audio ? err : pa_reg(addr, r_audio, &audio);
+	printf("PANDORA AMP: %#x DSP started: core control %#x (Android 0x81), MPU lock %#x (0xbeef), 0x2900 %#x, "
+	    "HALO_STATE %#x (2), heartbeat %#x -> %#x in 100 ms, AUDIO_STATE %#x, err %d\n", addr, core, lock, mem, state,
+	    beat0, beat1, audio, err);
+}
+
+/* One amplifier's firmware, coefficients and music scene, checked; with pandora_amp=3 started. */
 static void
 pa_load(uint8_t addr, char side)
 {
@@ -409,10 +489,22 @@ pa_load(uint8_t addr, char side)
 	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
 	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
 	uint32_t core = 0;
-	int err = pa_reg(addr, 0x2bc1000, &core);   /* HALO_CCM_CORE_CONTROL: the core stays stopped */
+	int err = pa_reg(addr, PA_HALO_CORE, &core);   /* the core must be stopped while it is written */
 	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
 	if (err || (core & 1u)) {
 		goto out;
+	}
+	if (pa_level >= 3) {
+		/* cs35l43_probe's register patch, then cs35l43_dsp_init's DSP inputs 3-6 (the sense signals) */
+		static const uint32_t pre[6][2] = {{0x7404, 0x11330000}, {0x3850, 0x50000802}, {0x4c48, 0x29},
+		                                   {0x4c4c, 0x19}, {0x4c50, 0x18}, {0x4c54, 0x28}};
+		for (unsigned i = 0; i < 6 && !err; i++) {
+			err = pa_write1(addr, pre[i][0], pre[i][1]);
+		}
+		if (err) {
+			printf("PANDORA AMP: %#x patch and DSP inputs: I2C error %d\n", addr, err);
+			goto out;
+		}
 	}
 	if (pa_write_file(addr, "firmware", fw, fw_size, false, &info, false)) {
 		goto out;
@@ -455,7 +547,9 @@ pa_load(uint8_t addr, char side)
 	if (err || pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
 		goto out;
 	}
-	(void)pa_write_file(addr, "music scene", d, d_size, true, &info, true);
+	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
+		pa_start(addr, fw, fw_size, &info);
+	}
 out:
 	if (fw) {
 		kfree_data(fw, (vm_size_t)fw_size);
@@ -468,6 +562,59 @@ out:
 	}
 }
 
+/*
+ * The fuel gauge's bus, looked at and not used. Android drives it from the apps processor
+ * (i2c@a94000, qcom,shared, GSI command word 0x00300001), but the SOCCP's device tree has this SE's
+ * pins and its firmware the clock name, so first: who has its clocks on, how the pins are set, and
+ * what the SE says (firmware, FIFO or GSI mode, busy) over 200 ms. Our votes are taken back.
+ */
+static void
+pa_gauge(void)
+{
+	static const uint32_t br[5] = {0x2315c, 0x23148, 0x23140, 0x23144, 0x18508};
+	const uint32_t vote = pa_rd(pa_gcc, PG_VOTE);
+	printf("PANDORA GAUGE: vote %#x; branches 2315c %#x 23148 %#x 23140 %#x 23144 %#x 18508 %#x; RCG cmd %#x cfg %#x; "
+	    "GPIO52 %#x/%#x GPIO53 %#x/%#x\n", vote, pa_rd(pa_gcc, br[0]), pa_rd(pa_gcc, br[1]), pa_rd(pa_gcc, br[2]),
+	    pa_rd(pa_gcc, br[3]), pa_rd(pa_gcc, br[4]), pa_rd(pa_gcc, 0x18518), pa_rd(pa_gcc, 0x1851c),
+	    pa_rd(pa_tlmm, PA_GPIO(52)), pa_rd(pa_tlmm, PA_GPIO(52) + 4), pa_rd(pa_tlmm, PA_GPIO(53)),
+	    pa_rd(pa_tlmm, PA_GPIO(53) + 4));
+	pa_wr(pa_gcc, PG_VOTE, vote | PG_VOTE_BITS);
+	bool on = true;
+	for (unsigned i = 0; i < 5 && on; i++) {
+		for (unsigned t = 0; t < 10000 && !pa_on(br[i]); t++) {
+			delay(1);
+		}
+		on = pa_on(br[i]);
+		if (!on) {
+			printf("PANDORA GAUGE: clock %#x stays off (%#x); SE not read\n", br[i], pa_rd(pa_gcc, br[i]));
+		}
+	}
+	vm_offset_t se = on ? ml_io_map_unmappable(PG_SE_PA, 0x4000, VM_WIMG_IO) : 0;
+	if (se) {
+		printf("PANDORA GAUGE: SE5 fw %#x if_disable %#x dma_mode %#x status %#x cmd %#x irq %#x irq_en %#x "
+		    "tx %#x rx %#x clk_sel %#x m_clk %#x scl %#x hw_tx %#x hw_rx %#x gsi_ev %#x se_irq_en %#x\n",
+		    pa_rd(se, SE_FW), pa_rd(se, SE_IF_DIS), pa_rd(se, SE_DMA), pa_rd(se, SE_STATUS), pa_rd(se, SE_CMD),
+		    pa_rd(se, SE_IRQ), pa_rd(se, SE_IRQ_EN), pa_rd(se, SE_TX_COUNT), pa_rd(se, SE_RX_COUNT),
+		    pa_rd(se, SE_CLK_SEL), pa_rd(se, SE_MCLK), pa_rd(se, SE_SCL), pa_rd(se, SE_HW_TX), pa_rd(se, SE_HW_RX),
+		    pa_rd(se, 0xe18), pa_rd(se, 0xe1c));
+		/* someone else using it shows as a running command or changing interrupt status */
+		unsigned busy = 0, changed = 0;
+		uint32_t irq = pa_rd(se, SE_IRQ);
+		for (unsigned i = 0; i < 200; i++) {
+			busy += pa_rd(se, SE_STATUS) & 1u;
+			const uint32_t now = pa_rd(se, SE_IRQ);
+			changed += now != irq;
+			irq = now;
+			pa_sleep(1);
+		}
+		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
+		    busy, changed);
+		ml_io_unmap(se, 0x4000);
+	}
+	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~vote));
+	printf("PANDORA GAUGE: vote back to %#x\n", pa_rd(pa_gcc, PG_VOTE));
+}
+
 static void
 pa_thread(void *arg, wait_result_t result)
 {
@@ -478,6 +625,12 @@ pa_thread(void *arg, wait_result_t result)
 	pa_se = ml_io_map_unmappable(PA_SE_PA, 0x4000, VM_WIMG_IO);
 	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xa0000, VM_WIMG_IO);
 	if (!pa_gcc || !pa_se || !pa_tlmm) {
+		goto out;
+	}
+	if (pa_gauge_level) {
+		pa_gauge();
+	}
+	if (!pa_level) {
 		goto out;
 	}
 	printf("PANDORA AMP: pins before: 10=%#x/%u 54=%#x/%u 64=%#x 65=%#x vote=%#x\n",
@@ -560,12 +713,14 @@ void
 pandora_amp_init(void)
 {
 	thread_t thread;
-	int on = 0;
+	int on = 0, gauge = 0;
 	(void)PE_parse_boot_argn("pandora_amp", &on, sizeof(on));
-	if (!on) {
+	(void)PE_parse_boot_argn("pandora_gauge", &gauge, sizeof(gauge));
+	if (!on && !gauge) {
 		return;
 	}
 	pa_level = on;
+	pa_gauge_level = gauge;
 	if (kernel_thread_start(pa_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

@@ -208,6 +208,116 @@ csfw_next(CsfwIter *it, const CsfwInfo *info, CsfwWrite *w)
 	return it->coeff ? next_coeff(it, info, w) : next_wmfw(it, w);
 }
 
+/* A length-prefixed string at *pos (LB = 1 or 2 length bytes), padded to 4 bytes with its length. */
+static int
+text_at(const uint8_t *b, uint32_t n, uint32_t *pos, unsigned lb, const uint8_t **s, uint32_t *len)
+{
+	if (n - *pos < lb) {
+		return CsfwShort;
+	}
+	*len = lb == 1 ? b[*pos] : le16(b + *pos);
+	if (*len > n - *pos - lb) {
+		return CsfwShort;
+	}
+	*s = b + *pos + lb;
+	*pos += (*len + lb + 3u) & ~3u;
+	if (*pos > n) {
+		*pos = n;
+	}
+	return CsfwOk;
+}
+
+/* Algorithm description: id, name (1), description (2), count, then per control
+ * {offset (16), type (16), size, name (1), full name (1), description (2), control type (16), flags (16),
+ * length}; strings are padded to 4 bytes with their length (cs_dsp_coeff_parse_alg/_coeff). */
+static int
+find_in_algdata(const uint8_t *b, uint32_t n, uint32_t alg, const char *name, CsfwCtl *ctl)
+{
+	uint32_t pos = 4, len;
+	const uint8_t *s;
+	if (n < 4 || le32(b) != alg) {
+		return CsfwNoAlg;
+	}
+	if (text_at(b, n, &pos, 1, &s, &len) || text_at(b, n, &pos, 2, &s, &len) || n - pos < 4) {
+		return CsfwShort;
+	}
+	const uint32_t count = le32(b + pos);
+	pos += 4;
+	uint32_t want = 0;
+	while (name[want]) {
+		want++;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (n - pos < 8) {
+			return CsfwShort;
+		}
+		const uint32_t start = pos, offset = le16(b + pos), type = le16(b + pos + 2), size = le32(b + pos + 4);
+		if (size > n - pos - 8) {
+			return CsfwShort;
+		}
+		uint32_t p = pos + 8, full, desc;
+		const uint8_t *fs, *ds;
+		if (text_at(b, pos + 8 + size, &p, 1, &s, &len) || text_at(b, pos + 8 + size, &p, 1, &fs, &full) ||
+		    text_at(b, pos + 8 + size, &p, 2, &ds, &desc) || pos + 8 + size - p < 8) {
+			return CsfwShort;
+		}
+		int same = len == want;
+		for (uint32_t k = 0; same && k < len; k++) {
+			same = s[k] == (uint8_t)name[k];
+		}
+		if (same) {
+			ctl->type = type;
+			ctl->offset = offset;
+			ctl->bytes = le32(b + p + 4);
+			return CsfwOk;
+		}
+		pos = start + 8 + size;
+	}
+	return CsfwNoAlg;
+}
+
+int
+csfw_find_ctl(const uint8_t *file, uint32_t size, const CsfwInfo *info, uint32_t alg, const char *name, CsfwCtl *ctl)
+{
+	CsfwIter it;
+	int e = csfw_wmfw_begin(&it, file, size);
+	if (e != CsfwOk) {
+		return e;
+	}
+	uint32_t xm_base, ym_base;
+	const CsfwAlg *a = csfw_find_alg(info, alg);
+	if (a) {
+		xm_base = a->xm_base;
+		ym_base = a->ym_base;
+	} else if (alg == info->fw_id) {
+		xm_base = info->xm_base;
+		ym_base = info->ym_base;
+	} else {
+		return CsfwNoAlg;
+	}
+	while (it.pos < size) {
+		if (size - it.pos < WMFW_REGION) {
+			return CsfwShort;
+		}
+		const uint8_t *r = file + it.pos;
+		const uint32_t type = le32(r) >> 24, bytes = le32(r + 4);
+		if (bytes > size - it.pos - WMFW_REGION) {
+			return CsfwShort;
+		}
+		it.pos += WMFW_REGION + bytes;
+		if (type != CSFW_ALGDATA_T || (e = find_in_algdata(r + WMFW_REGION, bytes, alg, name, ctl)) == CsfwNoAlg) {
+			continue;
+		}
+		if (e != CsfwOk) {
+			return e;
+		}
+		const uint32_t base = (ctl->type == CSFW_YM_T || ctl->type == CSFW_YM_PACKED_T) ? ym_base : xm_base;
+		ctl->reg = csfw_region_reg(ctl->type, base + ctl->offset);
+		return ctl->reg ? CsfwOk : CsfwBadRegion;
+	}
+	return CsfwNoAlg;
+}
+
 int
 csfw_wmfw_info(const uint8_t *file, uint32_t size, CsfwInfo *info)
 {

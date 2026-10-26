@@ -55,6 +55,83 @@ region(uint8_t *f, uint32_t at, uint32_t type, uint32_t offset, const uint8_t *d
 	return at + 8 + n;
 }
 
+/* A length-prefixed string (LB length bytes), padded to 4 bytes with its length. */
+static uint32_t
+put_text(uint8_t *b, uint32_t at, unsigned lb, const char *s)
+{
+	const uint32_t n = (uint32_t)strlen(s);
+	b[at] = (uint8_t)n;
+	if (lb == 2) {
+		b[at + 1] = (uint8_t)(n >> 8);
+	}
+	memcpy(b + at + lb, s, n);
+	return at + ((n + lb + 3u) & ~3u);
+}
+
+/* One control of an algorithm description. */
+static uint32_t
+put_ctl(uint8_t *b, uint32_t at, uint32_t offset, uint32_t type, const char *name, uint32_t len)
+{
+	uint32_t p = put_text(b, at + 8, 1, name);
+	p = put_text(b, p, 1, "FULL_NAME_OF_IT");
+	p = put_text(b, p, 2, "a description");
+	put_le32(b + p, 0x1000);          /* control type, flags */
+	put_le32(b + p + 4, len);
+	p += 8;
+	put_le32(b + at, offset | type << 16);
+	put_le32(b + at + 4, p - at - 8);
+	return p;
+}
+
+/* Algorithm descriptions: controls found by name at their algorithm's base (and the firmware's own). */
+static void
+controls(void)
+{
+	uint32_t words[24] = {0x40000, 0x30000, 2, 0x1234, 0x10203, 0x10, 0x20, 0x30, 0x40, 2,
+	                      0x5f200, 0x10100, 0x100, 0x8, 0, 0, 0x5f201, 0x20000, 0x200, 0x4, 0x40, 0x2,
+	                      0xbedead, 0};
+	uint8_t xm[72], f[1024], d[256];
+	for (unsigned i = 0; i < 6; i++) {
+		pack4(xm + 12 * i, words + 4 * i);
+	}
+	memset(f, 0, sizeof(f));
+	memcpy(f, "WMFW", 4);
+	put_le32(f + 4, 40);
+	f[10] = 4;
+	f[11] = 3;
+	uint32_t at = region(f, 40, CSFW_XM_PACKED_T, 0, xm, sizeof(xm));
+	memset(d, 0, sizeof(d));
+	put_le32(d, 0x5f201);
+	uint32_t q = put_text(d, 4, 1, "ALG");
+	q = put_text(d, q, 2, "second algorithm");
+	put_le32(d + q, 2);
+	q = put_ctl(d, q + 4, 3, CSFW_XM_T, "X", 4);
+	q = put_ctl(d, q, 5, CSFW_YM_T, "YY", 8);
+	at = region(f, at, CSFW_ALGDATA_T, 0, d, q);
+	memset(d, 0, sizeof(d));
+	put_le32(d, 0x1234);
+	q = put_text(d, 4, 1, "FW");
+	q = put_text(d, q, 2, "");
+	put_le32(d + q, 1);
+	q = put_ctl(d, q + 4, 1, CSFW_XM_T, "HB", 4);
+	const uint32_t last = at;
+	at = region(f, at, CSFW_ALGDATA_T, 0, d, q);
+	CsfwInfo info;
+	CsfwCtl c;
+	CHECK(csfw_wmfw_info(f, at, &info) == CsfwOk);
+	CHECK(csfw_find_ctl(f, at, &info, 0x5f201, "X", &c) == CsfwOk && c.type == CSFW_XM_T && c.offset == 3 &&
+	    c.bytes == 4 && c.reg == CSFW_XM + 4 * (0x200 + 3));
+	CHECK(csfw_find_ctl(f, at, &info, 0x5f201, "YY", &c) == CsfwOk && c.type == CSFW_YM_T &&
+	    c.reg == CSFW_YM + 4 * (0x40 + 5) && c.bytes == 8);
+	CHECK(csfw_find_ctl(f, at, &info, 0x1234, "HB", &c) == CsfwOk && c.reg == CSFW_XM + 4 * (0x10 + 1));
+	CHECK(csfw_find_ctl(f, at, &info, 0x5f201, "Y", &c) == CsfwNoAlg);
+	CHECK(csfw_find_ctl(f, at, &info, 0x5f200, "X", &c) == CsfwNoAlg);
+	CHECK(csfw_find_ctl(f, at, &info, 0x5f202, "X", &c) == CsfwNoAlg);
+	/* the firmware's own description cut inside its control */
+	put_le32(f + last + 4, q - 6);
+	CHECK(csfw_find_ctl(f, last + 8 + q - 6, &info, 0x1234, "HB", &c) == CsfwShort);
+}
+
 static void
 builtin(void)
 {
@@ -176,6 +253,24 @@ phone(const char *dir, const char *dump)
 	}
 	CsfwInfo info;
 	CHECK(csfw_wmfw_info(fw, size, &info) == CsfwOk);
+	/* where the controls the driver uses are; the five with addresses were found in Android's
+	 * register dumps holding the calibration file's values and the playback state */
+	static const struct {
+		uint32_t alg;
+		const char *name;
+		uint32_t reg;
+	} ctls[] = {{0x5f212, "AUDIO_STATE", 0x280105c}, {0x5f224, "ALLOW_ACT_BOOT", 0x280125c},
+	            {0x5f210, "CAL_R_SEL", 0x28033f4}, {0x5f210, "CAL_R_INIT", 0x2803278}, {0x5f210, "CAL_R", 0x280326c},
+	            {0x1820d6, "HALO_STATE", 0}, {0x1820d6, "HALO_HEARTBEAT", 0}};
+	uint32_t ctl_reg[sizeof(ctls) / sizeof(ctls[0])];
+	for (unsigned i = 0; i < sizeof(ctls) / sizeof(ctls[0]); i++) {
+		CsfwCtl c = {0, 0, 0, 0};
+		const int e = csfw_find_ctl(fw, size, &info, ctls[i].alg, ctls[i].name, &c);
+		printf("control %#x %-15s type %#x offset %#x %u bytes at %#x\n", ctls[i].alg, ctls[i].name, c.type, c.offset,
+		    c.bytes, c.reg);
+		CHECK(e == CsfwOk && (!ctls[i].reg || c.reg == ctls[i].reg));
+		ctl_reg[i] = c.reg;
+	}
 	printf("firmware: vendor %u id %#x version %u.%u.%u, %u algorithms\n", info.vendor, info.fw_id, info.fw_ver >> 16,
 	    info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
 	CsfwIter it;
@@ -233,9 +328,17 @@ phone(const char *dir, const char *dump)
 		unsigned matched = 0;
 		while (fp && fgets(line, sizeof(line), fp)) {
 			unsigned long a, v;
-			if (sscanf(line, "%lx: %lx", &a, &v) == 2 && a >= CSFW_XM && a < CSFW_XM + 4 * n) {
+			if (sscanf(line, "%lx: %lx", &a, &v) != 2) {
+				continue;
+			}
+			if (a >= CSFW_XM && a < CSFW_XM + 4 * n) {
 				got++;
 				matched += want[(a - CSFW_XM) / 4] == (uint32_t)v;
+			}
+			for (unsigned i = 5; i < sizeof(ctls) / sizeof(ctls[0]); i++) {
+				if (a == ctl_reg[i]) {
+					printf("register dump: %s = %#lx\n", ctls[i].name, v);
+				}
 			}
 		}
 		if (fp) {
@@ -251,6 +354,7 @@ int
 main(int argc, char **argv)
 {
 	builtin();
+	controls();
 	if (argc > 1) {
 		phone(argv[1], argc > 2 ? argv[2] : 0);
 	}
