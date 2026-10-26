@@ -467,6 +467,53 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
 	printf("PANDORA AMP: %#x DSP started: core control %#x (Android 0x81), MPU lock %#x (0xbeef), 0x2900 %#x, "
 	    "HALO_STATE %#x (2), heartbeat %#x -> %#x in 100 ms, AUDIO_STATE %#x, err %d\n", addr, core, lock, mem, state,
 	    beat0, beat1, audio, err);
+	if (!err && r_beat && beat0 == beat1) {
+		/* spk4: the core enabled but not counting, as if unclocked. cs35l43_dsp_preload_ev forces the
+		 * PLL on (0x2C04 bit 16) before Android's boot-time load when its clock hook is set. */
+		uint32_t pll = 0;
+		err = pa_reg(addr, 0x2c04, &pll);
+		err = err ? err : pa_write1(addr, 0x2c04, pll | 0x10000u);
+		pa_sleep(50);
+		err = err ? err : pa_reg(addr, r_beat, &beat0);
+		pa_sleep(100);
+		err = err ? err : pa_reg(addr, r_beat, &beat1);
+		err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+		err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+		err = err || !r_state ? err : pa_reg(addr, r_state, &state);
+		printf("PANDORA AMP: %#x PLL forced (0x2c04 %#x -> %#x): core control %#x, MPU lock %#x, HALO_STATE %#x, "
+		    "heartbeat %#x -> %#x in 100 ms, err %d\n", addr, pll, pll | 0x10000u, core, lock, state, beat0, beat1, err);
+	}
+}
+
+/* The amp's ordinary registers, the ones in Android's regmap dump (speakercheck amp_*_regs_before.txt),
+ * for comparing with Android's idle state on the PC. Addresses and counts only. */
+static void
+pa_dump(uint8_t addr)
+{
+	static const uint32_t runs[63][2] = {{0x0, 5}, {0x20, 1}, {0x40, 2}, {0x50, 4}, {0x100, 3}, {0x110, 1}, {0x120, 3},
+	    {0x140, 3}, {0x154, 2}, {0x160, 2}, {0x174, 3}, {0x400, 32}, {0x500, 8}, {0x2004, 3}, {0x2014, 10}, {0x2040, 2},
+	    {0x2084, 1}, {0x2418, 4}, {0x242c, 1}, {0x2440, 1}, {0x2900, 6}, {0x2c04, 3}, {0x2c14, 1}, {0x2d10, 1},
+	    {0x2d3c, 2}, {0x2d60, 2}, {0x300c, 1}, {0x3400, 1}, {0x3800, 9}, {0x3830, 1}, {0x3850, 1}, {0x4008, 1},
+	    {0x4220, 2}, {0x4300, 3}, {0x4800, 5}, {0x4820, 1}, {0x4830, 1}, {0x4840, 1}, {0x4c00, 1}, {0x4c08, 1},
+	    {0x4c20, 4}, {0x4c40, 6}, {0x4c60, 2}, {0x6000, 5}, {0x6200, 4}, {0x6404, 6}, {0x6450, 1}, {0x6800, 3},
+	    {0x6c04, 1}, {0x7400, 2}, {0x7424, 1}, {0x10000, 2}, {0x10010, 5}, {0x10090, 5}, {0x10110, 5}, {0x10190, 5},
+	    {0x10210, 1}, {0x1021c, 1}, {0x10290, 4}, {0x10314, 1}, {0x11000, 6}, {0x12000, 3}, {0x13000, 24}};
+	for (unsigned r = 0; r < 63; r++) {
+		for (unsigned at = 0; at < runs[r][1]; at += 8) {
+			uint32_t v[8];
+			const unsigned n = runs[r][1] - at > 8 ? 8 : runs[r][1] - at;
+			const uint32_t reg = runs[r][0] + 4 * at;
+			if (pa_read_regs(addr, reg, v, n)) {
+				printf("PANDORA AMPREG: %#x %05x: read error\n", addr, reg);
+				continue;
+			}
+			char line[8 * 9 + 1];
+			for (unsigned i = 0; i < n; i++) {
+				snprintf(line + 9 * i, sizeof(line) - 9 * i, " %08x", v[i]);
+			}
+			printf("PANDORA AMPREG: %#x %05x:%s\n", addr, reg, line);
+		}
+	}
 }
 
 /* One amplifier's firmware, coefficients and music scene, checked; with pandora_amp=3 started. */
@@ -572,6 +619,7 @@ pa_load(uint8_t addr, char side)
 	}
 	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
 		pa_start(addr, fw, fw_size, &info);
+		pa_dump(addr);
 	}
 out:
 	if (fw) {
