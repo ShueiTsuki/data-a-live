@@ -471,3 +471,5 @@
 - **核心级“ret”已在 0215 做了**（PSCI CPU_SUSPEND 0x4，按下一次定时器远近选 ret 或 WFI）。没做的是簇级和整机级，设备树层级：cpu0–5 → cluster-pd0（ret-pll-off 0x1000054，最短停留约 9.1 ms），cpu6–7 → cluster-pd1（同上），两簇 → cluster-pd2（apps-pc 0x200c354，约 10.2 ms）；要 PSCI OS 协调模式（已确认固件支持）。
 - **结论：现在做簇级休眠对发热几乎没用。** 滑动时每 10 ms 一帧，簇里所有核同时空闲 9 ms 以上的机会很少；静止时 vmd 占约 93% 的一个核、服务反复拉起，簇里总有核在忙。它要等“服务反复查询”解决后，对待机和静止画面的功耗才有意义。
 - **滑动时更直接的是调度**：测试一直开着 `pandora_bigfirst=1`，线程优先放 4.4 GHz 的大核。下一步可对比关掉大核优先（或换苹果自己的大小核调度）时的温度、帧率、CPU 占用（要上手机，需用户同意）。
+
+- 2026-10-28：交给 DeepSeek 的 spkstart 任务（D:\DeepSeekHarness\spkstart\TASK.md）：安卓放音时 AP→ADSP 的 GPR 命令序列 + 功放寄存器写序列，目标是让 TDM 口出位时钟、功放 PLL 锁上。gpicheck 修正（立即数 TRE、GO 写 rx_len 0、时钟 {2,5,11,22}、先用 GPII1）已改代码，待主机测试和编译。

@@ -643,11 +643,12 @@ out:
 
 /*
  * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
- * 2-byte little-endian read after writing the command byte. SCL timing as the SE holds it now (the
- * last configuration Android's i2c-5 sent before the reboot), else i2c-qcom-geni's 400 kHz entry.
+ * 2-byte little-endian read after writing the command byte. SCL timing and GPII as Android's i2c-5
+ * uses them (gpicheck's live log: config TRE 0x0316050b / 2, transfers on GPII1); the other GPIIs of
+ * the mask only if that one is busy.
  */
 static void
-pa_gauge_read(vm_offset_t se)
+pa_gauge_read(void)
 {
 	static const struct {
 		uint8_t cmd;
@@ -655,17 +656,13 @@ pa_gauge_read(vm_offset_t se)
 	} q[] = {{0x08, "voltage mV"}, {0x0c, "current mA (+ charging)"}, {0x06, "temperature 0.1 K"},
 	         {0x2c, "state of charge %"}, {0x10, "remaining mAh"}, {0x12, "full charge mAh"},
 	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
-	const uint32_t mclk = pa_rd(se, SE_MCLK), scl = pa_rd(se, SE_SCL);
-	PgpiI2cClock clk = {(uint8_t)((mclk >> 4) & 0xfffu), (uint8_t)((scl >> 20) & 0x3ffu),
-	                    (uint8_t)((scl >> 10) & 0x3ffu), (uint8_t)(scl & 0x3ffu)};
-	if (!clk.clk_div || !clk.t_cycle) {
-		clk = (PgpiI2cClock){2, 5, 12, 24};
-	}
+	const PgpiI2cClock clk = {2, 5, 11, 22};
+	static const uint32_t order[] = {1, 0, 2, 3, 4};
 	static PandoraGpi g;
 	int e = EBUSY;
-	for (uint32_t n = 0; n < 12 && e == EBUSY; n++) {
-		if (PG_GPII_MASK & (1u << n)) {
-			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, n, 5, 3);
+	for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]) && e == EBUSY; i++) {
+		if (PG_GPII_MASK & (1u << order[i])) {
+			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, order[i], 5, 3);
 		}
 	}
 	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
@@ -727,7 +724,7 @@ pa_gauge(void)
 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
 		    busy, changed);
 		if (pa_gauge_level >= 2 && !busy && !changed) {
-			pa_gauge_read(se);
+			pa_gauge_read();
 		}
 		ml_io_unmap(se, 0x4000);
 	}

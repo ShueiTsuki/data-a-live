@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index b9e01a4..4b66596 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -643,11 +643,12 @@ out:
+ 
+ /*
+  * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
+- * 2-byte little-endian read after writing the command byte. SCL timing as the SE holds it now (the
+- * last configuration Android's i2c-5 sent before the reboot), else i2c-qcom-geni's 400 kHz entry.
++ * 2-byte little-endian read after writing the command byte. SCL timing and GPII as Android's i2c-5
++ * uses them (gpicheck's live log: config TRE 0x0316050b / 2, transfers on GPII1); the other GPIIs of
++ * the mask only if that one is busy.
+  */
+ static void
+-pa_gauge_read(vm_offset_t se)
++pa_gauge_read(void)
+ {
+ 	static const struct {
+ 		uint8_t cmd;
+@@ -655,17 +656,13 @@ pa_gauge_read(vm_offset_t se)
+ 	} q[] = {{0x08, "voltage mV"}, {0x0c, "current mA (+ charging)"}, {0x06, "temperature 0.1 K"},
+ 	         {0x2c, "state of charge %"}, {0x10, "remaining mAh"}, {0x12, "full charge mAh"},
+ 	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
+-	const uint32_t mclk = pa_rd(se, SE_MCLK), scl = pa_rd(se, SE_SCL);
+-	PgpiI2cClock clk = {(uint8_t)((mclk >> 4) & 0xfffu), (uint8_t)((scl >> 20) & 0x3ffu),
+-	                    (uint8_t)((scl >> 10) & 0x3ffu), (uint8_t)(scl & 0x3ffu)};
+-	if (!clk.clk_div || !clk.t_cycle) {
+-		clk = (PgpiI2cClock){2, 5, 12, 24};
+-	}
++	const PgpiI2cClock clk = {2, 5, 11, 22};
++	static const uint32_t order[] = {1, 0, 2, 3, 4};
+ 	static PandoraGpi g;
+ 	int e = EBUSY;
+-	for (uint32_t n = 0; n < 12 && e == EBUSY; n++) {
+-		if (PG_GPII_MASK & (1u << n)) {
+-			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, n, 5, 3);
++	for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]) && e == EBUSY; i++) {
++		if (PG_GPII_MASK & (1u << order[i])) {
++			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, order[i], 5, 3);
+ 		}
+ 	}
+ 	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
+@@ -727,7 +724,7 @@ pa_gauge(void)
+ 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
+ 		    busy, changed);
+ 		if (pa_gauge_level >= 2 && !busy && !changed) {
+-			pa_gauge_read(se);
++			pa_gauge_read();
+ 		}
+ 		ml_io_unmap(se, 0x4000);
+ 	}
+diff --git a/bsd/dev/pandora_gpi.c b/bsd/dev/pandora_gpi.c
+index a962740..42b345e 100644
+--- a/bsd/dev/pandora_gpi.c
++++ b/bsd/dev/pandora_gpi.c
+@@ -285,14 +285,19 @@ pandora_gpi_i2c(PandoraGpi *g, const PgpiI2cClock *clk, uint8_t addr, const uint
+ 	int e = 0;
+ 	bool config = true;
+ 	if (nw) {
+-		/* the write: config, GO (write, no STOP when a read follows), DMA from the TX buffer */
+-		memcpy((void *)(g->mem + TX_BUF), w, nw);
+-		clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
++		/* the write: config, GO (write, no STOP when a read follows), the bytes; up to 8 go in an
++		 * immediate TRE as Android sends them, longer writes as DMA from the TX buffer */
+ 		PgpiTre t = pgpi_i2c_config0(clk);
+ 		put_tre(g, false, &t);
+-		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, nw, 0);
++		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, 0, 0);
+ 		put_tre(g, false, &t);
+-		t = pgpi_dma(g->mem_pa + TX_BUF, nw);
++		if (nw <= 8) {
++			t = pgpi_imm(w, nw);
++		} else {
++			memcpy((void *)(g->mem + TX_BUF), w, nw);
++			clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
++			t = pgpi_dma(g->mem_pa + TX_BUF, nw);
++		}
+ 		put_tre(g, false, &t);
+ 		doorbell(g, false);
+ 		e = wait_done(g, 0, &len);
+diff --git a/bsd/dev/pandora_gpi.h b/bsd/dev/pandora_gpi.h
+index 5efc2c4..9b71c72 100644
+--- a/bsd/dev/pandora_gpi.h
++++ b/bsd/dev/pandora_gpi.h
+@@ -21,6 +21,7 @@
+ #define PGPI_TRE_BEI       (1u << 10)
+ #define PGPI_TRE_LINK      (1u << 11)
+ #define PGPI_TRE_DMA       0x10u
++#define PGPI_TRE_IMM       0x11u   /* up to 8 bytes carried in dwords 0-1 (Android's i2c-5 writes, gpicheck) */
+ #define PGPI_TRE_GO        0x20u
+ #define PGPI_TRE_CONFIG0   0x22u
+ 
+@@ -80,6 +81,18 @@ pgpi_dma(uint64_t pa, uint32_t len)
+ 	return t;
+ }
+ 
++/* LEN (1-8) bytes in the TRE itself, as Android's i2c_msm_geni sends a gauge command byte:
++ * gpicheck's live log "tx_tre 0x70 0x0 0x1 0x110200" for command 0x70. */
++static inline PgpiTre
++pgpi_imm(const uint8_t *data, uint32_t len)
++{
++	PgpiTre t = {{0, 0, len & 0xffffffu, PGPI_TRE_IMM << 16 | PGPI_TRE_IEOT}};
++	for (uint32_t i = 0; i < len && i < 8; i++) {
++		t.w[i / 4] |= (uint32_t)data[i] << (8 * (i % 4));
++	}
++	return t;
++}
++
+ typedef struct {
+ 	uint64_t tre;          /* the TRE the event is about (bus address) */
+ 	uint32_t length, code, status, type, chid;

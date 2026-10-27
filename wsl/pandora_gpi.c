@@ -285,14 +285,19 @@ pandora_gpi_i2c(PandoraGpi *g, const PgpiI2cClock *clk, uint8_t addr, const uint
 	int e = 0;
 	bool config = true;
 	if (nw) {
-		/* the write: config, GO (write, no STOP when a read follows), DMA from the TX buffer */
-		memcpy((void *)(g->mem + TX_BUF), w, nw);
-		clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
+		/* the write: config, GO (write, no STOP when a read follows), the bytes; up to 8 go in an
+		 * immediate TRE as Android sends them, longer writes as DMA from the TX buffer */
 		PgpiTre t = pgpi_i2c_config0(clk);
 		put_tre(g, false, &t);
-		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, nw, 0);
+		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, 0, 0);
 		put_tre(g, false, &t);
-		t = pgpi_dma(g->mem_pa + TX_BUF, nw);
+		if (nw <= 8) {
+			t = pgpi_imm(w, nw);
+		} else {
+			memcpy((void *)(g->mem + TX_BUF), w, nw);
+			clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
+			t = pgpi_dma(g->mem_pa + TX_BUF, nw);
+		}
 		put_tre(g, false, &t);
 		doorbell(g, false);
 		e = wait_done(g, 0, &len);

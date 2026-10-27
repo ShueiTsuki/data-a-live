@@ -21,6 +21,7 @@
 #define PGPI_TRE_BEI       (1u << 10)
 #define PGPI_TRE_LINK      (1u << 11)
 #define PGPI_TRE_DMA       0x10u
+#define PGPI_TRE_IMM       0x11u   /* up to 8 bytes carried in dwords 0-1 (Android's i2c-5 writes, gpicheck) */
 #define PGPI_TRE_GO        0x20u
 #define PGPI_TRE_CONFIG0   0x22u
 
@@ -77,6 +78,18 @@ pgpi_dma(uint64_t pa, uint32_t len)
 	t.w[1] = (uint32_t)(pa >> 32);
 	t.w[2] = len & 0xffffffu;
 	t.w[3] = PGPI_TRE_DMA << 16 | PGPI_TRE_IEOT;
+	return t;
+}
+
+/* LEN (1-8) bytes in the TRE itself, as Android's i2c_msm_geni sends a gauge command byte:
+ * gpicheck's live log "tx_tre 0x70 0x0 0x1 0x110200" for command 0x70. */
+static inline PgpiTre
+pgpi_imm(const uint8_t *data, uint32_t len)
+{
+	PgpiTre t = {{0, 0, len & 0xffffffu, PGPI_TRE_IMM << 16 | PGPI_TRE_IEOT}};
+	for (uint32_t i = 0; i < len && i < 8; i++) {
+		t.w[i / 4] |= (uint32_t)data[i] << (8 * (i % 4));
+	}
 	return t;
 }
 
