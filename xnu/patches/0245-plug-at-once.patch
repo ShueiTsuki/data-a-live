@@ -1,0 +1,204 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 4a59ad8..ab2f7bf 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1692,6 +1692,7 @@ static struct {
+ 	uint64_t answer_by, refresh_at, open_by;
+ 	int32_t value[BM_PROPS];
+ 	bool ok[BM_PROPS];                     /* value answered without error in this pass */
++	int online;                            /* charger by bus_volt at the last pass: 1, 0, -1 not known */
+ 	uint32_t passes, answers, timeouts, notes, others;
+ 	char line[640];
+ } bm;
+@@ -1700,6 +1701,8 @@ LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
+ LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
+ static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
+ #define BM_BUS_VOLT      0x20002u        /* bus_volt, µV (spk1: about 5 000 000 on the PC's USB) */
++#define AD_BUS_FRESH_MS  60000u
++#define AD_BUS_ON_UV     4000000         /* spk6: unplugged 26 000-38 000, plugged 4 708 000-5 013 000 */
+ static int32_t ad_bus_uv = -1;           /* the last MCA pass's bus voltage, -1 unknown */
+ static uint64_t ad_bus_at;               /* when it was taken */
+ 
+@@ -1861,6 +1864,18 @@ bm_step(void)
+ 				ad_bus_uv = bm.ok[i] ? bm.value[i] : -1;
+ 				ad_bus_at = now;
+ 				lck_mtx_unlock(&ad_batt_lock);
++				/* Plugged or unplugged (the SOCCP's notification started this pass, spk6): the
++				 * battery service at once, and the gauge read again for the new current. */
++				const int online = bm.ok[i] ? bm.value[i] > AD_BUS_ON_UV : -1;
++				if (online >= 0 && online != bm.online) {
++					if (bm.online >= 0) {
++						printf("PANDORA SOCCP: charger %s (bus %d uV)\n", online ? "plugged" : "unplugged",
++						    bm.value[i]);
++						pandora_battery_changed();
++						pandora_gauge_kick();
++					}
++					bm.online = online;
++				}
+ 			}
+ 		}
+ 		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
+@@ -1887,9 +1902,6 @@ bm_step(void)
+  * without one when the gauge sees charge current. Android shows a percentage a point or two above
+  * 0x2c while charging (battui §2.2); that filter is not known yet.
+  */
+-#define AD_BUS_FRESH_MS  60000u
+-#define AD_BUS_ON_UV     4000000
+-
+ bool
+ pandora_battery_get(struct pandora_battery *b, size_t size)
+ {
+@@ -1973,6 +1985,7 @@ soccp_attach(void)
+ 	}
+ 	int open_now = 0;
+ 	(void)PE_parse_boot_argn("pandora_battery_open", &open_now, sizeof(open_now));
++	bm.online = -1;
+ 	static const QcomGlinkClient client = {bm_state, bm_receive};
+ 	bm.ch = qcom_glink_channel(&e->gl, "PMIC_RTR_SOCCP_APPS", BM_INTENT, BM_INTENTS, bm.storage, &client, NULL,
+ 	    open_now);
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 99df422..59ed883 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -739,28 +739,57 @@ pg_unvote(uint32_t before)
+ 
+ /*
+  * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
+- * polls as often), the clocks voted only for the read. One line of it in the log for the first and
+- * every PG_LOG_EVERY reads, errors always.
++ * polls as often), the clocks voted only for the read; at once when pandora_gauge_kick asks
++ * (charger plugged or unplugged). After a read that changes what the battery service shows
++ * (percentage, charger, charging, full), or a kicked one, the service takes it at once. One line
++ * of it in the log for the first, every PG_LOG_EVERY and every kicked read, errors always.
+  */
+ #define PG_PERIOD_MS 20000u
+ #define PG_LOG_EVERY 15u
+ 
++static int pg_wake;
++static int pg_kicked;
++
++void
++pandora_gauge_kick(void)
++{
++	__atomic_store_n(&pg_kicked, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&pg_wake);
++}
++
+ static void
+ pg_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+ 	(void)result;
++	struct pandora_battery shown = {0};
+ 	for (unsigned n = 1;; n++) {
+-		pa_sleep(PG_PERIOD_MS);
++		/* the flag after assert_wait: a kick before it is seen, one after it wakes the wait */
++		uint64_t deadline;
++		clock_interval_to_deadline(PG_PERIOD_MS, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&pg_wake, THREAD_UNINT, deadline);
++		if (__atomic_load_n(&pg_kicked, __ATOMIC_ACQUIRE)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++		const bool kicked = __atomic_exchange_n(&pg_kicked, 0, __ATOMIC_ACQ_REL) != 0;
+ 		uint32_t before;
+ 		int e = pg_vote(&before) ? pa_gauge_read(false) : EIO;
+ 		pg_unvote(before);
+ 		struct pandora_gauge r;
+-		if (e || n == 1 || n % PG_LOG_EVERY == 0) {
++		if (e || kicked || n == 1 || n % PG_LOG_EVERY == 0) {
+ 			(void)pandora_gauge_get(&r, sizeof(r));
+-			printf("PANDORA GAUGE: read %u err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n, e,
+-			    r.voltage_mv, r.current_ma, r.temperature_dk / 10, r.temperature_dk % 10, r.soc, r.remaining_mah,
+-			    r.full_mah, r.status);
++			printf("PANDORA GAUGE: read %u%s err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n,
++			    kicked ? " (kicked)" : "", e, r.voltage_mv, r.current_ma, r.temperature_dk / 10,
++			    r.temperature_dk % 10, r.soc, r.remaining_mah, r.full_mah, r.status);
++		}
++		struct pandora_battery b;
++		if (!e && pandora_battery_get(&b, sizeof(b)) &&
++		    (kicked || b.percent != shown.percent || b.external != shown.external || b.charging != shown.charging ||
++		    b.fully_charged != shown.fully_charged)) {
++			shown = b;
++			pandora_battery_changed();
+ 		}
+ 	}
+ }
+diff --git a/bsd/dev/pandora_battery.h b/bsd/dev/pandora_battery.h
+index 8cbb34e..7051278 100644
+--- a/bsd/dev/pandora_battery.h
++++ b/bsd/dev/pandora_battery.h
+@@ -37,6 +37,12 @@ struct pandora_gauge {
+ /* The latest gauge reading into g (size: sizeof(*g)); false when there is none. */
+ bool pandora_gauge_get(struct pandora_gauge *g, size_t size);
+ 
++/* Read the gauge now instead of at the next period (charger plugged or unplugged). */
++void pandora_gauge_kick(void);
++
++/* iokit/Kernel/arm/SweetBattery.cpp: take pandora_battery_get's readings now, not at its next poll. */
++void pandora_battery_changed(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0adc798..e5eb05e 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -46,10 +46,35 @@ private:
+ 	static unsigned estimatePercent(unsigned mv);
+ #if defined(PANDORA)
+ 	void publishPandora(const struct pandora_battery &b);
++public:
++	void pollNow(void);
+ #endif
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
++#if defined(PANDORA)
++/* The running instance, for pandora_battery_changed (bsd/dev: charger plugged, gauge read changed). */
++static SweetBattery *gPandoraBattery;
++
++/* The timer fires now instead of at its next 20 s; it rearms itself after the poll. */
++void
++SweetBattery::pollNow(void)
++{
++	if (fRunning && fTimer) {
++		fTimer->setTimeoutMS(1);
++	}
++}
++
++extern "C" void
++pandora_battery_changed(void)
++{
++	SweetBattery *battery = gPandoraBattery;
++	if (battery) {
++		battery->pollNow();
++	}
++}
++#endif
++
+ bool
+ SweetBattery::init(OSDictionary *dictionary)
+ {
+@@ -368,6 +393,9 @@ SweetBattery::start(IOService *provider)
+ 			fTimerAdded = true;
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(SWEET_BATTERY_POLL_MS);
++#if defined(PANDORA)
++			gPandoraBattery = this;
++#endif
+ 		} else {
+ 			fReal = false;
+ 			poll();
+@@ -397,6 +425,9 @@ SweetBattery::stopPolling(OSObject *owner, void *, void *, void *, void *)
+ 	if (!self) {
+ 		return kIOReturnBadArgument;
+ 	}
++#if defined(PANDORA)
++	gPandoraBattery = NULL;
++#endif
+ 	self->fRunning = false;
+ 	self->fTimer->cancelTimeout();
+ 	self->fTimer->disable();

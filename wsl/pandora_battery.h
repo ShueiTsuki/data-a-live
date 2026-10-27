@@ -37,6 +37,12 @@ struct pandora_gauge {
 /* The latest gauge reading into g (size: sizeof(*g)); false when there is none. */
 bool pandora_gauge_get(struct pandora_gauge *g, size_t size);
 
+/* Read the gauge now instead of at the next period (charger plugged or unplugged). */
+void pandora_gauge_kick(void);
+
+/* iokit/Kernel/arm/SweetBattery.cpp: take pandora_battery_get's readings now, not at its next poll. */
+void pandora_battery_changed(void);
+
 #ifdef __cplusplus
 }
 #endif

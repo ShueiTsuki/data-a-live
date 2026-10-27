@@ -475,3 +475,8 @@
 - 2026-10-28：交给 DeepSeek 的 spkstart 任务（D:\DeepSeekHarness\spkstart\TASK.md）：安卓放音时 AP→ADSP 的 GPR 命令序列 + 功放寄存器写序列，目标是让 TDM 口出位时钟、功放 PLL 锁上。gpicheck 修正（立即数 TRE、GO 写 rx_len 0、时钟 {2,5,11,22}、先用 GPII1）已改代码，待主机测试和编译。
 - 2026-10-28 spk6（k0241，pandora_gauge=2）：iOS 下经 GPI 读电量计成功，十个寄存器全部 err 0，用 GPII1，事件在 TX/RX 各一条。下一步把读数接进 SweetBattery（现在 ad_batt 还没人填）。交给 DeepSeek 的 battui 任务（D:\DeepSeekHarness\battui\TASK.md）：安卓的显示百分比、充电状态、电池温度怎么从原始读数算出来。
 - 2026-10-28 交给 DeepSeek 的 iosaudiocheck4（D:\DeepSeekHarness\iosaudiocheck4\TASK.md）：状态页写入方、ARMDMA/ARMIIS 全部重写槽、CoreAudio 读的注册表键、基类对子类的要求、开流到每周期的时序。thermalcheck、spkstart 的 RESULT 已交回，待复核。正在做：电量计读数接进 SweetBattery（显示一直是充电中 100%）。
+- 2026-10-28 daily-k0244 已装进开机菜单的 iOS 格子（0244，参数加 pandora_gauge=3 pandora_battery=1；bat3 验证：80%、4234 mV、-1109 mA、接电源、充电中）。
+- **用户插入（2026-10-28）：电池"每 20 秒刷新"不够好，要改。** 计划：
+  1. 插拔立即反映：SOCCP 的 MCA 通知（type 2）一到，马上重读 bus_volt 和电量计，并立刻推给 SweetBattery（给它加"马上刷新"的入口，不等 20 秒定时器）。先确认插拔时 SOCCP 会发通知：要一次测试中途拔插 USB（需要用户动手）。
+  2. 平时的刷新节奏照安卓：查 bq27z561 驱动和 MCA 业务层的轮询周期（battui 没查），电量计照那个周期读；值变了才通知 iOS。
+  3. 充电时安卓多显示 1-2 个点的处理（battui 第 2.2 节）查到后补上。

@@ -1692,6 +1692,7 @@ static struct {
 	uint64_t answer_by, refresh_at, open_by;
 	int32_t value[BM_PROPS];
 	bool ok[BM_PROPS];                     /* value answered without error in this pass */
+	int online;                            /* charger by bus_volt at the last pass: 1, 0, -1 not known */
 	uint32_t passes, answers, timeouts, notes, others;
 	char line[640];
 } bm;
@@ -1700,6 +1701,8 @@ LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
 LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
 static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
 #define BM_BUS_VOLT      0x20002u        /* bus_volt, µV (spk1: about 5 000 000 on the PC's USB) */
+#define AD_BUS_FRESH_MS  60000u
+#define AD_BUS_ON_UV     4000000         /* spk6: unplugged 26 000-38 000, plugged 4 708 000-5 013 000 */
 static int32_t ad_bus_uv = -1;           /* the last MCA pass's bus voltage, -1 unknown */
 static uint64_t ad_bus_at;               /* when it was taken */
 
@@ -1861,6 +1864,18 @@ bm_step(void)
 				ad_bus_uv = bm.ok[i] ? bm.value[i] : -1;
 				ad_bus_at = now;
 				lck_mtx_unlock(&ad_batt_lock);
+				/* Plugged or unplugged (the SOCCP's notification started this pass, spk6): the
+				 * battery service at once, and the gauge read again for the new current. */
+				const int online = bm.ok[i] ? bm.value[i] > AD_BUS_ON_UV : -1;
+				if (online >= 0 && online != bm.online) {
+					if (bm.online >= 0) {
+						printf("PANDORA SOCCP: charger %s (bus %d uV)\n", online ? "plugged" : "unplugged",
+						    bm.value[i]);
+						pandora_battery_changed();
+						pandora_gauge_kick();
+					}
+					bm.online = online;
+				}
 			}
 		}
 		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
@@ -1887,9 +1902,6 @@ bm_step(void)
  * without one when the gauge sees charge current. Android shows a percentage a point or two above
  * 0x2c while charging (battui §2.2); that filter is not known yet.
  */
-#define AD_BUS_FRESH_MS  60000u
-#define AD_BUS_ON_UV     4000000
-
 bool
 pandora_battery_get(struct pandora_battery *b, size_t size)
 {
@@ -1973,6 +1985,7 @@ soccp_attach(void)
 	}
 	int open_now = 0;
 	(void)PE_parse_boot_argn("pandora_battery_open", &open_now, sizeof(open_now));
+	bm.online = -1;
 	static const QcomGlinkClient client = {bm_state, bm_receive};
 	bm.ch = qcom_glink_channel(&e->gl, "PMIC_RTR_SOCCP_APPS", BM_INTENT, BM_INTENTS, bm.storage, &client, NULL,
 	    open_now);

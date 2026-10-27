@@ -739,28 +739,57 @@ pg_unvote(uint32_t before)
 
 /*
  * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
- * polls as often), the clocks voted only for the read. One line of it in the log for the first and
- * every PG_LOG_EVERY reads, errors always.
+ * polls as often), the clocks voted only for the read; at once when pandora_gauge_kick asks
+ * (charger plugged or unplugged). After a read that changes what the battery service shows
+ * (percentage, charger, charging, full), or a kicked one, the service takes it at once. One line
+ * of it in the log for the first, every PG_LOG_EVERY and every kicked read, errors always.
  */
 #define PG_PERIOD_MS 20000u
 #define PG_LOG_EVERY 15u
+
+static int pg_wake;
+static int pg_kicked;
+
+void
+pandora_gauge_kick(void)
+{
+	__atomic_store_n(&pg_kicked, 1, __ATOMIC_RELEASE);
+	thread_wakeup(&pg_wake);
+}
 
 static void
 pg_thread(void *arg, wait_result_t result)
 {
 	(void)arg;
 	(void)result;
+	struct pandora_battery shown = {0};
 	for (unsigned n = 1;; n++) {
-		pa_sleep(PG_PERIOD_MS);
+		/* the flag after assert_wait: a kick before it is seen, one after it wakes the wait */
+		uint64_t deadline;
+		clock_interval_to_deadline(PG_PERIOD_MS, NSEC_PER_MSEC, &deadline);
+		(void)assert_wait_deadline(&pg_wake, THREAD_UNINT, deadline);
+		if (__atomic_load_n(&pg_kicked, __ATOMIC_ACQUIRE)) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+		const bool kicked = __atomic_exchange_n(&pg_kicked, 0, __ATOMIC_ACQ_REL) != 0;
 		uint32_t before;
 		int e = pg_vote(&before) ? pa_gauge_read(false) : EIO;
 		pg_unvote(before);
 		struct pandora_gauge r;
-		if (e || n == 1 || n % PG_LOG_EVERY == 0) {
+		if (e || kicked || n == 1 || n % PG_LOG_EVERY == 0) {
 			(void)pandora_gauge_get(&r, sizeof(r));
-			printf("PANDORA GAUGE: read %u err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n, e,
-			    r.voltage_mv, r.current_ma, r.temperature_dk / 10, r.temperature_dk % 10, r.soc, r.remaining_mah,
-			    r.full_mah, r.status);
+			printf("PANDORA GAUGE: read %u%s err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n,
+			    kicked ? " (kicked)" : "", e, r.voltage_mv, r.current_ma, r.temperature_dk / 10,
+			    r.temperature_dk % 10, r.soc, r.remaining_mah, r.full_mah, r.status);
+		}
+		struct pandora_battery b;
+		if (!e && pandora_battery_get(&b, sizeof(b)) &&
+		    (kicked || b.percent != shown.percent || b.external != shown.external || b.charging != shown.charging ||
+		    b.fully_charged != shown.fully_charged)) {
+			shown = b;
+			pandora_battery_changed();
 		}
 	}
 }
