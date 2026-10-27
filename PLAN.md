@@ -473,3 +473,5 @@
 - **滑动时更直接的是调度**：测试一直开着 `pandora_bigfirst=1`，线程优先放 4.4 GHz 的大核。下一步可对比关掉大核优先（或换苹果自己的大小核调度）时的温度、帧率、CPU 占用（要上手机，需用户同意）。
 
 - 2026-10-28：交给 DeepSeek 的 spkstart 任务（D:\DeepSeekHarness\spkstart\TASK.md）：安卓放音时 AP→ADSP 的 GPR 命令序列 + 功放寄存器写序列，目标是让 TDM 口出位时钟、功放 PLL 锁上。gpicheck 修正（立即数 TRE、GO 写 rx_len 0、时钟 {2,5,11,22}、先用 GPII1）已改代码，待主机测试和编译。
+- 2026-10-28 spk6（k0241，pandora_gauge=2）：iOS 下经 GPI 读电量计成功，十个寄存器全部 err 0，用 GPII1，事件在 TX/RX 各一条。下一步把读数接进 SweetBattery（现在 ad_batt 还没人填）。交给 DeepSeek 的 battui 任务（D:\DeepSeekHarness\battui\TASK.md）：安卓的显示百分比、充电状态、电池温度怎么从原始读数算出来。
+- 2026-10-28 交给 DeepSeek 的 iosaudiocheck4（D:\DeepSeekHarness\iosaudiocheck4\TASK.md）：状态页写入方、ARMDMA/ARMIIS 全部重写槽、CoreAudio 读的注册表键、基类对子类的要求、开流到每周期的时序。thermalcheck、spkstart 的 RESULT 已交回，待复核。正在做：电量计读数接进 SweetBattery（显示一直是充电中 100%）。

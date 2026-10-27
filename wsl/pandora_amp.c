@@ -25,6 +25,7 @@
  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
  * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
  * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
+ * pandora_gauge=3 keeps reading it every 20 s for the battery service (pandora_gauge_get).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -38,6 +39,8 @@
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 #include <kern/kalloc.h>
+#include <kern/locks.h>
+#include "pandora_battery.h"
 #include "pandora_csfw.h"
 #include "pandora_gpi.h"
 
@@ -645,10 +648,15 @@ out:
  * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
  * 2-byte little-endian read after writing the command byte. SCL timing and GPII as Android's i2c-5
  * uses them (gpicheck's live log: config TRE 0x0316050b / 2, transfers on GPII1); the other GPIIs of
- * the mask only if that one is busy.
+ * the mask only if that one is busy. A complete read becomes the reading pandora_gauge_get hands out.
  */
-static void
-pa_gauge_read(void)
+LCK_GRP_DECLARE(pg_grp, "pandora_gauge");
+LCK_MTX_DECLARE(pg_lock, &pg_grp);
+static struct pandora_gauge pg_last;
+static PandoraGpi pg_gpi;
+
+static int
+pa_gauge_read(bool log)
 {
 	static const struct {
 		uint8_t cmd;
@@ -658,22 +666,103 @@ pa_gauge_read(void)
 	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
 	const PgpiI2cClock clk = {2, 5, 11, 22};
 	static const uint32_t order[] = {1, 0, 2, 3, 4};
-	static PandoraGpi g;
+	PandoraGpi *g = &pg_gpi;
+	g->quiet = !log;
 	int e = EBUSY;
 	for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]) && e == EBUSY; i++) {
 		if (PG_GPII_MASK & (1u << order[i])) {
-			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, order[i], 5, 3);
+			e = pandora_gpi_open(g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, order[i], 5, 3);
 		}
 	}
-	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
-	    clk.t_cycle);
-	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && !e; i++) {
-		uint8_t v[2] = {0, 0};
-		e = pandora_gpi_i2c(&g, &clk, 0x55, &q[i].cmd, 1, v, 2);
-		printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, (unsigned)(v[0] | v[1] << 8),
-		    (unsigned)(v[0] | v[1] << 8), e);
+	if (log || e) {
+		printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high,
+		    clk.t_low, clk.t_cycle);
 	}
-	pandora_gpi_close(&g);
+	uint16_t v[sizeof(q) / sizeof(q[0])];
+	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && !e; i++) {
+		uint8_t b[2] = {0, 0};
+		e = pandora_gpi_i2c(g, &clk, 0x55, &q[i].cmd, 1, b, 2);
+		v[i] = (uint16_t)(b[0] | b[1] << 8);
+		if (log || e) {
+			printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, v[i], v[i], e);
+		}
+	}
+	pandora_gpi_close(g);
+	if (!e) {
+		const struct pandora_gauge r = {.valid = 1, .voltage_mv = v[0], .current_ma = (int16_t)v[1],
+		    .temperature_dk = v[2], .soc = v[3], .remaining_mah = v[4], .full_mah = v[5], .design_mah = v[6],
+		    .cycles = v[7], .health = v[8], .status = v[9], .at = mach_absolute_time()};
+		lck_mtx_lock(&pg_lock);
+		pg_last = r;
+		lck_mtx_unlock(&pg_lock);
+	}
+	return e;
+}
+
+bool
+pandora_gauge_get(struct pandora_gauge *g, size_t size)
+{
+	if (size != sizeof(*g)) {
+		return false;
+	}
+	lck_mtx_lock(&pg_lock);
+	*g = pg_last;
+	lck_mtx_unlock(&pg_lock);
+	return g->valid != 0;
+}
+
+/* The bus's clocks on (our votes added to what *BEFORE gets); false when one stays off. */
+static bool
+pg_vote(uint32_t *before)
+{
+	static const uint32_t br[5] = {0x2315c, 0x23148, 0x23140, 0x23144, 0x18508};
+	*before = pa_rd(pa_gcc, PG_VOTE);
+	pa_wr(pa_gcc, PG_VOTE, *before | PG_VOTE_BITS);
+	for (unsigned i = 0; i < 5; i++) {
+		for (unsigned t = 0; t < 10000 && !pa_on(br[i]); t++) {
+			delay(1);
+		}
+		if (!pa_on(br[i])) {
+			printf("PANDORA GAUGE: clock %#x stays off (%#x); SE not read\n", br[i], pa_rd(pa_gcc, br[i]));
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Our votes taken back, the ones that were there before kept. */
+static void
+pg_unvote(uint32_t before)
+{
+	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~before));
+}
+
+/*
+ * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
+ * polls as often), the clocks voted only for the read. One line of it in the log every
+ * PG_LOG_EVERY reads, errors always.
+ */
+#define PG_PERIOD_MS 20000u
+#define PG_LOG_EVERY 15u
+
+static void
+pg_thread(void *arg, wait_result_t result)
+{
+	(void)arg;
+	(void)result;
+	for (unsigned n = 1;; n++) {
+		pa_sleep(PG_PERIOD_MS);
+		uint32_t before;
+		int e = pg_vote(&before) ? pa_gauge_read(false) : EIO;
+		pg_unvote(before);
+		struct pandora_gauge r;
+		if (e || n % PG_LOG_EVERY == 0) {
+			(void)pandora_gauge_get(&r, sizeof(r));
+			printf("PANDORA GAUGE: read %u err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n, e,
+			    r.voltage_mv, r.current_ma, r.temperature_dk / 10, r.temperature_dk % 10, r.soc, r.remaining_mah,
+			    r.full_mah, r.status);
+		}
+	}
 }
 
 /*
@@ -686,23 +775,13 @@ static void
 pa_gauge(void)
 {
 	static const uint32_t br[5] = {0x2315c, 0x23148, 0x23140, 0x23144, 0x18508};
-	const uint32_t vote = pa_rd(pa_gcc, PG_VOTE);
+	uint32_t vote = pa_rd(pa_gcc, PG_VOTE);
 	printf("PANDORA GAUGE: vote %#x; branches 2315c %#x 23148 %#x 23140 %#x 23144 %#x 18508 %#x; RCG cmd %#x cfg %#x; "
 	    "GPIO52 %#x/%#x GPIO53 %#x/%#x\n", vote, pa_rd(pa_gcc, br[0]), pa_rd(pa_gcc, br[1]), pa_rd(pa_gcc, br[2]),
 	    pa_rd(pa_gcc, br[3]), pa_rd(pa_gcc, br[4]), pa_rd(pa_gcc, 0x18518), pa_rd(pa_gcc, 0x1851c),
 	    pa_rd(pa_tlmm, PA_GPIO(52)), pa_rd(pa_tlmm, PA_GPIO(52) + 4), pa_rd(pa_tlmm, PA_GPIO(53)),
 	    pa_rd(pa_tlmm, PA_GPIO(53) + 4));
-	pa_wr(pa_gcc, PG_VOTE, vote | PG_VOTE_BITS);
-	bool on = true;
-	for (unsigned i = 0; i < 5 && on; i++) {
-		for (unsigned t = 0; t < 10000 && !pa_on(br[i]); t++) {
-			delay(1);
-		}
-		on = pa_on(br[i]);
-		if (!on) {
-			printf("PANDORA GAUGE: clock %#x stays off (%#x); SE not read\n", br[i], pa_rd(pa_gcc, br[i]));
-		}
-	}
+	const bool on = pg_vote(&vote);
 	vm_offset_t se = on ? ml_io_map_unmappable(PG_SE_PA, 0x4000, VM_WIMG_IO) : 0;
 	if (se) {
 		printf("PANDORA GAUGE: SE5 fw %#x if_disable %#x dma_mode %#x status %#x cmd %#x irq %#x irq_en %#x "
@@ -723,12 +802,15 @@ pa_gauge(void)
 		}
 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
 		    busy, changed);
-		if (pa_gauge_level >= 2 && !busy && !changed) {
-			pa_gauge_read();
+		if (pa_gauge_level >= 2 && !busy && !changed && !pa_gauge_read(true) && pa_gauge_level >= 3) {
+			thread_t thread;
+			if (kernel_thread_start(pg_thread, NULL, &thread) == KERN_SUCCESS) {
+				thread_deallocate(thread);
+			}
 		}
 		ml_io_unmap(se, 0x4000);
 	}
-	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~vote));
+	pg_unvote(vote);
 	printf("PANDORA GAUGE: vote back to %#x\n", pa_rd(pa_gcc, PG_VOTE));
 }
 

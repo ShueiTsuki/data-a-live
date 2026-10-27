@@ -126,9 +126,13 @@ typedef struct {
 	uint32_t ev_rp;        /* next event to look at, bytes into the event ring */
 	uint32_t ev_wp;        /* last element handed to the hardware */
 	bool open;
+	bool owned;            /* this GPII was free and set up by us: close takes it down */
+	bool quiet;            /* log errors only (periodic users) */
 } PandoraGpi;
 
-/* Allocate and start the GPII's event ring and both channels; logs every step. 0 or an errno. */
+/* Allocate and start the GPII's event ring and both channels; logs every step unless quiet. The
+ * register mapping and the ring memory stay with G after a close and are used again by the next
+ * open, so a G that is opened and closed repeatedly maps and allocates once. 0 or an errno. */
 int pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
     uint32_t seid, uint32_t proto);
 /* Write NW bytes (if any) to ADDR, then with a repeated start read NR bytes (if any). 0 or an errno. */

@@ -1652,10 +1652,10 @@ spk_step(void)
  * notification {header, number, 256 bytes}. bat2 asked with the classic 24-byte opcode 0x30 reads:
  * each came back as a 280-byte answer the old code did not take. The properties are the 4-byte ones
  * mca_qcom_subpmic_proxy reads. The percentage is not among them: Android reads the bq27z561 gauge on
- * the shared I2C bus (DT i2c@a94000) itself. Until the units are settled against Android's readings
- * and the gauge is read, the values are only logged, not handed to the battery service: a pass after
- * the channel comes up, then every 20 s and after each notification. Only reads go out; charging
- * stays the SOCCP's.
+ * the shared I2C bus (DT i2c@a94000) itself, and so do we (pandora_amp.c). Until the units are
+ * settled against Android's readings, only bus_volt goes to the battery service (charger connected);
+ * the rest are logged: a pass after the channel comes up, then every 20 s and after each notification.
+ * Only reads go out; charging stays the SOCCP's.
  */
 #define BM_OWNER         0x800au
 #define BM_TYPE_REQUEST  1u
@@ -1691,6 +1691,7 @@ static struct {
 	bool reading;                          /* a pass is under way */
 	uint64_t answer_by, refresh_at, open_by;
 	int32_t value[BM_PROPS];
+	bool ok[BM_PROPS];                     /* value answered without error in this pass */
 	uint32_t passes, answers, timeouts, notes, others;
 	char line[640];
 } bm;
@@ -1698,6 +1699,9 @@ static struct {
 LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
 LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
 static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
+#define BM_BUS_VOLT      0x20002u        /* bus_volt, µV (spk1: about 5 000 000 on the PC's USB) */
+static int32_t ad_bus_uv = -1;           /* the last MCA pass's bus voltage, -1 unknown */
+static uint64_t ad_bus_at;               /* when it was taken */
 
 static void
 bm_state(void *ctx, QcomGlinkChannel *ch, int up)
@@ -1792,6 +1796,7 @@ bm_handle(const uint8_t *m, uint32_t len)
 	char one[48];
 	bm.answers++;
 	bm.value[bm.step] = value;
+	bm.ok[bm.step] = result == 0;
 	if (result) {
 		snprintf(one, sizeof(one), " %s=err%#x", bm_props[bm.step].name, result);
 	} else {
@@ -1838,6 +1843,7 @@ bm_step(void)
 	if (bm.answer_by && now >= bm.answer_by) {
 		char one[40];
 		bm.timeouts++;
+		bm.ok[bm.step] = false;
 		snprintf(one, sizeof(one), " %s=?", bm_props[bm.step].name);
 		strlcat(bm.line, one, sizeof(bm.line));
 		bm.pending = bm.inflight = false;
@@ -1849,6 +1855,14 @@ bm_step(void)
 		bm.passes++;
 		printf("PANDORA SOCCP: MCA pass %u at %llu ms:%s (answers %u, timeouts %u)\n", bm.passes, ad_ms(ed_soccp.t0),
 		    bm.line, bm.answers, bm.timeouts);
+		for (unsigned i = 0; i < BM_PROPS; i++) {
+			if (bm_props[i].prop == BM_BUS_VOLT) {
+				lck_mtx_lock(&ad_batt_lock);
+				ad_bus_uv = bm.ok[i] ? bm.value[i] : -1;
+				ad_bus_at = now;
+				lck_mtx_unlock(&ad_batt_lock);
+			}
+		}
 		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
 	}
 	if (!bm.reading && bm.refresh_at && now >= bm.refresh_at) {
@@ -1862,16 +1876,50 @@ bm_step(void)
 	}
 }
 
-/* For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use. */
+/*
+ * For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use.
+ * The battery itself is the bq27z561 gauge's (bsd/dev/pandora_amp.c, pandora_gauge=3): its
+ * RelativeStateOfCharge as the percentage, voltage, current (positive while charging), temperature,
+ * the mAh figures and cycles. Android's battery psy (mca_business_battery batt_psy_get_prop, battui
+ * RESULT §3.1, §5): not online is discharging; online with the percentage at 100 and charging done
+ * (BatteryStatus FC, bit 5) is full; otherwise charging. Temperature is 0x06 in 0.1 K less 2730. A
+ * charger counts as online when the SOCCP's bus_volt of the last 60 s is above 4 V (pandora_battery=1),
+ * without one when the gauge sees charge current. Android shows a percentage a point or two above
+ * 0x2c while charging (battui §2.2); that filter is not known yet.
+ */
+#define AD_BUS_FRESH_MS  60000u
+#define AD_BUS_ON_UV     4000000
+
 bool
 pandora_battery_get(struct pandora_battery *b, size_t size)
 {
 	if (size != sizeof(*b)) {
 		return false;
 	}
+	struct pandora_gauge g;
+	const bool gauge = pandora_gauge_get(&g, sizeof(g));
 	lck_mtx_lock(&ad_batt_lock);
 	*b = ad_batt;
+	const int32_t bus_uv = ad_bus_uv;
+	const uint64_t bus_at = ad_bus_at;
 	lck_mtx_unlock(&ad_batt_lock);
+	if (gauge) {
+		b->valid = b->present = 1;
+		b->percent = g.soc < 0 ? 0 : g.soc > 100 ? 100 : g.soc;
+		b->voltage_mv = g.voltage_mv;
+		b->current_ma = g.current_ma;
+		b->temperature = (g.temperature_dk - 2730) * 10;
+		b->temperature_ok = g.temperature_dk > 2330 && g.temperature_dk < 3730;   /* -40 to 100 degrees */
+		b->raw_mah = g.remaining_mah;
+		b->full_mah = g.full_mah;
+		b->design_mah = g.design_mah;
+		b->cycles = g.cycles;
+		const bool bus_known = bus_at && bus_uv >= 0 && ad_ms(bus_at) < AD_BUS_FRESH_MS;
+		b->external = bus_known ? bus_uv > AD_BUS_ON_UV : g.current_ma > 0;
+		b->fully_charged = b->external && b->percent == 100 && (g.status & 0x20) != 0;
+		b->charging = b->external && !b->fully_charged;
+		b->time_to_full_min = b->time_to_empty_min = -1;
+	}
 	return b->valid != 0;
 }
 

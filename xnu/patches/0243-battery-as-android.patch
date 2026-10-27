@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index a748048..4a59ad8 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1880,11 +1880,12 @@ bm_step(void)
+  * For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use.
+  * The battery itself is the bq27z561 gauge's (bsd/dev/pandora_amp.c, pandora_gauge=3): its
+  * RelativeStateOfCharge as the percentage, voltage, current (positive while charging), temperature,
+- * the mAh figures and cycles; fully charged is BatteryStatus FC (bit 5, the Smart Battery layout the
+- * bq27z561 uses). A charger counts as connected when the SOCCP's bus_volt of the last 60 s is above
+- * 4 V (pandora_battery=1), without one when the gauge sees charge current. Charging is connected and
+- * not fully charged. How Android turns the same readings into its percentage and charging state is
+- * being checked (D:\DeepSeekHarness\battui).
++ * the mAh figures and cycles. Android's battery psy (mca_business_battery batt_psy_get_prop, battui
++ * RESULT §3.1, §5): not online is discharging; online with the percentage at 100 and charging done
++ * (BatteryStatus FC, bit 5) is full; otherwise charging. Temperature is 0x06 in 0.1 K less 2730. A
++ * charger counts as online when the SOCCP's bus_volt of the last 60 s is above 4 V (pandora_battery=1),
++ * without one when the gauge sees charge current. Android shows a percentage a point or two above
++ * 0x2c while charging (battui §2.2); that filter is not known yet.
+  */
+ #define AD_BUS_FRESH_MS  60000u
+ #define AD_BUS_ON_UV     4000000
+@@ -1907,15 +1908,15 @@ pandora_battery_get(struct pandora_battery *b, size_t size)
+ 		b->percent = g.soc < 0 ? 0 : g.soc > 100 ? 100 : g.soc;
+ 		b->voltage_mv = g.voltage_mv;
+ 		b->current_ma = g.current_ma;
+-		b->temperature = g.temperature_dk * 10 - 27315;
+-		b->temperature_ok = g.temperature_dk > 2331 && g.temperature_dk < 3731;   /* -40 to 100 degrees */
++		b->temperature = (g.temperature_dk - 2730) * 10;
++		b->temperature_ok = g.temperature_dk > 2330 && g.temperature_dk < 3730;   /* -40 to 100 degrees */
+ 		b->raw_mah = g.remaining_mah;
+ 		b->full_mah = g.full_mah;
+ 		b->design_mah = g.design_mah;
+ 		b->cycles = g.cycles;
+-		b->fully_charged = (g.status & 0x20) != 0;
+ 		const bool bus_known = bus_at && bus_uv >= 0 && ad_ms(bus_at) < AD_BUS_FRESH_MS;
+ 		b->external = bus_known ? bus_uv > AD_BUS_ON_UV : g.current_ma > 0;
++		b->fully_charged = b->external && b->percent == 100 && (g.status & 0x20) != 0;
+ 		b->charging = b->external && !b->fully_charged;
+ 		b->time_to_full_min = b->time_to_empty_min = -1;
+ 	}

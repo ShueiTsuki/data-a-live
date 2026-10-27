@@ -162,8 +162,10 @@ wait_done(PandoraGpi *g, uint32_t chid, uint32_t *len)
 		int result = -1;
 		while (g->ev_rp != hw) {
 			const PgpiEvent e = pgpi_event((const uint32_t *)(g->mem + EV_RING + g->ev_rp));
-			printf("PANDORA GPI: event type %#x channel %u code %u status %#x length %u tre %#llx\n", e.type, e.chid,
-			    e.code, e.status, e.length, e.tre);
+			if (!g->quiet || e.type != PGPI_EV_XFER_DONE || e.code == PGPI_CODE_ERROR) {
+				printf("PANDORA GPI: event type %#x channel %u code %u status %#x length %u tre %#llx\n", e.type,
+				    e.chid, e.code, e.status, e.length, e.tre);
+			}
 			if (e.type == PGPI_EV_XFER_DONE && e.chid == chid && result < 0) {
 				result = e.code == PGPI_CODE_ERROR ? EIO : 0;
 				*len = e.length;
@@ -188,30 +190,43 @@ int
 pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
     uint32_t seid, uint32_t proto)
 {
+	const vm_offset_t regs = g->regs, mem = g->mem;
+	const uint64_t mem_pa = g->mem_pa;
+	const bool quiet = g->quiet;
 	bzero(g, sizeof(*g));
 	g->ee_offset = ee_offset;
 	g->gpii = gpii;
 	g->seid = seid;
 	g->proto = proto;
-	g->regs = ml_io_map_unmappable((vm_offset_t)block_pa, block_len, VM_WIMG_IO);
+	g->quiet = quiet;
+	g->regs = regs ? regs : ml_io_map_unmappable((vm_offset_t)block_pa, block_len, VM_WIMG_IO);
 	if (!g->regs) {
 		return ENOMEM;
 	}
+	g->mem = mem;
+	g->mem_pa = mem_pa;
 	const uint32_t n = gpii;
-	printf("PANDORA GPI: gpii %u before: tx %#x rx %#x event %#x, type irq %#x, masks %#x/%#x/%#x\n", n,
-	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), rd(g, TYPE_IRQ(n)), rd(g, TYPE_IRQ_MSK(n)),
-	    rd(g, SRC_CH_IRQ_MSK(n)), rd(g, IEOB_IRQ_MSK(n)));
+	if (!quiet) {
+		printf("PANDORA GPI: gpii %u before: tx %#x rx %#x event %#x, type irq %#x, masks %#x/%#x/%#x\n", n,
+		    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), rd(g, TYPE_IRQ(n)),
+		    rd(g, TYPE_IRQ_MSK(n)), rd(g, SRC_CH_IRQ_MSK(n)), rd(g, IEOB_IRQ_MSK(n)));
+	}
 	if (((rd(g, CH_CNTXT(n, 0)) | rd(g, CH_CNTXT(n, 1)) | rd(g, EV_CNTXT(n))) >> 20) & 0xfu) {
-		printf("PANDORA GPI: gpii %u is in use; left alone\n", n);
-		ml_io_unmap(g->regs, block_len);
-		g->regs = 0;
+		if (!quiet) {
+			printf("PANDORA GPI: gpii %u is in use; left alone\n", n);
+		}
 		return EBUSY;
 	}
-	if (kmem_alloc_contig(kernel_map, &g->mem, MEM_LEN, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		return ENOMEM;
+	g->owned = true;
+	if (!g->mem) {
+		if (kmem_alloc_contig(kernel_map, &g->mem, MEM_LEN, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			g->mem = 0;
+			return ENOMEM;
+		}
+		g->mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)g->mem));
 	}
-	g->mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)g->mem));
+	bzero((void *)g->mem, MEM_LEN);
 	clean_dcache64((addr64_t)g->mem_pa, MEM_LEN, TRUE);
 
 	/* interrupts as gpi_config_interrupts; nothing takes them, the status is polled */
@@ -268,8 +283,10 @@ pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t 
 	for (uint32_t k = 0; k < 2 && !e; k++) {
 		e = command(g, false, OP_START, k, ST_STARTED);
 	}
-	printf("PANDORA GPI: gpii %u for SE %u: rings at %#llx, tx %#x rx %#x event %#x, err %d\n", n, seid, g->mem_pa,
-	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), e);
+	if (!quiet || e) {
+		printf("PANDORA GPI: gpii %u for SE %u: rings at %#llx, tx %#x rx %#x event %#x, err %d\n", n, seid,
+		    g->mem_pa, rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), e);
+	}
 	g->open = e == 0;
 	return e;
 }
@@ -326,7 +343,7 @@ pandora_gpi_i2c(PandoraGpi *g, const PgpiI2cClock *clk, uint8_t addr, const uint
 void
 pandora_gpi_close(PandoraGpi *g)
 {
-	if (!g->regs) {
+	if (!g->regs || !g->owned) {
 		return;
 	}
 	const uint32_t n = g->gpii;
@@ -352,8 +369,10 @@ pandora_gpi_close(PandoraGpi *g)
 	wr(g, GLOB_IRQ_EN(n), 0);
 	wr(g, GPII_IRQ_EN(n), 0);
 	wr(g, INTSET(n), 0);
-	printf("PANDORA GPI: gpii %u closed: tx %#x rx %#x event %#x\n", n, rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)),
-	    rd(g, EV_CNTXT(n)));
-	g->open = false;
+	if (!g->quiet) {
+		printf("PANDORA GPI: gpii %u closed: tx %#x rx %#x event %#x\n", n, rd(g, CH_CNTXT(n, 0)),
+		    rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)));
+	}
+	g->open = g->owned = false;
 }
 #endif /* PANDORA */

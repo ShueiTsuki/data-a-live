@@ -6,6 +6,7 @@
 #define PANDORA_BATTERY_H
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +23,19 @@ struct pandora_battery {
 
 /* The latest readings into b (size: sizeof(*b)); false when there are none to use. */
 bool pandora_battery_get(struct pandora_battery *b, size_t size);
+
+/* The bq27z561 gauge's standard commands as last read (bsd/dev/pandora_amp.c, pandora_gauge=3). */
+struct pandora_gauge {
+	int valid;
+	int voltage_mv, current_ma;             /* current: the gauge's sign, positive while charging */
+	int temperature_dk;                     /* 0.1 K */
+	int soc, remaining_mah, full_mah, design_mah, cycles, health;
+	int status;                             /* BatteryStatus (0x0a) */
+	uint64_t at;                            /* mach_absolute_time of the read */
+};
+
+/* The latest gauge reading into g (size: sizeof(*g)); false when there is none. */
+bool pandora_gauge_get(struct pandora_gauge *g, size_t size);
 
 #ifdef __cplusplus
 }
