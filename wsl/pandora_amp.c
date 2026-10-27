@@ -739,8 +739,8 @@ pg_unvote(uint32_t before)
 
 /*
  * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
- * polls as often), the clocks voted only for the read. One line of it in the log every
- * PG_LOG_EVERY reads, errors always.
+ * polls as often), the clocks voted only for the read. One line of it in the log for the first and
+ * every PG_LOG_EVERY reads, errors always.
  */
 #define PG_PERIOD_MS 20000u
 #define PG_LOG_EVERY 15u
@@ -756,7 +756,7 @@ pg_thread(void *arg, wait_result_t result)
 		int e = pg_vote(&before) ? pa_gauge_read(false) : EIO;
 		pg_unvote(before);
 		struct pandora_gauge r;
-		if (e || n % PG_LOG_EVERY == 0) {
+		if (e || n == 1 || n % PG_LOG_EVERY == 0) {
 			(void)pandora_gauge_get(&r, sizeof(r));
 			printf("PANDORA GAUGE: read %u err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n, e,
 			    r.voltage_mv, r.current_ma, r.temperature_dk / 10, r.temperature_dk % 10, r.soc, r.remaining_mah,
