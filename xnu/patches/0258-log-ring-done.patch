@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
+index be66898..ada9ffa 100644
+--- a/bsd/dev/pandora_usb.c
++++ b/bsd/dev/pandora_usb.c
+@@ -39,6 +39,7 @@
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint32_t sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max);   /* 0258: unfinished bytes too */
+ /* osfmk's, not in the headers BSD code sees (kern/processor.h, kern/sched_prim.h); master_processor
+  * itself is a per-CPU macro there */
+ extern processor_t cpu_to_processor(int cpu);
+@@ -201,7 +202,9 @@ pu_serial(void)
+  * the reset. The thread is stopped once its current pass ends (up to 20 ms; a panic can have stopped it
+  * inside one, and then only what the module already holds goes out), the rest of the console ring goes
+  * into the module, and the module sends it from this CPU (qcom_usb_debug_final_drain), for at most 2 s:
+- * as long as a reset waits when nothing on the PC reads the port.
++ * as long as a reset waits when nothing on the PC reads the port. The rest is every byte taken, stored
++ * or not (sweet_log_copy_any): a CPU a panic stopped inside sweet_log_put must not hold back the lines
++ * after it.
+  */
+ void pandora_usb_final(void);
+ void
+@@ -221,7 +224,7 @@ pandora_usb_final(void)
+ 	if (owned) {
+ 		for (unsigned k = 0; k < 2048; k++) {    /* 8 MiB at most, twice the ring */
+ 			if (pu_held == pu_sent) {
+-				pu_held = sweet_log_copy(&pu_pos, pu_chunk, PU_CHUNK);
++				pu_held = sweet_log_copy_any(&pu_pos, pu_chunk, PU_CHUNK);
+ 				pu_sent = 0;
+ 				if (!pu_held) {
+ 					break;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0575c62..e7800b0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1748,6 +1748,7 @@ void fuxi_storage_probe(void)
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
++static uint64_t _Atomic sweet_log_done;     /* 0258: bytes whose writer has stored them (sweet_log_copy) */
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+@@ -1774,6 +1775,7 @@ sweet_log_put(const char *c, int size)
+     __asm__ volatile("dc cvac, %0" :: "r"(&sweet_log_total) : "memory");
+     __asm__ volatile("dsb sy" ::: "memory");
+ #endif
++	os_atomic_add(&sweet_log_done, (uint64_t)size, release);
+ }
+ 
+ /* 0208: each line starts with "[ssssss.mmm] ", the time since the first log byte. */
+@@ -1832,16 +1834,22 @@ sweet_log_append(const char *c, int size)
+ }
+ 
+ /*
+- * Copy console bytes [*pos, total) (at most max) for live log streaming
+- * (sweet_usb.c). A reader that fell more than the ring behind skips ahead.
++ * Copy console bytes [*pos, end) (at most max) for live log streaming
++ * (sweet_usb.c, pandora_usb.c). A reader that fell more than the ring behind skips ahead.
+  * Returns the byte count; *pos advances.
++ * 0258: end is the last moment seen when every byte taken had been stored (sweet_log_done
++ * == sweet_log_total): sweet_log_put takes its place before it stores the bytes, and usb9's
++ * serial log got 13 NULs where a timestamp was still to come. sweet_log_copy_any goes up to
++ * every byte taken, for the last copy before a reset.
+  */
+-uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++static uint64_t sweet_log_safe;
+ 
+-uint32_t
+-sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
++static uint32_t
++sweet_log_copy_to(uint64_t *pos, char *out, uint32_t max, uint64_t total)
+ {
+-	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total < *pos) {
++		return 0;
++	}
+ 	if (total - *pos > SWEET_LOG_SIZE) {
+ 		*pos = total - SWEET_LOG_SIZE;
+ 	}
+@@ -1853,6 +1861,28 @@ sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
+ 	return n;
+ }
+ 
++uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++
++uint32_t
++sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
++{
++	const uint64_t done = os_atomic_load(&sweet_log_done, acquire);
++	const uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t safe = __atomic_load_n(&sweet_log_safe, __ATOMIC_RELAXED);
++	while (done == total && safe < total &&
++	    !__atomic_compare_exchange_n(&sweet_log_safe, &safe, total, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++	}
++	return sweet_log_copy_to(pos, out, max, __atomic_load_n(&sweet_log_safe, __ATOMIC_RELAXED));
++}
++
++uint32_t sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max);
++
++uint32_t
++sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max)
++{
++	return sweet_log_copy_to(pos, out, max, os_atomic_load(&sweet_log_total, relaxed));
++}
++
+ uint64_t sweet_log_position(void);
+ 
+ uint64_t

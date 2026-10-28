@@ -39,6 +39,7 @@
 
 extern kern_return_t thread_terminate(thread_t);
 extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+extern uint32_t sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max);   /* 0258: unfinished bytes too */
 /* osfmk's, not in the headers BSD code sees (kern/processor.h, kern/sched_prim.h); master_processor
  * itself is a per-CPU macro there */
 extern processor_t cpu_to_processor(int cpu);
@@ -201,7 +202,9 @@ pu_serial(void)
  * the reset. The thread is stopped once its current pass ends (up to 20 ms; a panic can have stopped it
  * inside one, and then only what the module already holds goes out), the rest of the console ring goes
  * into the module, and the module sends it from this CPU (qcom_usb_debug_final_drain), for at most 2 s:
- * as long as a reset waits when nothing on the PC reads the port.
+ * as long as a reset waits when nothing on the PC reads the port. The rest is every byte taken, stored
+ * or not (sweet_log_copy_any): a CPU a panic stopped inside sweet_log_put must not hold back the lines
+ * after it.
  */
 void pandora_usb_final(void);
 void
@@ -221,7 +224,7 @@ pandora_usb_final(void)
 	if (owned) {
 		for (unsigned k = 0; k < 2048; k++) {    /* 8 MiB at most, twice the ring */
 			if (pu_held == pu_sent) {
-				pu_held = sweet_log_copy(&pu_pos, pu_chunk, PU_CHUNK);
+				pu_held = sweet_log_copy_any(&pu_pos, pu_chunk, PU_CHUNK);
 				pu_sent = 0;
 				if (!pu_held) {
 					break;
