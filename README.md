@@ -98,4 +98,4 @@ GPU 部分用了 UniXNU 的组件：NativeAdreno 的用户接口、ArmSmmu4K、M
 
 ## 许可证
 
-内核补丁和编进内核的代码用 APSL 2.0，和 xnu 一样。其他代码和文档用 MIT。从别的项目拷来的文件保留原来的许可证。具体条款在 [LICENSE](LICENSE) 里。
+内核补丁和编进内核的代码用 APSL 2.0。其他代码和文档用 MIT。从别的项目拷来的文件保留原来的许可证。具体条款在 [LICENSE](LICENSE) 里。
