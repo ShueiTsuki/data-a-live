@@ -510,3 +510,4 @@
   - 热点 → 温度：DieTempHS(80)←芯片；MLBHigh/Low(48/45)←TSBE；BandMLB(46/43)←TSRM；Radio(46)←TSRR；Camera(49)←TSFC；Arc←TSBa；CGLED(49)←TSFL；Charger(43)←TSRQ。THERMAL_TRAP_LOAD 53-58 → 降温界面。
   - 输出：AppleCLPC（setDieTempControllerProperty: CPUMaxPower/GPUMaxPower/PackageMaxPower，mW）、AGXAccelerator（SGX/GPU 功率）、AppleARMBacklight（亮度上限）、充电 AppleChargeRateLimitIndex、ApplePMGR、AppleDieTempController。
   - 小米 → iPhone X 对应建议：电池←电量计；tdev2←charger；tdev3←pa1/pa2 取大；tdev4←quiet；mic1←display；mic2←flash；tdev1←cpu；tdev5←wifi；芯片传感器←tsens。usb9 173 s 试算：TSBE 42.0、TSRM 41.8、TSRR 40.5、TSRQ 40.5、TSFD 37.4（mi_thermald 机身 40.3）。
+- **用户（2026-10-28）：** 指出应该用小米机器的数据而不是 iPhone X 的（公式、阈值描述的是 iPhone X 机身）；问清区别后决定「接入」：温度接进 iOS 的温控机制（应用的发热等级、降温画面、亮度/充电走 iOS 的路），但机身温度公式和阈值用小米 mi_thermald 的，频率功耗用高通芯片的。下一步：查 thermalmonitord 能否不经 D22 类写死的公式、直接拿内核给的温度当热点温度；plist（目标温度、决策表）可换成按小米表写的版本放进固件包。
