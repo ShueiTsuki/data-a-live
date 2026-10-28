@@ -1506,19 +1506,49 @@ static struct {
 #define SPK_TONE_SLOT         0x2000u
 #define SPK_TONE_SLOTS        8u
 #define SPK_TONE_INFLIGHT     4u
-static const int32_t spk_sine[48] = {         /* one period of 1 kHz at 48 kHz, -12 dBFS q31 (0277; -20, -30 before) */
-	0, 70408896, 139613076, 206428438, 269711752, 328380223,
-	381430017, 427953439, 467154458, 498362334, 521043094, 534808661,
-	539423504, 534808661, 521043094, 498362334, 467154458, 427953439,
-	381430017, 328380223, 269711752, 206428438, 139613076, 70408896,
-	0, -70408896, -139613076, -206428438, -269711752, -328380223,
-	-381430017, -427953439, -467154458, -498362334, -521043094, -534808661,
-	-539423504, -534808661, -521043094, -498362334, -467154458, -427953439,
-	-381430017, -328380223, -269711752, -206428438, -139613076, -70408896,
+static const int32_t spk_sine[96] = {         /* one period of 500 Hz at 48 kHz, -12 dBFS q31 (0279; 1 kHz before) */
+	0, 35279985, 70408896, 105236305, 139613076, 173392003, 206428438, 238580915,
+	269711752, 299687642, 328380223, 355666630, 381430018, 405560063, 427953439, 448514252,
+	467154458, 483794237, 498362335, 510796368, 521043094, 529058633, 534808661, 538268557,
+	539423504, 538268557, 534808661, 529058633, 521043094, 510796368, 498362335, 483794237,
+	467154458, 448514252, 427953439, 405560063, 381430018, 355666630, 328380223, 299687642,
+	269711752, 238580915, 206428438, 173392003, 139613076, 105236305, 70408896, 35279985,
+	0, -35279985, -70408896, -105236305, -139613076, -173392003, -206428438, -238580915,
+	-269711752, -299687642, -328380223, -355666630, -381430018, -405560063, -427953439, -448514252,
+	-467154458, -483794237, -498362335, -510796368, -521043094, -529058633, -534808661, -538268557,
+	-539423504, -538268557, -534808661, -529058633, -521043094, -510796368, -498362335, -483794237,
+	-467154458, -448514252, -427953439, -405560063, -381430018, -355666630, -328380223, -299687642,
+	-269711752, -238580915, -206428438, -173392003, -139613076, -105236305, -70408896, -35279985,
 };
-/* 0277: one steady tone, faded in over the first 20 ms (0275's 300/200 ms beeps made the amps' 1 s readouts land in
- * the gaps, and the user heard nothing) */
+/*
+ * 0279 (spk20: the speakers play; the user could not tell whether one or both): the bottom speaker 500 Hz, the top
+ * 1 kHz, at different times, by the time since the tone started (the amps play from about 1.8 s to 19.8 s). Left
+ * (TDM slot 0) is the top amp, right (slot 1) the bottom: the amps' receive slots 0x4820 (0x42 slot 0, 0x40 slot 1).
+ * Each piece faded in and out over 20 ms.
+ */
+static const struct {
+	uint32_t from_ms, to_ms;
+	bool bottom, top;
+} spk_plan[] = {{3000, 8000, true, false}, {9000, 14000, false, true}, {15000, 18000, true, true}};
 #define SPK_TONE_FADE         SPK_TONE_FRAMES
+
+static int32_t
+spk_tone_sample(uint64_t n, bool top)
+{
+	for (unsigned i = 0; i < sizeof(spk_plan) / sizeof(spk_plan[0]); i++) {
+		const uint64_t a = (uint64_t)spk_plan[i].from_ms * 48u, b = (uint64_t)spk_plan[i].to_ms * 48u;
+		if (n < a || n >= b || !(top ? spk_plan[i].top : spk_plan[i].bottom)) {
+			continue;
+		}
+		int64_t v = spk_sine[(top ? 2u * n : n) % 96u];
+		const uint64_t edge = n - a < b - 1u - n ? n - a : b - 1u - n;
+		if (edge < SPK_TONE_FADE) {
+			v = v * (int64_t)edge / (int64_t)SPK_TONE_FADE;
+		}
+		return (int32_t)v;
+	}
+	return 0;
+}
 static struct {
 	bool on;
 	uint32_t sent, done, bad, inflight, busy;
@@ -2007,12 +2037,8 @@ spk_tone_pump(void)
 		int32_t *s = (int32_t *)(ad_shm_va + off);
 		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
 			const uint64_t n = spk_tone.frames + f;
-			int64_t v = spk_sine[n % 48u];
-			if (n < SPK_TONE_FADE) {
-				v = v * (int64_t)n / (int64_t)SPK_TONE_FADE;
-			}
-			s[2 * f] = (int32_t)v;
-			s[2 * f + 1] = (int32_t)v;
+			s[2 * f] = spk_tone_sample(n, true);
+			s[2 * f + 1] = spk_tone_sample(n, false);
 		}
 		__asm__ volatile ("dsb sy" ::: "memory");
 		const uint64_t a = ad_shm_pa + off;

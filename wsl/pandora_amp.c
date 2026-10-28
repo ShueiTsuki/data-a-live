@@ -752,7 +752,7 @@ pa_key(uint8_t addr, uint32_t test)
 	return err;
 }
 
-static void pa_dump(uint8_t addr);
+static void pa_dump(uint8_t addr) __unused;    /* comparisons with Android's chip values; not called now */
 static void pa_load(uint8_t addr, char side, unsigned what);
 
 /* 0275: the firmware's playback readouts (pa_mon_ctl), one line */
@@ -870,22 +870,17 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
 		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
 	}
-	/* 0277: 15 s of play (the steady tone), the firmware's readouts every second (0275: 8 s, at 1, 4, 7 s) */
-	for (unsigned s = 1; s <= 15; s++) {
+	/* 0279: 18 s of play (pandora_adsp.c's bottom, top, both pieces end 18 s after the tone starts, about 16 s into
+	 * the play), the firmware's readouts every second. 0278's dump while playing matched Android's chips; not now. */
+	for (unsigned s = 1; s <= 18; s++) {
 		char when[16];
 		pa_sleep(1000);
 		snprintf(when, sizeof(when), "play %u s", s);
 		pa_levels(0x40, when);
 		pa_levels(0x42, when);
-		if (s == 2) {
-			/* 0278: the whole ordinary register map while playing, against Android's chip values while
-			 * playing (cache bypassed) */
-			pa_dump(0x40);
-			pa_dump(0x42);
-		}
 	}
-	pa_state(0x40, "play 15 s");
-	pa_state(0x42, "play 15 s");
+	pa_state(0x40, "play 18 s");
+	pa_state(0x42, "play 18 s");
 	for (unsigned i = 0; i < 2; i++) {
 		if (!pa_awake[i] || !pa_r_audio) {
 			continue;
