@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index c1f6f5e..bc7e52e 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -240,14 +240,17 @@ IOAudio2Device::start(IOService *provider)
+ 	/* 0282: the UID VirtualAudio looks the speaker up by (aud1: HAL activated "PandoraBuiltInSpeaker" as device 33,
+ 	 * but VirtualAudio built no route to it). Its table of physical devices takes the iPhone's UIDs: "Codec"
+ 	 * (CS42L75: receiver, headphones, mics), "Speaker" (CS35L26), "Voice", "Reference", "Baseband Voice". */
+-	setProperty("device UID", "Speaker");
+-	setProperty("device name", "Speaker");
+-	setProperty("device manufacturer", "Pandora");
+ 	/* 0283: boot-arg pandora_audio_tt=1 makes it a Thunderbolt device, as sheng's plug-in on iPadOS 17
+ 	 * (VirtualAudio there routes a Thunderbolt device as a generic driver device; built-in devices it takes only
+-	 * from the product's transducer database). aud2/aud3 (built-in, UID "Speaker"): still no route. */
++	 * from the product's transducer database). aud2/aud3 (built-in, UID "Speaker"): still no route.
++	 * 0291: aud12-aud14 (built-in "Speaker", VirtualAudio loaded): no category ever gets a route to the speaker port,
++	 * whatever the ringer; the iPhone X routing database wants more than this one device. The Thunderbolt device
++	 * takes its own UID so that VirtualAudio does not build the built-in speaker (Device_Speaker_Aspen) from it. */
+ 	int tt = 0;
+ 	(void)PE_parse_boot_argn("pandora_audio_tt", &tt, sizeof(tt));
++	setProperty("device UID", tt == 1 ? "PandoraSpeaker" : "Speaker");
++	setProperty("device name", "Speaker");
++	setProperty("device manufacturer", "Pandora");
+ 	setProperty("transport type", tt == 1 ? PA_4CC('t', 'h', 'u', 'n') : PA_4CC('b', 'l', 't', 'n'), 32);
+ 	setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
+ 	setProperty("io buffer frame size", PA_RING_FRAMES, 32);
