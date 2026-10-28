@@ -25,7 +25,7 @@
  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
  * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
  * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
- * pandora_gauge=3 keeps reading it every 20 s for the battery service (pandora_gauge_get).
+ * pandora_gauge=3 keeps reading it every 5 s for the battery service (pandora_gauge_get).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -738,14 +738,16 @@ pg_unvote(uint32_t before)
 }
 
 /*
- * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
- * polls as often), the clocks voted only for the read; at once when pandora_gauge_kick asks
- * (charger plugged or unplugged). After a read that changes what the battery service shows
- * (percentage, charger, charging, full), or a kicked one, the service takes it at once. One line
- * of it in the log for the first, every PG_LOG_EVERY and every kicked read, errors always.
+ * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS, as often as
+ * Android's fg_update_status recomputes the percentage (battui2 §2.2b: 5.08-5.14 s apart in dmesg),
+ * the clocks voted only for the read; at once when pandora_gauge_kick asks (charger plugged or
+ * unplugged). After a read that changes what the battery service shows (percentage, charger,
+ * charging, full), or a kicked one, the service takes it at once, as Android notifies only on such
+ * changes. One line of it in the log for the first, every PG_LOG_EVERY and every kicked read,
+ * errors always.
  */
-#define PG_PERIOD_MS 20000u
-#define PG_LOG_EVERY 15u
+#define PG_PERIOD_MS 5000u
+#define PG_LOG_EVERY 60u
 
 static int pg_wake;
 static int pg_kicked;

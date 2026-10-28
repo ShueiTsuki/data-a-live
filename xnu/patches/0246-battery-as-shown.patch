@@ -1,0 +1,217 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index ab2f7bf..6214008 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1692,7 +1692,6 @@ static struct {
+ 	uint64_t answer_by, refresh_at, open_by;
+ 	int32_t value[BM_PROPS];
+ 	bool ok[BM_PROPS];                     /* value answered without error in this pass */
+-	int online;                            /* charger by bus_volt at the last pass: 1, 0, -1 not known */
+ 	uint32_t passes, answers, timeouts, notes, others;
+ 	char line[640];
+ } bm;
+@@ -1701,10 +1700,42 @@ LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
+ LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
+ static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
+ #define BM_BUS_VOLT      0x20002u        /* bus_volt, µV (spk1: about 5 000 000 on the PC's USB) */
+-#define AD_BUS_FRESH_MS  60000u
++#define AD_ONLINE_FRESH_MS 60000u
+ #define AD_BUS_ON_UV     4000000         /* spk6: unplugged 26 000-38 000, plugged 4 708 000-5 013 000 */
+-static int32_t ad_bus_uv = -1;           /* the last MCA pass's bus voltage, -1 unknown */
+-static uint64_t ad_bus_at;               /* when it was taken */
++#define AD_NOTE_FIRST_MS 5000u           /* a pass's bus_volt does not overrule a notification this young */
++#define BM_NOTE_ONLINE   0u              /* notification 0: USB online in payload word 0 (battui2 §1.2) */
++static int ad_online = -1;               /* charger plugged 1, not 0, -1 unknown */
++static uint64_t ad_online_at, ad_note_at;   /* when ad_online was set; when a notification set it */
++
++/*
++ * The charger plugged or not: from the SOCCP's notification 0 (Android's usb/online: qcom_subpmic_notify_cb
++ * id 0 -> qcom_subpmic_update_usb_online, battui2 §1.2-1.4) or, between notifications, a pass's bus_volt.
++ * A change tells the battery service at once and has the gauge read again for the new current.
++ */
++static void
++ad_set_online(int online, bool note, const char *why)
++{
++	const uint64_t now = mach_absolute_time();
++	lck_mtx_lock(&ad_batt_lock);
++	if (!note && ad_note_at && ad_ms(ad_note_at) < AD_NOTE_FIRST_MS) {
++		lck_mtx_unlock(&ad_batt_lock);
++		return;
++	}
++	const int was = ad_online;
++	ad_online = online;
++	ad_online_at = now;
++	if (note) {
++		ad_note_at = now;
++	}
++	lck_mtx_unlock(&ad_batt_lock);
++	if (was != online) {
++		printf("PANDORA SOCCP: charger %s (%s)\n", online ? "plugged" : "unplugged", why);
++		if (was >= 0) {
++			pandora_battery_changed();
++			pandora_gauge_kick();
++		}
++	}
++}
+ 
+ static void
+ bm_state(void *ctx, QcomGlinkChannel *ch, int up)
+@@ -1782,6 +1813,9 @@ bm_handle(const uint8_t *m, uint32_t len)
+ 			printf("PANDORA SOCCP: notification opcode %#x number %#x first word %#x (%u bytes)\n", op, bm_le32(m + 12),
+ 			    len >= 20 ? bm_le32(m + 16) : 0, len);
+ 		}
++		if (bm_le32(m + 12) == BM_NOTE_ONLINE && len >= 20) {
++			ad_set_online(bm_le32(m + 16) != 0, true, "notification");
++		}
+ 		bm.refresh_at = mach_absolute_time();  /* something changed: read again now */
+ 		return;
+ 	}
+@@ -1859,23 +1893,10 @@ bm_step(void)
+ 		printf("PANDORA SOCCP: MCA pass %u at %llu ms:%s (answers %u, timeouts %u)\n", bm.passes, ad_ms(ed_soccp.t0),
+ 		    bm.line, bm.answers, bm.timeouts);
+ 		for (unsigned i = 0; i < BM_PROPS; i++) {
+-			if (bm_props[i].prop == BM_BUS_VOLT) {
+-				lck_mtx_lock(&ad_batt_lock);
+-				ad_bus_uv = bm.ok[i] ? bm.value[i] : -1;
+-				ad_bus_at = now;
+-				lck_mtx_unlock(&ad_batt_lock);
+-				/* Plugged or unplugged (the SOCCP's notification started this pass, spk6): the
+-				 * battery service at once, and the gauge read again for the new current. */
+-				const int online = bm.ok[i] ? bm.value[i] > AD_BUS_ON_UV : -1;
+-				if (online >= 0 && online != bm.online) {
+-					if (bm.online >= 0) {
+-						printf("PANDORA SOCCP: charger %s (bus %d uV)\n", online ? "plugged" : "unplugged",
+-						    bm.value[i]);
+-						pandora_battery_changed();
+-						pandora_gauge_kick();
+-					}
+-					bm.online = online;
+-				}
++			if (bm_props[i].prop == BM_BUS_VOLT && bm.ok[i]) {
++				char why[32];
++				snprintf(why, sizeof(why), "bus %d uV", bm.value[i]);
++				ad_set_online(bm.value[i] > AD_BUS_ON_UV, false, why);
+ 			}
+ 		}
+ 		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
+@@ -1893,15 +1914,40 @@ bm_step(void)
+ 
+ /*
+  * For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use.
+- * The battery itself is the bq27z561 gauge's (bsd/dev/pandora_amp.c, pandora_gauge=3): its
+- * RelativeStateOfCharge as the percentage, voltage, current (positive while charging), temperature,
+- * the mAh figures and cycles. Android's battery psy (mca_business_battery batt_psy_get_prop, battui
+- * RESULT §3.1, §5): not online is discharging; online with the percentage at 100 and charging done
+- * (BatteryStatus FC, bit 5) is full; otherwise charging. Temperature is 0x06 in 0.1 K less 2730. A
+- * charger counts as online when the SOCCP's bus_volt of the last 60 s is above 4 V (pandora_battery=1),
+- * without one when the gauge sees charge current. Android shows a percentage a point or two above
+- * 0x2c while charging (battui §2.2); that filter is not known yet.
++ * The battery itself is the bq27z561 gauge's (bsd/dev/pandora_amp.c, pandora_gauge=3): voltage,
++ * current (positive while charging), temperature, the mAh figures and cycles; the percentage as
++ * ad_display_percent. Android's battery psy (mca_business_battery batt_psy_get_prop, battui RESULT
++ * §3.1, §5): not online is discharging; online with the percentage at 100 and charging done
++ * (BatteryStatus FC, bit 5) is full; otherwise charging. Temperature is 0x06 in 0.1 K less 2730.
++ * Online is ad_set_online's (the SOCCP's, pandora_battery=1) while it is under a minute old, without
++ * it charge current.
++ */
++#define AD_SOC_PROPORTION_C 97           /* DT soc-proportion-c = <0x61>, pandora-live.dts 41344 */
++
++/*
++ * The percentage Android shows (mca_strategy_fg_comp fg_ui_soc_smooth, the path at 0x916c that
++ * non-EU models take charging or not: the EU switch [+0xad8] is set by event 0x3a, "is_eu_model";
++ * battui2 §3.3-3.5): remaining over full charge in 0.01 %, 97 % of it stretched to 100 %. Android
++ * computes it every 5 s (fg_update_status) and then moves what it shows towards it a point at a time;
++ * that step timing is not taken over yet.
+  */
++static int
++ad_display_percent(const struct pandora_gauge *g)
++{
++	if (g->full_mah <= 0 || g->remaining_mah < 0) {
++		return g->soc < 0 ? 0 : g->soc > 100 ? 100 : g->soc;
++	}
++	const int64_t r = 10000LL * g->remaining_mah / g->full_mah;
++	if (r <= 0) {
++		return 0;
++	}
++	if (r > AD_SOC_PROPORTION_C * 100) {
++		return 100;
++	}
++	int64_t s = 10000LL * (r + 100) / (AD_SOC_PROPORTION_C * 100 + 100);
++	return (int)(s > 10000 ? 100 : s / 100);
++}
++
+ bool
+ pandora_battery_get(struct pandora_battery *b, size_t size)
+ {
+@@ -1912,12 +1958,12 @@ pandora_battery_get(struct pandora_battery *b, size_t size)
+ 	const bool gauge = pandora_gauge_get(&g, sizeof(g));
+ 	lck_mtx_lock(&ad_batt_lock);
+ 	*b = ad_batt;
+-	const int32_t bus_uv = ad_bus_uv;
+-	const uint64_t bus_at = ad_bus_at;
++	const int online = ad_online;
++	const uint64_t online_at = ad_online_at;
+ 	lck_mtx_unlock(&ad_batt_lock);
+ 	if (gauge) {
+ 		b->valid = b->present = 1;
+-		b->percent = g.soc < 0 ? 0 : g.soc > 100 ? 100 : g.soc;
++		b->percent = ad_display_percent(&g);
+ 		b->voltage_mv = g.voltage_mv;
+ 		b->current_ma = g.current_ma;
+ 		b->temperature = (g.temperature_dk - 2730) * 10;
+@@ -1926,8 +1972,8 @@ pandora_battery_get(struct pandora_battery *b, size_t size)
+ 		b->full_mah = g.full_mah;
+ 		b->design_mah = g.design_mah;
+ 		b->cycles = g.cycles;
+-		const bool bus_known = bus_at && bus_uv >= 0 && ad_ms(bus_at) < AD_BUS_FRESH_MS;
+-		b->external = bus_known ? bus_uv > AD_BUS_ON_UV : g.current_ma > 0;
++		const bool known = online >= 0 && online_at && ad_ms(online_at) < AD_ONLINE_FRESH_MS;
++		b->external = known ? online : g.current_ma > 0;
+ 		b->fully_charged = b->external && b->percent == 100 && (g.status & 0x20) != 0;
+ 		b->charging = b->external && !b->fully_charged;
+ 		b->time_to_full_min = b->time_to_empty_min = -1;
+@@ -1985,7 +2031,6 @@ soccp_attach(void)
+ 	}
+ 	int open_now = 0;
+ 	(void)PE_parse_boot_argn("pandora_battery_open", &open_now, sizeof(open_now));
+-	bm.online = -1;
+ 	static const QcomGlinkClient client = {bm_state, bm_receive};
+ 	bm.ch = qcom_glink_channel(&e->gl, "PMIC_RTR_SOCCP_APPS", BM_INTENT, BM_INTENTS, bm.storage, &client, NULL,
+ 	    open_now);
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 59ed883..18af4ff 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -25,7 +25,7 @@
+  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
+  * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
+  * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
+- * pandora_gauge=3 keeps reading it every 20 s for the battery service (pandora_gauge_get).
++ * pandora_gauge=3 keeps reading it every 5 s for the battery service (pandora_gauge_get).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -738,14 +738,16 @@ pg_unvote(uint32_t before)
+ }
+ 
+ /*
+- * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS (SweetBattery
+- * polls as often), the clocks voted only for the read; at once when pandora_gauge_kick asks
+- * (charger plugged or unplugged). After a read that changes what the battery service shows
+- * (percentage, charger, charging, full), or a kicked one, the service takes it at once. One line
+- * of it in the log for the first, every PG_LOG_EVERY and every kicked read, errors always.
++ * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS, as often as
++ * Android's fg_update_status recomputes the percentage (battui2 §2.2b: 5.08-5.14 s apart in dmesg),
++ * the clocks voted only for the read; at once when pandora_gauge_kick asks (charger plugged or
++ * unplugged). After a read that changes what the battery service shows (percentage, charger,
++ * charging, full), or a kicked one, the service takes it at once, as Android notifies only on such
++ * changes. One line of it in the log for the first, every PG_LOG_EVERY and every kicked read,
++ * errors always.
+  */
+-#define PG_PERIOD_MS 20000u
+-#define PG_LOG_EVERY 15u
++#define PG_PERIOD_MS 5000u
++#define PG_LOG_EVERY 60u
+ 
+ static int pg_wake;
+ static int pg_kicked;
