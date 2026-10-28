@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 85d6cfb..0326198 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -801,6 +801,18 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 	for (unsigned t = 0; t < 200 && !pa_done; t++) {
+ 		pa_sleep(100);
+ 	}
++	/*
++	 * 0280: the top amp's receiver switch, GPIO 174 (DT rcv_gpio_high / rcv_gpio_low on 0x42, mixer "T Enable RCV
++	 * Pin Control", cs35l43_rcv_switch_pinctrl_put: 1 = high "pull up", 0 = low "pull down"). Android's mixer
++	 * default is 1 and only the handset path sets 0; read on Android: "gpio174 : out high func0 2mA pull up".
++	 * Never set by us before 0280: the old state is logged.
++	 */
++	if (pa_tlmm) {
++		const uint32_t rcv_ctl = pa_rd(pa_tlmm, PA_GPIO(174)), rcv_io = pa_rd(pa_tlmm, PA_GPIO(174) + 4);
++		pa_gpio(174, 0, 3, 2, 1);
++		printf("PANDORA AMP: GPIO 174 (top amp receiver switch) was %#x/%u, now %#x/%u (Android: output high)\n",
++		    rcv_ctl, rcv_io & 3u, pa_rd(pa_tlmm, PA_GPIO(174)), pa_rd(pa_tlmm, PA_GPIO(174) + 4) & 3u);
++	}
+ 	if (!pa_ready) {
+ 		printf("PANDORA AMP: TDM clock up, but the amps are not loaded and started\n");
+ 		(void)thread_terminate(current_thread());
+@@ -1340,7 +1352,7 @@ pa_thread(void *arg, wait_result_t result)
+ 	pa_sleep(8000);
+ 	pa_gcc = ml_io_map_unmappable(PA_GCC_PA, 0x1f0000, VM_WIMG_IO);
+ 	pa_se = ml_io_map_unmappable(PA_SE_PA, 0x4000, VM_WIMG_IO);
+-	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xa0000, VM_WIMG_IO);
++	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xb0000, VM_WIMG_IO);    /* GPIO 0-175 (0280: 174) */
+ 	if (!pa_gcc || !pa_se || !pa_tlmm) {
+ 		goto out;
+ 	}
