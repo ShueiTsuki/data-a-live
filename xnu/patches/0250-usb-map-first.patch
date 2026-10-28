@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/pandora_usb.c b/bsd/dev/pandora_usb.c
+index 8b074a0..d514705 100644
+--- a/bsd/dev/pandora_usb.c
++++ b/bsd/dev/pandora_usb.c
+@@ -150,6 +150,11 @@ pu_serial(void)
+ 		printf("PANDORA USB: serial not started: not on the boot CPU\n");
+ 		return;
+ 	}
++	/* the module masks interrupts while it works; its windows are mapped first, here */
++	if (!qcom_usb_debug_map()) {
++		printf("PANDORA USB: serial not started: register windows not mapped\n");
++		return;
++	}
+ 	const int up = qcom_usb_debug_init();
+ 	pu_status(up ? "started" : "refused");
+ 	if (!up) {
+diff --git a/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h b/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
+index f3cdc4a..749e69d 100644
+--- a/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
++++ b/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
+@@ -103,6 +103,8 @@ extern "C" {
+  * before PE_init_kprintf. Requires exclusive USB ownership and no competing
+  * firmware callbacks. Returns 1 only when the fresh native core is running.
+  * Explicit qcom-usb-debug=1 is mandatory. No hook is installed here. */
++/* Data A Live: map the register windows first, interrupts enabled (a running kernel). */
++int qcom_usb_debug_map(void);
+ int qcom_usb_debug_init(void);
+ /* Candidate PE_kputc sink. All CPUs can enqueue before/during initialization.
+  * IRQ-safe nonspinning CPU-only backlog preserves the oldest bytes; overflow
+diff --git a/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c b/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
+index 9d8fdc2..48b2089 100644
+--- a/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
++++ b/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
+@@ -658,6 +658,18 @@ static int validate_static_pages(const uint8_t *arena, size_t arena_bytes, uint6
+     return 1;
+ }
+ 
++/* Data A Live: map the GCC, DWC3 and SMMU windows ahead of qcom_usb_debug_init, from a thread
++ * with interrupts enabled (ml_io_map allocates, which a running kernel refuses with interrupts
++ * masked). Mapping only: no register is read. 1 when all three are mapped. */
++int qcom_usb_debug_map(void)
++{
++    if (native.status.phase != QCOM_USB_DEBUG_NOT_INITIALIZED) return 0;
++    if (!native.gcc_va) native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
++    if (!native.usb_va) native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
++    if (!native.smmu_va) native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
++    return native.gcc_va && native.usb_va && native.smmu_va;
++}
++
+ int qcom_usb_debug_init(void)
+ {
+     uint64_t flags, frequency, ctr;
+@@ -740,12 +752,14 @@ int qcom_usb_debug_init(void)
+         fail(QCOM_USB_DEBUG_TABLES_NOT_CONTIGUOUS, 0); goto out;
+     }
+     native.status.dma_iova = QUSB_DOMAIN_IOVA;
++    /* Data A Live: windows qcom_usb_debug_map made beforehand are used as they are; mapping
++     * here, with interrupts masked, allocates and is refused once the kernel runs. */
+     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_GCC);
+-    native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
++    if (!native.gcc_va) native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
+     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_USB);
+-    native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
++    if (!native.usb_va) native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
+     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_SMMU);
+-    native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
++    if (!native.smmu_va) native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
+     if (!native.gcc_va || !native.usb_va || !native.smmu_va) {
+         fail(QCOM_USB_DEBUG_MAP_FAILED, 0); goto out;
+     }

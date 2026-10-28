@@ -103,6 +103,8 @@ extern "C" {
  * before PE_init_kprintf. Requires exclusive USB ownership and no competing
  * firmware callbacks. Returns 1 only when the fresh native core is running.
  * Explicit qcom-usb-debug=1 is mandatory. No hook is installed here. */
+/* Data A Live: map the register windows first, interrupts enabled (a running kernel). */
+int qcom_usb_debug_map(void);
 int qcom_usb_debug_init(void);
 /* Candidate PE_kputc sink. All CPUs can enqueue before/during initialization.
  * IRQ-safe nonspinning CPU-only backlog preserves the oldest bytes; overflow

@@ -658,6 +658,18 @@ static int validate_static_pages(const uint8_t *arena, size_t arena_bytes, uint6
     return 1;
 }
 
+/* Data A Live: map the GCC, DWC3 and SMMU windows ahead of qcom_usb_debug_init, from a thread
+ * with interrupts enabled (ml_io_map allocates, which a running kernel refuses with interrupts
+ * masked). Mapping only: no register is read. 1 when all three are mapped. */
+int qcom_usb_debug_map(void)
+{
+    if (native.status.phase != QCOM_USB_DEBUG_NOT_INITIALIZED) return 0;
+    if (!native.gcc_va) native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
+    if (!native.usb_va) native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
+    if (!native.smmu_va) native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
+    return native.gcc_va && native.usb_va && native.smmu_va;
+}
+
 int qcom_usb_debug_init(void)
 {
     uint64_t flags, frequency, ctr;
@@ -740,12 +752,14 @@ int qcom_usb_debug_init(void)
         fail(QCOM_USB_DEBUG_TABLES_NOT_CONTIGUOUS, 0); goto out;
     }
     native.status.dma_iova = QUSB_DOMAIN_IOVA;
+    /* Data A Live: windows qcom_usb_debug_map made beforehand are used as they are; mapping
+     * here, with interrupts masked, allocates and is refused once the kernel runs. */
     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_GCC);
-    native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
+    if (!native.gcc_va) native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_USB);
-    native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
+    if (!native.usb_va) native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
     diag_checkpoint(QCOM_USB_DEBUG_DIAG_MAP_SMMU);
-    native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
+    if (!native.smmu_va) native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
     if (!native.gcc_va || !native.usb_va || !native.smmu_va) {
         fail(QCOM_USB_DEBUG_MAP_FAILED, 0); goto out;
     }

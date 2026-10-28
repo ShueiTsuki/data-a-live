@@ -12,13 +12,14 @@ USB 串口日志（DWC3 设备模式，CDC ACM）用的内核代码，编进内�
 
 ## 我们改了什么
 
-除了导入脚本做的 include 改写，源码里有三处改动，都标了 “Data A Live”：
+除了导入脚本做的 include 改写，源码里有四处改动，都标了 “Data A Live”：
 
 1. `soc/Sm8850.h`：新文件，本机的平台配置。每个值的出处写在文件头里：设备树、主线 `gcc-kaanapali.c`，以及 usb1、spk6 两次实测。
 2. `include/QcomUsbSoc.h` 和 `kernel/QcomXnuUsbDebug.c`：初始化里“关着中断等电脑识别”的时间改成 `QUD_INIT_ENUM_WAIT_MS`，默认还是 5 秒。我们是在系统已经跑起来以后才从线程里启动它，所以设成 0，识别交给 `pandora_usb.c` 的轮询线程完成。
 3. `soc/QcomUsbBypass.c`：
    - SMMU 寄存器区的大小检查改成按映射窗口算。本机是 128 个全局页加 81 个上下文，共 0xd1000 字节，超过了原来写死的 0xd0000。
    - 固件留给流号 0x40 的上下文，只要翻译关着（SCTLR.M=0）、类型是 S1_TRANS_S2_BYPASS，就原样使用，不再改写成 SCTLR=0、CBAR=0x10000。
+4. `kernel/QcomXnuUsbDebug.c`、`include/QcomXnuUsbDebug.h`：新增 `qcom_usb_debug_map()`，在开着中断时先把时钟、DWC3、SMMU 三个寄存器窗口映射好；初始化时发现已经映射过就跳过。原来的初始化在关中断的状态下调用 `ml_io_map`，会申请内存，系统跑起来以后内核断言不允许，usb2 那次就在 0.19 秒重启了。
 
 ## 本机的交接状态（usb1，`fastboot boot` 之后）
 

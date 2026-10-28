@@ -150,6 +150,11 @@ pu_serial(void)
 		printf("PANDORA USB: serial not started: not on the boot CPU\n");
 		return;
 	}
+	/* the module masks interrupts while it works; its windows are mapped first, here */
+	if (!qcom_usb_debug_map()) {
+		printf("PANDORA USB: serial not started: register windows not mapped\n");
+		return;
+	}
 	const int up = qcom_usb_debug_init();
 	pu_status(up ? "started" : "refused");
 	if (!up) {
