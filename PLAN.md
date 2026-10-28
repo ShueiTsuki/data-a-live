@@ -485,3 +485,11 @@
 - thermadc 复核+自查（VERIFY.md）→ 0247：板上 14 个热敏电阻只读可得（SDAM0 0x090 第 1-7 格、SDAM1 0x091 第 0-6 格，设备树顺序；安卓单位 1/1024 度当 m 度报）；pandora_therm=1 每秒读、每 10 秒记机身温度（五个加权和取最大，2428 行 dump 验证）。未接降频。
 - 待上机（合并成一次 bat4）：0245-0247 = 插拔马上反映 + 显示百分比 + 读热敏电阻；要用户中途拔插 USB。看点：插拔日志、百分比、PANDORA THERM 的"格子变了多少次"（iOS 下 PMIC 是否还在测）。
 - 之后：按 mi_thermald 的 SS-CPU0/CPU6/MONITOR-GPU 表接降频（等 bat4 证明温度可读）；iosaudiocheck4 未完成部分自己看。
+- **用户插入（2026-10-28，bat4 之后查）：** Metal 翻译层的三个问题：
+  1. renderCommandEncoder 不支持 MTLPixelFormatRGB8_444_2P（两平面 YCbCr 4:4:4 8 位）；
+  2. AttachmentFormat(Color(0))：渲染管线要求的颜色附件和当前渲染目标不兼容，部分绘制被拒；
+  3. BGR10_XR_sRGB：翻译器只支持它的一部分混合组合。
+- **用户同意（2026-10-28）：** USB 排在三个 Metal 问题之后。现状：iOS 下只有充电（SOCCP 管），没有数据（无控制器驱动）。方向：查 iPhone X 内核缓存里 USB 控制器驱动是否是 Synopsys DWC3 一系；若是，高通外壳（ssusb@a600000 glue、PHY、eUSB2 repeater）由我们上电配置，控制器交给 iOS 原生驱动，用 ADT 描述接上，iTunes/usbmuxd 原生可用。
+- bat4（k0247，2026-10-28）：无死机，VKTEST 17 过。百分比照安卓（显示 78%，电量计 76%）；电量计 5 秒读通。插拔没测到（180 s 内 bus_volt 一直 5 V、无通知）。热敏电阻：iOS 下 SDAM 14 格全 0（安卓驱动配的 TM 自动测量重启后没了；SDAM0 0x4F-0x55 = 27 00 01 14 80 44 01，即引导程序单次测过 pmih010x 0x44 batt_therm，第 0 格 21401）→ 要读温度得照安卓 adc_tm5_gen3_configure 写 ADC 配置（PMIC 写，问用户）。芯片又到 105 C。
+- **用户插入（2026-10-28）：** USB 串口（调试日志走 USB），参考 https://github.com/Lux12138/nabu-usb-cdc 和 https://github.com/xiaoleGun/QcomXnuUsbDebug（只读参考）。与 USB 计划合并考虑。bat4 时用户没有拔插 USB，插拔测试仍待做。
+- **用户（2026-10-28）：先做 USB 串口（实时日志），Metal 三条暂停。** Metal 进度：三条来自同 SoC 的另一位移植者，不是我们日志里的。①RGB8_444_2P 当颜色附件：metal2vulkan 只让"读出来要换算"的双平面格式经 RGBA32F 替身渲染（ycbcr_renders 要求 reads==Converted），RGB*_444_2P 这类"存原码"的直接拒绝（render_pass.rs ~915）；shader 写入规则已有（ycbcr_write.rs：Y=G、Cb=B、Cr=R，round(clamp(v)*(2^b-1))），但渲染存回的规则作者只量过 converted 格式，code 格式未量。②AttachmentFormat(Color(i))：render.rs route/check_pipeline，管线颜色格式无法按 Metal 的放法落到通道颜色上时拒绝。③BGR10_XR_sRGB 混合：degradation.rs ExtendedRangeBlendSource 等。②③要具体格式/混合组合才能补。
