@@ -1,0 +1,193 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index 2bee577..15f1350 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -123,6 +123,7 @@ public:
+ 	uint64_t t0_ = 0;
+ 	volatile uint32_t traps_ = 0;
+ 	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
++	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
+ 
+ 	const char *tag(void) const { return hawking_ ? "Hawking" : "Speaker"; }
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -146,6 +147,7 @@ public:
+ 	bool started_ = false;
+ 
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+@@ -158,15 +160,19 @@ public:
+ OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
+ 
+ /*
+- * 0290: when the device is published. VirtualAudio picks a route in full only when ports come or go; on a ringer
+- * switch change it keeps any route that still works (aud12: "Ringer switch update." -> "Route did not change", the
+- * system sounds stay on Null_Device). Our speaker existed from boot, long before SpringBoard sets the ringer state,
+- * so its port was culled as "ringer switch is off". backboardd reads the switch once (SweetHIDButtons::copyEvent, ring
+- * or silent) and SpringBoard posts the state some 0.2 s later: the device is published 3 s after that read, and
+- * VirtualAudio routes it under the right ringer state. Fallbacks: published at 120 s uptime if nobody reads the
+- * switch; boot-arg pandora_audio_delay=SECONDS (0288) a fixed time instead; pandora_audio_now=1 at once.
++ * 0290/0293: when the speaker is published. VirtualAudio picks a route in full only when ports come or go, and the
++ * speaker port is dropped from the default device's route while the ringer is off ("Culling route connection because
++ * ringer switch is off"); a later ringer change does not bring it back (the default category's routing database entry
++ * is not ringer dependent: "Ringer switch update." -> "Route did not change"). The ringer is off until SpringBoard
++ * posts its state, about 11 s after backboardd reads the switch (SweetHIDButtons::copyEvent; aud13, unified log times
++ * x52). So the speaker is published 3 s after that read and then watched: when VirtualAudio routes the default device
++ * to it, it sets our stream active (aud19: "set stream active" 1 1 at "Route change succeeded"). Without that within
++ * 5 s the speaker is plugged in again (a new instance, the old one terminated), up to 12 times. Fallbacks: first
++ * publication at 120 s uptime if nobody reads the switch; boot-arg pandora_audio_delay=SECONDS a fixed time instead,
++ * pandora_audio_now=1 at once.
+  */
+ static volatile bool pa_ringer_known;
++static IOAudio2Device *pa_speaker;                           /* the instance the supervisor publishes (retained) */
+ 
+ extern "C" void pandora_audio_ringer_known(void);
+ void
+@@ -183,14 +189,38 @@ pa_uptime_ms(void)
+ 	return ns / NSEC_PER_MSEC;
+ }
+ 
++/* A new speaker instance, started (described) but not published. */
++static IOAudio2Device *
++pa_new_speaker(IOService *provider)
++{
++	IOAudio2Device *d = OSTypeAlloc(IOAudio2Device);
++	if (d == nullptr || !d->init()) {
++		OSSafeReleaseNULL(d);
++		return nullptr;
++	}
++	if (!d->attach(provider)) {
++		d->release();
++		return nullptr;
++	}
++	if (!d->start(provider)) {
++		d->detach(provider);
++		d->release();
++		return nullptr;
++	}
++	return d;
++}
++
+ static void
+-pa_publish_later(void *arg, wait_result_t)
++pa_supervise(void *arg, wait_result_t)
+ {
+-	IOAudio2Device *d = static_cast<IOAudio2Device *>(arg);
+-	int delay = 0;
++	IOService *provider = static_cast<IOService *>(arg);
++	int delay = 0, now = 0;
+ 	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
++	(void)PE_parse_boot_argn("pandora_audio_now", &now, sizeof(now));
+ 	const char *why;
+-	if (delay > 0) {
++	if (now) {
++		why = "at once";
++	} else if (delay > 0) {
+ 		while (pa_uptime_ms() < (uint64_t)delay * 1000) {
+ 			IOSleep(200);
+ 		}
+@@ -206,9 +236,33 @@ pa_publish_later(void *arg, wait_result_t)
+ 			why = "nobody read the ring/silent switch by 120 s";
+ 		}
+ 	}
+-	d->registerService();
+-	IOLog("PANDORA AUDIO: IOAudio2Device registered at %llu ms (%s)\n", pa_uptime_ms(), why);
+-	d->release();
++	for (unsigned attempt = 1;; attempt++) {
++		IOAudio2Device *d = pa_speaker;
++		d->registerService();
++		IOLog("PANDORA AUDIO Speaker: registered at %llu ms (%s, attempt %u)\n", pa_uptime_ms(), why, attempt);
++		for (unsigned t = 0; t < 50 && !d->routed_; t++) {
++			IOSleep(100);
++		}
++		if (d->routed_) {
++			IOLog("PANDORA AUDIO Speaker: routed at %llu ms (attempt %u)\n", pa_uptime_ms(), attempt);
++			break;
++		}
++		if (attempt == 12) {
++			IOLog("PANDORA AUDIO Speaker: not routed after %u attempts, left as it is\n", attempt);
++			break;
++		}
++		IOAudio2Device *n = pa_new_speaker(provider);
++		if (n == nullptr) {
++			IOLog("PANDORA AUDIO Speaker: no memory to plug it in again\n");
++			break;
++		}
++		IOLog("PANDORA AUDIO Speaker: not routed within 5 s, plugging it in again\n");
++		pa_speaker = n;
++		d->terminate();
++		d->release();
++		why = "plugged in again";
++	}
++	provider->release();
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -318,23 +372,21 @@ IOAudio2Device::start(IOService *provider)
+ 	OSSafeReleaseNULL(outs);
+ 	OSSafeReleaseNULL(ins);
+ 	OSSafeReleaseNULL(controls);
+-	/* 0288/0290: published later, see pa_publish_later. */
+-	int now = 0;
+-	(void)PE_parse_boot_argn("pandora_audio_now", &now, sizeof(now));
+-	if (!now) {
++	/* 0293: published and watched by pa_supervise; an instance made to plug the speaker in again is published there. */
++	if (pa_speaker == nullptr) {
+ 		retain();
++		pa_speaker = this;
++		provider->retain();
+ 		thread_t thread;
+-		if (kernel_thread_start(pa_publish_later, this, &thread) == KERN_SUCCESS) {
++		if (kernel_thread_start(pa_supervise, provider, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+ 		} else {
+-			release();
++			provider->release();
+ 			registerService();
+ 		}
+-	} else {
+-		registerService();
+ 	}
+-	IOLog("PANDORA AUDIO: IOAudio2Device %s: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n",
+-	    now ? "registered" : "made, published later", PA_RATE, PA_CHANNELS, PA_RING_FRAMES);
++	IOLog("PANDORA AUDIO Speaker: made: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n", PA_RATE,
++	    PA_CHANNELS, PA_RING_FRAMES);
+ 	return true;
+ }
+ 
+@@ -389,6 +441,7 @@ IOAudio2Device::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 		OSSafeReleaseNULL(uc);
+ 		return kIOReturnNoMemory;
+ 	}
++	retain();                                                /* 0293: a speaker plugged in again is terminated */
+ 	uc->device_ = this;
+ 	proc_selfname(uc->name_, sizeof(uc->name_));
+ 	if (!uc->attach(this) || !uc->start(this)) {
+@@ -507,6 +560,13 @@ IOAudio2DeviceUserClient::clientClose(void)
+ 	return kIOReturnSuccess;
+ }
+ 
++void
++IOAudio2DeviceUserClient::free(void)
++{
++	OSSafeReleaseNULL(device_);
++	IOUserClient::free();
++}
++
+ IOReturn
+ IOAudio2DeviceUserClient::setProperties(OSObject *properties)
+ {
+@@ -603,6 +663,11 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 			    rate_bits, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+ 		}
+ 		break;
++	case 6:                                                  /* stream ID, active */
++		if (s[1] != 0) {
++			device_->routed_ = true;
++		}
++		break;
+ 	case 8:
+ 		ret = kIOReturnUnsupported;
+ 		break;
