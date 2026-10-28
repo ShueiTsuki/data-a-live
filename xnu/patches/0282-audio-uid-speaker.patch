@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index 4965491..c5c1ca0 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -177,7 +177,10 @@ IOAudio2Device::start(IOService *provider)
+ 	}
+ 	bzero(status_->getBytesNoCopy(), PA_STATUS_BYTES);
+ 	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);
+-	setProperty("device UID", "PandoraBuiltInSpeaker");
++	/* 0282: the UID VirtualAudio looks the speaker up by (aud1: HAL activated "PandoraBuiltInSpeaker" as device 33,
++	 * but VirtualAudio built no route to it). Its table of physical devices takes the iPhone's UIDs: "Codec"
++	 * (CS42L75: receiver, headphones, mics), "Speaker" (CS35L26), "Voice", "Reference", "Baseband Voice". */
++	setProperty("device UID", "Speaker");
+ 	setProperty("device name", "Speaker");
+ 	setProperty("device manufacturer", "Pandora");
+ 	setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);

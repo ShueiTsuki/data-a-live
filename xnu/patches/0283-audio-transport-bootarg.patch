@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index c5c1ca0..b042fe2 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -183,7 +183,12 @@ IOAudio2Device::start(IOService *provider)
+ 	setProperty("device UID", "Speaker");
+ 	setProperty("device name", "Speaker");
+ 	setProperty("device manufacturer", "Pandora");
+-	setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);
++	/* 0283: boot-arg pandora_audio_tt=1 makes it a Thunderbolt device, as sheng's plug-in on iPadOS 17
++	 * (VirtualAudio there routes a Thunderbolt device as a generic driver device; built-in devices it takes only
++	 * from the product's transducer database). aud2/aud3 (built-in, UID "Speaker"): still no route. */
++	int tt = 0;
++	(void)PE_parse_boot_argn("pandora_audio_tt", &tt, sizeof(tt));
++	setProperty("transport type", tt == 1 ? PA_4CC('t', 'h', 'u', 'n') : PA_4CC('b', 'l', 't', 'n'), 32);
+ 	setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
+ 	setProperty("io buffer frame size", PA_RING_FRAMES, 32);
+ 	setProperty("output latency", PA_OUT_LATENCY, 32);

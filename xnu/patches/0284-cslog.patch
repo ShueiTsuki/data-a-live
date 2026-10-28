@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 8e0137d..3a54491 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -4595,6 +4595,36 @@ reconstitute_code_signature(
+ 	return 0;
+ }
+ 
++#include <pexpert/pexpert.h>
++
++/*
++ * PANDORA (0284): boot-arg pandora_cslog=NAME logs each code signature a process of that name adds (the images
++ * dyld maps outside the shared cache: plug-ins, bundles), with the result.
++ */
++static void
++pandora_cslog(struct vnode *vp, int error)
++{
++	static int state;                       /* 0 not read yet, 1 off, 2 on */
++	static char want[32];
++	if (state == 0) {
++		state = PE_parse_boot_arg_str("pandora_cslog", want, sizeof(want)) && want[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (strncmp(name, want, sizeof(name)) != 0) {
++		return;
++	}
++	char path[256];
++	int len = sizeof(path);
++	if (vn_getpath(vp, path, &len) != 0) {
++		strlcpy(path, "?", sizeof(path));
++	}
++	printf("PANDORA CS: %s adds the signature of %s: %d\n", name, path, error);
++}
++
+ int
+ ubc_cs_blob_add(
+ 	struct vnode    *vp,
+@@ -5019,6 +5049,7 @@ ubc_cs_blob_add(
+ 	error = 0;      /* success ! */
+ 
+ out:
++	pandora_cslog(vp, error);
+ 	if (error) {
+ 		if (error != EAGAIN) {
+ 			printf("check_signature[pid: %d]: error = %d\n", proc_getpid(current_proc()), error);

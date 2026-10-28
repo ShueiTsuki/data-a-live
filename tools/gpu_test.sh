@@ -2,7 +2,7 @@
 # One GPU test round on the phone, from Git Bash:
 #
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
-#                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N] [--amp-fw DIR]
+#                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N] [--amp-fw DIR] [--log-cfg PLIST]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -28,6 +28,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
+LOG_CFG=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
 	--no-vktest) SWAP=; shift ;;          # vktest not run (launchd restarts it all boot, mtltest with it)
 	--metal-from) METAL_FROM=$2; shift 2 ;;  # a local plugin build (tools/metal/build_plugin_linux.sh OUT, WSL path)
 	--amp-fw) AMP_FW=$2; shift 2 ;;        # the amplifiers' firmware files (Windows-side directory)
+	--log-cfg) LOG_CFG+=("$2"); shift 2 ;; # a unified-log subsystem config (tools/logging/SUBSYSTEM.plist), repeatable
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -151,6 +153,13 @@ if [ -n "${AMP_FW:-}" ]; then
 		PARTS+=("$(winp "$AMP_FW/crus_calr.bin")")
 	fi
 fi
+# --log-cfg: logd's per-subsystem overrides (/Library/Preferences/Logging/Subsystems, next to the system's own in
+# /System/Library/Preferences/Logging/Subsystems), e.g. debug level persisted for VirtualAudio's categories
+for c in "${LOG_CFG[@]}"; do
+	[ -f "$c" ] || { echo "no $c"; exit 1; }
+	printf '%s 644 /Library/Preferences/Logging/Subsystems/%s\n' "$(basename "$c")" "$(basename "$c")" >> "$T/files.txt"
+	PARTS+=("$(winp "$c")")
+done
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"
 SZ=$(stat -c %s "$PACK"); N=$((SZ / 4096)); WANT=$(sha256sum "$PACK" | cut -c1-64)
