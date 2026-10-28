@@ -125,6 +125,18 @@
 			<string>Debug</string>
 		</dict>
 	</dict>
+	<key>va_dsp   </key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
 	<key>va_haptic</key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
@@ -221,6 +233,18 @@
 			<string>Debug</string>
 		</dict>
 	</dict>
+	<key>va_port  </key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
 	<key>va_prtmgr</key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
@@ -258,6 +282,18 @@
 		</dict>
 	</dict>
 	<key>va_rthndl</key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
+	<key>va_rtmgr </key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
 		<true/>
@@ -342,6 +378,18 @@
 		</dict>
 	</dict>
 	<key>va_usbiap</key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
+	<key>va_utils </key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
 		<true/>

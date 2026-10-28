@@ -154,6 +154,28 @@ public:
 
 OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
 
+/* pandora_audio_delay (0288): publish the device once the uptime reaches the boot-arg's seconds. */
+static void
+pa_publish_later(void *arg, wait_result_t)
+{
+	IOAudio2Device *d = static_cast<IOAudio2Device *>(arg);
+	int delay = 0;
+	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
+	uint64_t ns = 0;
+	for (;;) {
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		if (ns >= (uint64_t)delay * NSEC_PER_SEC) {
+			break;
+		}
+		IOSleep(200);
+	}
+	d->registerService();
+	IOLog("PANDORA AUDIO: IOAudio2Device registered at %llu ms\n", ns / NSEC_PER_MSEC);
+	d->release();
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
 bool
 IOAudio2Device::start(IOService *provider)
 {
@@ -207,9 +229,28 @@ IOAudio2Device::start(IOService *provider)
 	OSSafeReleaseNULL(outs);
 	OSSafeReleaseNULL(ins);
 	OSSafeReleaseNULL(controls);
-	registerService();
-	IOLog("PANDORA AUDIO: IOAudio2Device registered: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n",
-	    PA_RATE, PA_CHANNELS, PA_RING_FRAMES);
+	/*
+	 * 0288: boot-arg pandora_audio_delay=SECONDS publishes the device that many seconds after boot. aud9: VirtualAudio
+	 * routes the default device the moment the speaker appears ("Culling route connection because ringer switch is
+	 * off", pap -> pspk) and keeps the null device after SpringBoard turns the ringer on 0.3 s later; system sounds
+	 * then run on Null_Device. Published after SpringBoard has set the ringer state, the speaker is routed.
+	 */
+	int delay = 0;
+	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
+	if (delay > 0) {
+		retain();
+		thread_t thread;
+		if (kernel_thread_start(pa_publish_later, this, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			release();
+			registerService();
+		}
+	} else {
+		registerService();
+	}
+	IOLog("PANDORA AUDIO: IOAudio2Device %s: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n",
+	    delay > 0 ? "made, published later" : "registered", PA_RATE, PA_CHANNELS, PA_RING_FRAMES);
 	return true;
 }
 

@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index c63a848..d565b33 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -330,6 +330,7 @@ class SweetHIDButtons : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -398,6 +399,26 @@ SweetHIDButtons::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * PANDORA 0289: the ring/silent switch. backboardd's BKButtonHIDEventProcessor asks at start for the current keyboard
++ * event of Telephony page 0x0B usage 0x2E and takes its down field as the ringer state (0 "silent", 1 "tone1"). The
++ * phone has no switch; without an answer iOS starts silent (SpringBoard mutes the ringer, VirtualAudio keeps the
++ * speaker out of system sounds). The switch reads "ring"; boot-arg sweetringer=0 makes it "silent".
++ */
++IOHIDEvent *
++SweetHIDButtons::copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options)
++{
++	if (type == kIOHIDEventTypeKeyboard && matching != NULL &&
++	    matching->getIntegerValue(kIOHIDEventFieldKeyboardUsagePage) == kHIDPage_Telephony &&
++	    matching->getIntegerValue(kIOHIDEventFieldKeyboardUsage) == 0x2e) {
++		UInt32 ring = 1;
++		(void)PE_parse_boot_argn("sweetringer", &ring, sizeof(ring));
++		IOLog("SWEET HID: ring/silent switch asked: %s\n", ring ? "ring" : "silent");
++		return IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Telephony, 0x2e, ring != 0);
++	}
++	return IOHIDEventService::copyEvent(type, matching, options);
++}
++
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
