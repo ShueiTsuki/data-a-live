@@ -1,0 +1,113 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index eae68a2..b4b56cb 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1193,6 +1193,85 @@ sweet_exec_blocked(const char *name, bool log)
+ 	}
+ 	return false;
+ }
++/*
++ * sweetcrashstop=N (0274; default 3, 0 off): a program that crashed N times this boot (kern_exit.c, where Crash
++ * Reporter is told) is not started again until the next boot; launchd's next spawn fails here like a sweetnoexec
++ * one. Never stopped: the programs without which the phone is not usable (better they restart).
++ */
++#define SWEET_CRASH_SLOTS 48
++static LCK_MTX_DECLARE(sweet_crash_lock, &proc_lck_grp);
++static struct {
++	char name[MAXCOMLEN + 1];
++	uint32_t n;
++	bool stopped;
++} sweet_crashes[SWEET_CRASH_SLOTS];
++static int sweet_crash_limit = -1;
++static const char *const sweet_crash_keep[] = {"launchd", "SpringBoard", "backboardd", "runningboardd", "logd",
++    "notifyd", "configd", "securityd", "keybagd", "ReportCrash", "mediaserverd", "audiomxd", "lsd", "installd",
++    "UserEventAgent", "cfprefsd", "containermanager"};
++
++static int
++sweet_crash_limit_get(void)
++{
++	if (sweet_crash_limit < 0) {
++		int n = 3;
++		(void)PE_parse_boot_argn("sweetcrashstop", &n, sizeof(n));
++		sweet_crash_limit = n < 0 ? 0 : n;
++	}
++	return sweet_crash_limit;
++}
++
++void sweet_crash_count(const char *name);
++void
++sweet_crash_count(const char *name)
++{
++	const int limit = sweet_crash_limit_get();
++	if (!limit || name == NULL || !name[0]) {
++		return;
++	}
++	for (unsigned k = 0; k < sizeof(sweet_crash_keep) / sizeof(sweet_crash_keep[0]); k++) {
++		if (strncmp(name, sweet_crash_keep[k], MAXCOMLEN) == 0) {
++			return;
++		}
++	}
++	lck_mtx_lock(&sweet_crash_lock);
++	unsigned i = 0;
++	for (; i < SWEET_CRASH_SLOTS && sweet_crashes[i].name[0]; i++) {
++		if (strncmp(sweet_crashes[i].name, name, MAXCOMLEN) == 0) {
++			break;
++		}
++	}
++	if (i < SWEET_CRASH_SLOTS) {
++		if (!sweet_crashes[i].name[0]) {
++			strlcpy(sweet_crashes[i].name, name, sizeof(sweet_crashes[i].name));
++		}
++		if (++sweet_crashes[i].n == (uint32_t)limit) {
++			sweet_crashes[i].stopped = true;
++			printf("CRASH %s: %u crashes this boot, not started again (sweetcrashstop)\n", sweet_crashes[i].name,
++			    sweet_crashes[i].n);
++		}
++	}
++	lck_mtx_unlock(&sweet_crash_lock);
++}
++
++static bool
++sweet_crash_stopped(const char *name)
++{
++	bool stopped = false;
++	if (!sweet_crash_limit_get()) {
++		return false;
++	}
++	lck_mtx_lock(&sweet_crash_lock);
++	for (unsigned i = 0; i < SWEET_CRASH_SLOTS && sweet_crashes[i].name[0]; i++) {
++		if (sweet_crashes[i].stopped && strncmp(sweet_crashes[i].name, name, MAXCOMLEN) == 0) {
++			stopped = true;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_crash_lock);
++	return stopped;
++}
++
+ #include "sweet_execswap.h"
+ static LCK_MTX_DECLARE(sweet_execswap_lock, &proc_lck_grp);
+ static const char *
+@@ -7486,7 +7565,8 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-			if (!(imgp->ip_flags & IMGPF_SWEET_EXECSWAP) && sweet_exec_blocked(p->p_name, true)) {
++			if (!(imgp->ip_flags & IMGPF_SWEET_EXECSWAP) &&
++			    (sweet_exec_blocked(p->p_name, true) || sweet_crash_stopped(p->p_name))) {
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index f3b0784..cbff06e 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1904,6 +1904,8 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 		if (p == current_proc()) {
+ 			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++			extern void sweet_crash_count(const char *);      /* kern_exec.c, 0274 */
++			sweet_crash_count(p->p_comm);
+ 			sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
+ 			    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
+ 			/* abort_with_payload messages (_objc_fatal, os_crash_fmt, ...) */

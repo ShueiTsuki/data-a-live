@@ -437,6 +437,16 @@ static bool pa_ready;                                /* both amps loaded and sta
 static volatile bool pa_done;                        /* pa_thread finished, ready or not (0268) */
 static bool pa_awake[2];                             /* 0x40, 0x42: the firmware answered on the mailbox (0270) */
 static uint32_t pa_r_calsel, pa_r_actboot;           /* CAL_R_SEL (alg 0x5F210), ALLOW_ACT_BOOT (0x5F224) (0271) */
+/* 0275: what the firmware reports while it plays; Android's mixer dump during playback (speakercheck
+ * raw/during/tinymix_1.txt, bottom amp): AUDIO_EN_STATUS 1, CLOCK_OK 1, SAMPLING_RATE 48000, ERROR 0,
+ * ABNORMAL_MUTE 0, AUDIO_IN_MAX 0x109, VOLTAGE_MAX 0x1a8, CURRENT_MAX 0x172; after playback the last three 2, 0, 0. */
+static const struct {
+	uint32_t alg;
+	const char *name;
+} pa_mon_ctl[8] = {{0x5f212, "AUDIO_EN_STATUS"}, {0x5f212, "CLOCK_OK"}, {0x5f212, "SAMPLING_RATE"},
+    {0x5f212, "ERROR"}, {0x5f21f, "ABNORMAL_MUTE"}, {0x5f210, "AUDIO_IN_MAX"}, {0x5f210, "VOLTAGE_MAX"},
+    {0x5f210, "CURRENT_MAX"}};
+static uint32_t pa_r_mon[8];
 static uint32_t pa_calr[2];                          /* 0x40, 0x42: this phone's calibration, never printed (0271) */
 static bool pa_calr_ok;
 static const CsfwInfo *pa_infop;                     /* the firmware's algorithm list, for the scene at power-up */
@@ -535,6 +545,9 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
 	pa_r_audio = r_audio;
 	pa_r_calsel = pa_ctl(fw, fw_size, info, 0x5f210, "CAL_R_SEL");
 	pa_r_actboot = pa_ctl(fw, fw_size, info, 0x5f224, "ALLOW_ACT_BOOT");
+	for (unsigned k = 0; k < 8; k++) {
+		pa_r_mon[k] = pa_ctl(fw, fw_size, info, pa_mon_ctl[k].alg, pa_mon_ctl[k].name);
+	}
 	uint32_t lock = 0, mem = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
 	err = pa_reg(addr, PA_HALO_CORE, &core);
 	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
@@ -571,11 +584,14 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
  *  - the Halo registers Android's dump has (pa_halo), and the whole dump after power-up, against Android's
  *    dump during playback (speakercheck raw/during);
  *  - the lines short: spk7's long ones were cut by other threads' output.
+ * 0278: Android's chips read with the regmap cache bypassed (idle, both amps): every value here is the chip's but
+ * 0x0104 and 0x0124, which are 1 on the chip (as ours after reset); the 0 of the old dump was the driver's cache
+ * default, the driver never writes them. Left alone now.
  */
 static const struct {
 	uint32_t reg, v40, v42;
 } pa_cfg[] = {
-	{0x0104, 0, 0}, {0x0124, 0, 0}, {0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
+	{0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
 	{0x3808, 0x40, 0x40}, {0x4808, 0x20200000, 0x20200000},
 	{0x480c, 3, 3}, {0x4810, 1, 0}, {0x4820, 0x20401, 0x20200}, {0x4830, 0x20, 0x20}, {0x4840, 0x20, 0x20},
 	{0x4c20, 0x36, 0x36}, {0x4c24, 0, 0}, {0x4c44, 8, 8}, {0x6000, 0x8004, 0x8004}, {0x6404, 0x02005604, 0x02005604},
@@ -739,6 +755,22 @@ pa_key(uint8_t addr, uint32_t test)
 static void pa_dump(uint8_t addr);
 static void pa_load(uint8_t addr, char side, unsigned what);
 
+/* 0275: the firmware's playback readouts (pa_mon_ctl), one line */
+static void
+pa_levels(uint8_t addr, const char *when)
+{
+	uint32_t v[8];
+	int err = 0;
+	for (unsigned k = 0; k < 8; k++) {
+		v[k] = 0;
+		if (pa_r_mon[k] && !err) {
+			err = pa_reg(addr, pa_r_mon[k], &v[k]);
+		}
+	}
+	printf("PANDORA AMP: %#x %s: en %x clock %x rate %u error %x mute %x in max %#x V max %#x I max %#x, err %d\n",
+	    addr, when, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], err);
+}
+
 /* 0271: the music scene laid on the running DSP when the main amp powers up, as cs35l43_main_amp_event does
  * (cs35l43_apply_delta_tuning: request_firmware of the delta file, then cs_dsp_load_coeff). */
 static int
@@ -789,9 +821,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		}
 		const int cfg_err = err;
 		err = err ? err : pa_sysclk(amps[i]);
+		/* 0278: as Android's music player start (ftrace of both amps): 0x4C00, the noise gate 0x6808, 0x4800,
+		 * then 0x2018 with bit 0 already set, before the scene and GLOBAL_EN */
 		err = err ? err : pa_write1(amps[i], 0x4c00, 0x36);
-		err = err ? err : pa_write1(amps[i], 0x2018, 0x3720);
+		err = err ? err : pa_write1(amps[i], 0x6808, 0x3f75);
 		err = err ? err : pa_write1(amps[i], 0x4800, 0x10001);
+		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
 		printf("PANDORA AMP: %#x configuration (err %d), PLL as set_sysclk, routing, enables: err %d (firmware %s)\n",
 		    amps[i], cfg_err, err, pa_awake[i] ? "awake" : "not awake");
 	}
@@ -805,7 +840,6 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		const int serr = pa_awake[i] ? pa_scene(amps[i], i ? 'T' : 'B') : -1;
 		int err = pa_key(amps[i], 0x000f1aa0);
 		err = err ? err : pa_write1(amps[i], 0x2014, 1);
-		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
 		printf("PANDORA AMP: %#x powered up (music scene err %d), err %d\n", amps[i], serr, err);
 	}
 	pa_sleep(500);
@@ -836,11 +870,22 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
 		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
 	}
-	pa_dump(0x40);
-	pa_dump(0x42);
-	pa_sleep(1500);
-	pa_state(0x40, "up 3 s");
-	pa_state(0x42, "up 3 s");
+	/* 0277: 15 s of play (the steady tone), the firmware's readouts every second (0275: 8 s, at 1, 4, 7 s) */
+	for (unsigned s = 1; s <= 15; s++) {
+		char when[16];
+		pa_sleep(1000);
+		snprintf(when, sizeof(when), "play %u s", s);
+		pa_levels(0x40, when);
+		pa_levels(0x42, when);
+		if (s == 2) {
+			/* 0278: the whole ordinary register map while playing, against Android's chip values while
+			 * playing (cache bypassed) */
+			pa_dump(0x40);
+			pa_dump(0x42);
+		}
+	}
+	pa_state(0x40, "play 15 s");
+	pa_state(0x42, "play 15 s");
 	for (unsigned i = 0; i < 2; i++) {
 		if (!pa_awake[i] || !pa_r_audio) {
 			continue;

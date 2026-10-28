@@ -1,0 +1,64 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 3eec40d..3996b22 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -584,11 +584,14 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
+  *  - the Halo registers Android's dump has (pa_halo), and the whole dump after power-up, against Android's
+  *    dump during playback (speakercheck raw/during);
+  *  - the lines short: spk7's long ones were cut by other threads' output.
++ * 0278: Android's chips read with the regmap cache bypassed (idle, both amps): every value here is the chip's but
++ * 0x0104 and 0x0124, which are 1 on the chip (as ours after reset); the 0 of the old dump was the driver's cache
++ * default, the driver never writes them. Left alone now.
+  */
+ static const struct {
+ 	uint32_t reg, v40, v42;
+ } pa_cfg[] = {
+-	{0x0104, 0, 0}, {0x0124, 0, 0}, {0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
++	{0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
+ 	{0x3808, 0x40, 0x40}, {0x4808, 0x20200000, 0x20200000},
+ 	{0x480c, 3, 3}, {0x4810, 1, 0}, {0x4820, 0x20401, 0x20200}, {0x4830, 0x20, 0x20}, {0x4840, 0x20, 0x20},
+ 	{0x4c20, 0x36, 0x36}, {0x4c24, 0, 0}, {0x4c44, 8, 8}, {0x6000, 0x8004, 0x8004}, {0x6404, 0x02005604, 0x02005604},
+@@ -749,7 +752,7 @@ pa_key(uint8_t addr, uint32_t test)
+ 	return err;
+ }
+ 
+-static void pa_dump(uint8_t addr) __unused;    /* kept for comparisons with Android's dumps; not called now */
++static void pa_dump(uint8_t addr);
+ static void pa_load(uint8_t addr, char side, unsigned what);
+ 
+ /* 0275: the firmware's playback readouts (pa_mon_ctl), one line */
+@@ -818,9 +821,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		}
+ 		const int cfg_err = err;
+ 		err = err ? err : pa_sysclk(amps[i]);
++		/* 0278: as Android's music player start (ftrace of both amps): 0x4C00, the noise gate 0x6808, 0x4800,
++		 * then 0x2018 with bit 0 already set, before the scene and GLOBAL_EN */
+ 		err = err ? err : pa_write1(amps[i], 0x4c00, 0x36);
+-		err = err ? err : pa_write1(amps[i], 0x2018, 0x3720);
++		err = err ? err : pa_write1(amps[i], 0x6808, 0x3f75);
+ 		err = err ? err : pa_write1(amps[i], 0x4800, 0x10001);
++		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
+ 		printf("PANDORA AMP: %#x configuration (err %d), PLL as set_sysclk, routing, enables: err %d (firmware %s)\n",
+ 		    amps[i], cfg_err, err, pa_awake[i] ? "awake" : "not awake");
+ 	}
+@@ -834,7 +840,6 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		const int serr = pa_awake[i] ? pa_scene(amps[i], i ? 'T' : 'B') : -1;
+ 		int err = pa_key(amps[i], 0x000f1aa0);
+ 		err = err ? err : pa_write1(amps[i], 0x2014, 1);
+-		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
+ 		printf("PANDORA AMP: %#x powered up (music scene err %d), err %d\n", amps[i], serr, err);
+ 	}
+ 	pa_sleep(500);
+@@ -872,6 +877,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		snprintf(when, sizeof(when), "play %u s", s);
+ 		pa_levels(0x40, when);
+ 		pa_levels(0x42, when);
++		if (s == 2) {
++			/* 0278: the whole ordinary register map while playing, against Android's chip values while
++			 * playing (cache bypassed) */
++			pa_dump(0x40);
++			pa_dump(0x42);
++		}
+ 	}
+ 	pa_state(0x40, "play 15 s");
+ 	pa_state(0x42, "play 15 s");

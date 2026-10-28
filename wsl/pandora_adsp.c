@@ -1448,7 +1448,7 @@ gpr_step(void)
 #define SPK_ANSWER_MS         1000u
 #define SPK_GRAPH_ANSWER_MS   3000u
 #define SPK_HOLD_MS           2000u
-#define SPK_RUN_MS            20000u    /* 0269: 20 s, room for pandora_amp_tdm reloading both amps */
+#define SPK_RUN_MS            26000u    /* 0277: 26 s, room for 15 s of play in pandora_amp_tdm */
 #define APM_CMD_GRAPH_OPEN    0x01001000u
 #define APM_CMD_GRAPH_PREPARE 0x01001001u
 #define APM_CMD_GRAPH_START   0x01001002u
@@ -1493,8 +1493,9 @@ static struct {
  * {data address lsw, msw (the stream index in the upper word, as for the command payloads), mem map handle, size,
  * timestamp lsw, msw, flags 0, metadata address lsw, msw, handle, size: all 0}, one per 20 ms buffer in the stream
  * area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 {data address lsw, msw, handle, status,
- * ...} hands it back and the next 20 ms go into it. 1 kHz at -30 dBFS on both channels, interleaved q31 as the
- * endpoint's media format says, faded in over the first 20 ms. Four in flight. Audible only while the amplifiers
+ * ...} hands it back and the next 20 ms go into it. 1 kHz on both channels, interleaved q31 as the endpoint's
+ * media format says; 0277: -12 dBFS steady (0275: -20 dBFS beeps; 0271: -30 dBFS steady; the user heard neither).
+ * Four in flight. Audible only while the amplifiers
  * play (pandora_amp_tdm: PLAY ... PAUSE).
  */
 #define SPK_TONE_MIID         0x4001u
@@ -1505,16 +1506,19 @@ static struct {
 #define SPK_TONE_SLOT         0x2000u
 #define SPK_TONE_SLOTS        8u
 #define SPK_TONE_INFLIGHT     4u
-static const int32_t spk_sine[48] = {         /* one period of 1 kHz at 48 kHz, -30 dBFS q31 */
-	0, 8863955, 17576245, 25987801, 33954698, 41340621,
-	48019194, 53876146, 58811262, 62740101, 65595439, 67328421,
-	67909396, 67328421, 65595439, 62740101, 58811262, 53876146,
-	48019194, 41340621, 33954698, 25987801, 17576245, 8863955,
-	0, -8863955, -17576245, -25987801, -33954698, -41340621,
-	-48019194, -53876146, -58811262, -62740101, -65595439, -67328421,
-	-67909396, -67328421, -65595439, -62740101, -58811262, -53876146,
-	-48019194, -41340621, -33954698, -25987801, -17576245, -8863955,
+static const int32_t spk_sine[48] = {         /* one period of 1 kHz at 48 kHz, -12 dBFS q31 (0277; -20, -30 before) */
+	0, 70408896, 139613076, 206428438, 269711752, 328380223,
+	381430017, 427953439, 467154458, 498362334, 521043094, 534808661,
+	539423504, 534808661, 521043094, 498362334, 467154458, 427953439,
+	381430017, 328380223, 269711752, 206428438, 139613076, 70408896,
+	0, -70408896, -139613076, -206428438, -269711752, -328380223,
+	-381430017, -427953439, -467154458, -498362334, -521043094, -534808661,
+	-539423504, -534808661, -521043094, -498362334, -467154458, -427953439,
+	-381430017, -328380223, -269711752, -206428438, -139613076, -70408896,
 };
+/* 0277: one steady tone, faded in over the first 20 ms (0275's 300/200 ms beeps made the amps' 1 s readouts land in
+ * the gaps, and the user heard nothing) */
+#define SPK_TONE_FADE         SPK_TONE_FRAMES
 static struct {
 	bool on;
 	uint32_t sent, done, bad, inflight, busy;
@@ -1811,6 +1815,18 @@ spk_graph_begin(void)
 	spk_add_oob("SPR path end", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x080010C4u, d, 4), false);
 	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
 	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x08001B07u, d, 4), false);
+	{
+		/* 0276: the stream's volume control (0x401f, MODULE_ID_VOL_CTRL) has no calibration in the ACDB; PAL sets
+		 * the stream volume itself at stream start, and Linux q6apm sets VOL_CTRL_DEFAULT_GAIN 0x2000 (Q13, unity).
+		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. Unity gain and unmute
+		 * (PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain, u16 0}, _MUTE 0x08001036 {u32 0}) there, and unmute
+		 * on the device volume control (0x437e, calibrated to 0x2000). */
+		uint8_t v[96], g[4] = {0x00, 0x20, 0, 0}, m[4] = {0, 0, 0, 0};
+		uint32_t vl = spk_param(v, 0x401f, 0x08001035u, g, 4);
+		vl += spk_param(v + vl, 0x401f, 0x08001036u, m, 4);
+		vl += spk_param(v + vl, 0x437e, 0x08001036u, m, 4);
+		spk_add_oob("volume", APM_CMD_SET_CFG, v, vl, false);
+	}
 	spk_add_sgs("graph prepare", APM_CMD_GRAPH_PREPARE, true);
 	spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
 	kfree_data(f, (vm_size_t)size);
@@ -1992,8 +2008,8 @@ spk_tone_pump(void)
 		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
 			const uint64_t n = spk_tone.frames + f;
 			int64_t v = spk_sine[n % 48u];
-			if (n < SPK_TONE_FRAMES) {
-				v = v * (int64_t)n / (int64_t)SPK_TONE_FRAMES;
+			if (n < SPK_TONE_FADE) {
+				v = v * (int64_t)n / (int64_t)SPK_TONE_FADE;
 			}
 			s[2 * f] = (int32_t)v;
 			s[2 * f + 1] = (int32_t)v;

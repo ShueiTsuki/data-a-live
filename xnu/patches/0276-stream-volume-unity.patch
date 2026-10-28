@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 60092d0..b9964f8 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1816,6 +1816,18 @@ spk_graph_begin(void)
+ 	spk_add_oob("SPR path end", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x080010C4u, d, 4), false);
+ 	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
+ 	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x08001B07u, d, 4), false);
++	{
++		/* 0276: the stream's volume control (0x401f, MODULE_ID_VOL_CTRL) has no calibration in the ACDB; PAL sets
++		 * the stream volume itself at stream start, and Linux q6apm sets VOL_CTRL_DEFAULT_GAIN 0x2000 (Q13, unity).
++		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. Unity gain and unmute
++		 * (PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain, u16 0}, _MUTE 0x08001036 {u32 0}) there, and unmute
++		 * on the device volume control (0x437e, calibrated to 0x2000). */
++		uint8_t v[96], g[4] = {0x00, 0x20, 0, 0}, m[4] = {0, 0, 0, 0};
++		uint32_t vl = spk_param(v, 0x401f, 0x08001035u, g, 4);
++		vl += spk_param(v + vl, 0x401f, 0x08001036u, m, 4);
++		vl += spk_param(v + vl, 0x437e, 0x08001036u, m, 4);
++		spk_add_oob("volume", APM_CMD_SET_CFG, v, vl, false);
++	}
+ 	spk_add_sgs("graph prepare", APM_CMD_GRAPH_PREPARE, true);
+ 	spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
+ 	kfree_data(f, (vm_size_t)size);
