@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/pandora_therm.c b/bsd/dev/pandora_therm.c
+index b1a65d7..a47dbbb 100644
+--- a/bsd/dev/pandora_therm.c
++++ b/bsd/dev/pandora_therm.c
+@@ -341,8 +341,13 @@ pt_limit(int32_t b)
+  * P sensors from cores 6-7, E from cores 0-5, G from the GPU; "Avg:" the mean, the others the highest).
+  * AppleVTempDispatcher hands back what thermalmonitord computed (pandora_therm_ios_temp), logged every 10 s next to
+  * Xiaomi's numbers.
++ * thermalmonitord runs its control (timerCallBackHID -> updateSystemLoad) only in a round where every sensor of the
++ * watchdog mask got a value, and requiresWatchDog defaults to true: all of the D22 table's HID sensors but mic2 and
++ * Tarc are in it, and only services that exist give values (usb10: without TG0B, TG0V and NAND CH0 temp it read
++ * the others all along and never computed). TG0B and TG0V (the gas gauge's battery temperature, a HID service on the
++ * iPhone X too) carry the gauge's reading; NAND CH0 temp, information only, quiet_therm's (the main board).
+  */
+-enum { PH_TDEV1, PH_TDEV2, PH_TDEV3, PH_TDEV4, PH_TDEV5, PH_TCAL, PH_MIC1, PH_MIC2, PH_INPUTS };
++enum { PH_TDEV1, PH_TDEV2, PH_TDEV3, PH_TDEV4, PH_TDEV5, PH_TCAL, PH_MIC1, PH_MIC2, PH_BATT, PH_NAND, PH_INPUTS };
+ #define PH_DIE  (-1)     /* a die sensor: tsens group g, sensors first .. first + count - 1 */
+ #define PH_JUNC (-2)     /* the hottest of every tsens sensor */
+ static const struct {
+@@ -353,6 +358,7 @@ static const struct {
+ 	{"PMU tdev1", PH_TDEV1, 0, 0, 0, 0, 0}, {"PMU tdev2", PH_TDEV2, 0, 0, 0, 0, 0}, {"PMU tdev3", PH_TDEV3, 0, 0, 0, 0, 0},
+ 	{"PMU tdev4", PH_TDEV4, 0, 0, 0, 0, 0}, {"PMU tdev5", PH_TDEV5, 0, 0, 0, 0, 0}, {"PMU tcal", PH_TCAL, 0, 0, 0, 0, 0},
+ 	{"PMU tjunc", PH_JUNC, 0, 0, 0, 0, 0}, {"mic1", PH_MIC1, 0, 0, 0, 0, 1}, {"mic2", PH_MIC2, 0, 0, 0, 0, 1},
++	{"TG0B", PH_BATT, 0, 0, 0, 0, 0}, {"TG0V", PH_BATT, 0, 0, 0, 0, 0}, {"NAND CH0 temp", PH_NAND, 0, 0, 0, 0, 0},
+ 	{"PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 0, 0}, {"Avg: PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 1, 0},
+ 	{"Max: PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 0, 0}, {"PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 0, 0},
+ 	{"Avg: PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 1, 0}, {"Max: PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 0, 0},
+@@ -449,6 +455,8 @@ pt_hid_update(const int32_t in[7], const int32_t vs[PT_VS], bool whole)
+ 	const int64_t b = in[5], side = vs[2] > vs[3] ? vs[2] : vs[3];
+ 	pt_hid_set(PH_TDEV1, in[6]);
+ 	pt_hid_set(PH_TDEV5, in[4]);
++	pt_hid_set(PH_BATT, in[5]);
++	pt_hid_set(PH_NAND, in[3]);
+ 	pt_hid_set(PH_TDEV2, (int32_t)((vs[1] - 2222 - 45 * b / 100) * 100 / 48));
+ 	pt_hid_set(PH_TDEV4, (int32_t)((side + 802 - 50 * b / 100) * 100 / 50));
+ 	pt_hid_set(PH_TDEV3, (int32_t)((vs[4] + 1094 - 63 * b / 100) * 100 / 37));
