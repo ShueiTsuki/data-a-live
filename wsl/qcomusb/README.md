@@ -19,7 +19,7 @@ USB 串口日志（DWC3 设备模式，CDC ACM）用的内核代码，编进内�
 3. `soc/QcomUsbBypass.c`：
    - SMMU 寄存器区的大小检查改成按映射窗口算。本机是 128 个全局页加 81 个上下文，共 0xd1000 字节，超过了原来写死的 0xd0000。
    - 固件留给流号 0x40 的上下文，只要翻译关着（SCTLR.M=0）、类型是 S1_TRANS_S2_BYPASS，就原样使用，不再改写成 SCTLR=0、CBAR=0x10000。
-4. `kernel/QcomXnuUsbDebug.c`、`include/QcomXnuUsbDebug.h`：新增 `qcom_usb_debug_map()`，在开着中断时先把时钟、DWC3、SMMU 三个寄存器窗口映射好；初始化时发现已经映射过就跳过。原来的初始化在关中断的状态下调用 `ml_io_map`，会申请内存，系统跑起来以后内核断言不允许，usb2 那次就在 0.19 秒重启了。
+4. `kernel/QcomXnuUsbDebug.c`、`include/QcomXnuUsbDebug.h`：新增 `qcom_usb_debug_map()`，在开着中断时先把时钟、DWC3、SMMU 三个寄存器窗口映射好；初始化时发现已经映射过就跳过。原来的初始化在关中断的状态下调用 `ml_io_map`，会申请内存，系统跑起来以后内核断言不允许，usb2 那次就在 0.19 秒重启了。映射用 `ml_io_map_unmappable`，地址从内核主地址空间分配：`ml_io_map` 用的是只有 8 MiB 的专用区，三个窗口共 2.25 MiB 放进去以后，5 秒时触摸驱动要的 128 KiB 就没地方了（usb3 那次重启）。
 
 ## 本机的交接状态（usb1，`fastboot boot` 之后）
 

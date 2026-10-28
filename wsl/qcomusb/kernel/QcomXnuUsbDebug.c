@@ -15,6 +15,9 @@
 /* XNU 17.7.11 keeps ml_io_map in osfmk/arm/machine_routines.h, which the
  * generic <machine/machine_routines.h> does not pull in for this SDK. */
 extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+/* Data A Live: qcom_usb_debug_map maps from kernel_map (see there); VM_WIMG_IO from vm/pmap.h. */
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys, vm_size_t size, uint32_t flags);
+#include <vm/pmap.h>
 #include <kern/cpu_number.h>
 #include <pexpert/pexpert.h>
 
@@ -660,13 +663,15 @@ static int validate_static_pages(const uint8_t *arena, size_t arena_bytes, uint6
 
 /* Data A Live: map the GCC, DWC3 and SMMU windows ahead of qcom_usb_debug_init, from a thread
  * with interrupts enabled (ml_io_map allocates, which a running kernel refuses with interrupts
- * masked). Mapping only: no register is read. 1 when all three are mapped. */
+ * masked). Mapping only: no register is read. 1 when all three are mapped. The windows come from
+ * kernel_map (ml_io_map_unmappable): ml_io_map takes them from the 8 MiB io_submap for good, and
+ * 2.25 MiB more there left a later 128 KiB driver mapping without room (usb3, a panic at 5 s). */
 int qcom_usb_debug_map(void)
 {
     if (native.status.phase != QCOM_USB_DEBUG_NOT_INITIALIZED) return 0;
-    if (!native.gcc_va) native.gcc_va = ml_io_map((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES);
-    if (!native.usb_va) native.usb_va = ml_io_map((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES);
-    if (!native.smmu_va) native.smmu_va = ml_io_map((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES);
+    if (!native.gcc_va) native.gcc_va = ml_io_map_unmappable((vm_offset_t)QUSB_GCC_BASE, GCC_BYTES, VM_WIMG_IO);
+    if (!native.usb_va) native.usb_va = ml_io_map_unmappable((vm_offset_t)QUSB_DWC3_BASE, USB_BYTES, VM_WIMG_IO);
+    if (!native.smmu_va) native.smmu_va = ml_io_map_unmappable((vm_offset_t)QUSB_SMMU_BASE, QUSB_SMMU_BYTES, VM_WIMG_IO);
     return native.gcc_va && native.usb_va && native.smmu_va;
 }
 
