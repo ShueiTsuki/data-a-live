@@ -1,6 +1,6 @@
 # 小米 17 Pro (pandora) 跑 iOS 16：完整计划
 
-最后更新：2026-10-24（GPU 一节见 docs/GPU_PLAN.md；CPU 一节在文末）
+最后更新：2026-10-28（全局进度见下一节；GPU 一节见 docs/GPU_PLAN.md；CPU 一节在文末）
 
 ## 目标和边界
 
@@ -10,6 +10,32 @@
 - 原来不做的声音，2026-10-25 起开始做（用户定，先 ADSP 通信、再喇叭）；真实电量 2026-10-26 起做。还不做：蜂窝网络、相机、背屏；Wi-Fi 只调查过。App Store 的应用基本跑不了（解密要靠苹果芯片里的安全模块）。
 - 为什么是 iOS 16：iOS 17 起 iPhone 只支持 A12 及以后，那些系统程序都用了苹果特有的指针签名指令；iPhone X 是最后一代不用的。
 - 主要参考：ref/ios-fuxi（小米 13 / 骁龙 8 Gen 2，iOS 16 已进桌面，ios-sweet 的复刻）；ref/ios-sweet（红米 Note 10 Pro，已进桌面）；社区全貌见 COMMUNITY.md；[UniXNU](https://github.com/UniXNU/UniXNU)（骁龙 8 Gen 2，4K 页、存储驱动）。
+
+## 全局进度和顺序（2026-10-28 重新整理）
+
+做好了的（真机验证过）：
+- 开机进 iOS 桌面，触摸、按键、控制中心；GPU 合成整个界面（Turnip + Metal 插件，VKTEST/MTLTEST 过）。
+- 亮度：滑条跟手、熄屏亮屏照 iOS 的渐变时长、重启后开机标志亮度正常（0263/0264，bl2）。
+- CPU 调频、核心级休眠、perfcontrol。
+- 电量：电量计读数进 SweetBattery，百分比照安卓（bat4）。
+- 温度：7 个热敏电阻读数准（GPIO 高阻、PMIC 自动测温），按 mi_thermald 表限频，机身约 40 度不再到 105 度（0255-0257）。iOS 温控接入第 1 步做通过（usb11），现在默认关（pandora_therm_ios=1 才开）。
+- USB 串口实时日志（0250-0258）。
+- ADSP：启动、GLINK 通信；喇叭的 DSP 播放图能开能跑，TDM 时钟送到两颗功放，功放功率级照安卓运转（spk7）。
+
+卡住的：
+- 功放里的 Halo 处理器核一起动就被 MPU 拦下（spk8-spk12 六轮）。已排除：固件写入（整块读回全对）、写法、PLL、系数和场景数据、ROM 停的时机。
+
+没验证或没做的（按原来定的顺序：电源 → 声音 → Metal）：
+- 电源：插拔马上反映（0245）没测到；温控第 2 步（这台手机自己的 plist、接 iOS 的背光/充电/CLPC 输出）暂停。
+- 声音：功放跑起来以后 → 校准值、PLAY、试音 → iOS 的音频设备（IOAudio2），那时一并拿上游的 work interval 补丁（UniXNU 8b6a0f5）。
+- GPU：三个 Metal 问题；着色器预热。
+- 以后：原生 USB（iTunes）、原版壁纸、开机画面、80 帧上限、十点触控验证、后台划掉 App 卡几秒（待查）。
+- 开机菜单里的 iOS 格子还是 k0244，之后的修正（亮度、串口、限频等）没进去，装要用户说"装"。
+
+思路调整：
+1. 扬声器不再一轮猜一个。安卓（已 root）下有 "B/T DSP1 Preload Switch" 开关，关再开会让驱动重新加载、启动 DSP；开 regmap 的写入跟踪（ftrace regmap 事件）抓下这一次从停核到起核的每一笔寄存器读写，照着逐条对。要切到安卓开机一次，上手机前问。spk13（配 MPU 前先强制开 PLL）可以同时编好备用。
+2. 上游 UniXNU 的 GPU 拆成 AdrenoMetal（原 NativeMetal，我们的插件基于 c6d29ca，之后 24 个提交：两平面 IOSurface 纹理、系统内存渲染、着色器预热整套）和 Adreno740（原 NativeAdreno，提交路径优化）。三个 Metal 问题和着色器预热合成一项：升级到 AdrenoMetal 最新，再照 Adreno740 补我们的内核驱动。
+3. 小件随时插：UniXNU 477e530（开机读 dyld 缓存不塞满内存）。
 
 ## 一、双系统怎么做
 
@@ -529,3 +555,19 @@
   - 测试 bl1：开机后看 24 s 处不再有 brightness = 1；用户拖滑条看是否跟手、是否平滑；重启看 logo 亮度。
   - bl1（k0263，2026-10-28）：24 s 处不再压到最低（全程 brightness 只有开机 8996、熄屏 0、亮屏 8996 和拖动）；开机读到面板 916。拖滑条时 CoreBrightness 每 8 ms 发一次、FadePeriod 0，内核立刻写；熄屏、亮屏照 0.184 s 走 10 步，面板读回对得上。**用户：「亮度变的太慢了」** → 慢在面板自己的渐变（53 28），每一步都被面板拖慢。0264：面板渐变默认关（pandora_bl_dim=1 才开），FadePeriod 仍由内核照做。
   - bl2（k0264，2026-10-28）：**用户：「跟手了，logo也正常」**。开机读到面板 916、面板渐变关；bl1 重启前写回 916。亮度三件事完成。iOS 温度传感器要等温控第 2 步再开（pandora_therm_ios=1）。下一步回到扬声器 spk8。
+- 0265（k0265，2026-10-28）：功放的 PLL 照安卓设。cs35l43_component_set_sysclk（ampfwcheck raw/cs35l43_dis2.txt 0x529c）每次开流时改 0x2C04 分六步：开环（bit 11）→ 参考频率（bits 5-10，3.072 MHz = 0x21）→ 关 PLL（bit 4）→ 选源（bits 0-2，0 = 位时钟）→ 闭环 → 开 PLL；再写 FS_MON 0x2D10。cs35l43_pcm_hw_params 先写 0x2C0C = 3（48 kHz）。spk7 是一次把 0x2C04 写成 0x430，PLL 可能没重新锁。另外安卓空闲转储 0x2C14 也是 0（放音中才 3），所以 0x2C14 跟着放音走，不是 Halo 跑不跑的原因。
+  - TDM 那一步：配置 → 照安卓设 PLL（最后清掉 pa_start 加的 bit 16，安卓转储是 0x430）→ 看心跳；不走就在时钟在时停核（清 EN、软复位置 1）、再照 pa_start 起核，前后核对 XM[0]（固件还在）→ 上电 0.5 s 时读安卓转储里有的那批 Halo 寄存器、全量 pa_dump 两颗，和安卓放音中转储对比 → 3 s 后下电。不发 PLAY（还没有校准值），DSP 送的是静音。日志行拆短。
+  - 测试 spk8：参数同 spk7，--secs 90（喇叭这段在开机 30 s 内）。
+- spk8（k0265，2026-10-28）：PLL 照安卓设好（0x2C04 = 0x430）、时钟在时停核再起，心跳都不走，0x2C14 仍 0。找到直接原因：MPU 一条都没写进去。访问寄存器读回 3 1 ff0000 fffff 0（安卓 20 个全 0xffffffff），锁存器 0x800000（安卓 0xbeef），越界状态 0x2BC3104 = 0x400000、310C = 0x400000、3114 = 0x10001（安卓都 0；cs_dsp 里这三个是 XM/YM/PM_VIO_STATUS）。也就是核跑过、碰内存被 MPU 拦下停住。XM[0] 读出 0（加载时 173 个字都对）。安卓 cs_dsp_halo_configure_mpu 的 23 次写和我们逐条一样。差别在时机：安卓 cs35l43_probe 复位后读 ID、打补丁、设中断屏蔽，就进 cs35l43_dsp_init → cs_dsp_stop 停 ROM，前后几毫秒；我们先读固件文件才停，第二颗等到第一颗加载完（几秒）。推测 ROM 跑久了自己配了 MPU 并锁死。
+- 0266（k0266）：复位后照安卓顺序（读 ID、补丁）马上停两颗的 ROM；停前、停后、起核后各记一次 MPU。测试 spk9 参数同 spk8。
+- spk9（k0266，2026-10-28）：早停 ROM 没改变结果。ROM 在跑时锁存器读 0xbeef（和安卓转储一样，所以 0xbeef 是核在跑时的读数），停后访问寄存器 3 1 0 0 0、越界状态全 0；我们配完读 3 1 ff0000 fffff 0（写是生效的，可能每个寄存器只有这些位；安卓转储的 0xffffffff 可能是 regmap 缓存值）；核一起动越界状态就置上、核停住。安卓 cs35l43_dsp_preload_ev：事件 1 若有外部回调（偏移 1000，本模块里没人写它）先强制开 PLL 再加载；事件 2 写 0x2900=2、cs_dsp_run，再撤强制。
+- spk10（k0267，2026-10-28）：越界只在起核之后出现（ROM 停后、加载完都是 0），两颗一样：XM 0xffffe、YM 0x820d6、PM 0x7a90，全在固件加载范围外（wmfw：PM 0..0xf0c 一块 19260 字节，XM 到 0x1e7e，YM 到 0x7aa）；YM 0x820d6 = 固件号 0x1820d6 的低 20 位。核被 MPU 停住后核控制写不掉 EN，0x40 的重新加载在 pa_load 里直接放弃了（没测到）。我们只核对过 PM 前 128 字节，PM 是一次 I2C 发 19260 字节。
+- 0268（k0268，用户：「要不做多点一次」→ 一次多做几组）：①写完固件整块读回（每次读 30 个寄存器，整组，不从压缩组中间读）；②TDM 那一步先硬复位两颗（pa_reset，照 cs35l43_probe），有位时钟时重新加载：0x40 每次发 120 字节，0x42 一块一次发完，都整块读回再起核；③TDM 那一步等开机加载做完（最多 20 s）；喇叭图跑 30 s。测试 spk11 参数同 spk10。
+- spk11（k0268，2026-10-28）：写入没问题——开机和复位后、一块一次和 120 字节分包，四次整块读回 5871 个寄存器全对（含 PM）。核照样跑飞到同样三个地址。但复位后的那组是先加载起核、后设 PLL（复位把 0x2C04 清回 0x10），"有时钟"并不成立。和安卓转储对比：安卓转储里驱动只写不读的寄存器是 regmap 缓存值（0x0104/0x0124 驱动从不写，转储的 0 是默认值），不能当芯片读数；cap_during.sh 把文件名标反了（T_regs = 13-0040 = DT 里的 "B"）。安卓 cs35l43_irq：0x10014 bit 0 = PLL Lock INT，bit 3 = Unlock。
+- 0269（k0269）：照安卓开流顺序：复位 → 配置、PLL（set_sysclk）、路由、使能 → 查锁（0x10014 bit 0）→ 再加载起核。0x40 全量；0x42 不写场景（安卓在 DSP 跑起来后才叠场景）。开机那组 0x42 只写固件（看是不是数据害的）。不再整块读回。喇叭图 20 s。测试 spk12 参数同 spk11。
+- **用户插入（2026-10-28）：** 「开个fork给 xnu-ios-build-linux 的 GitHub 页面 .MD 重写」→ fork 会话 xnu-build-readme 在做，推送前先给用户看。
+- 同步上游（2026-10-28 做了）：三个本地克隆都快进到最新。UniXNU-sheng d76556b → 08cde20（11 个提交：A510 当 E 簇其余当 P 簇的 AMP 调度补丁 zzyf-sheng-amp.patch、八核调频、触摸时拉高 CPU/GPU、启动日志加行、ShengUfs 显示和 WiFi 窗口），我们拷过的 SMEM/SMP2P/GPR/GLINK/FAT 五个库都没改，不用更新；ios-sweet 只加了 MIT 许可和网站；ios-fuxi ba239fc → d49884e（263 个提交，主要是 Metal、扫描输出、GPU ABI、WiFi），提交说明里没有我们那三个 Metal 问题的关键词。
+- spk12（k0269，2026-10-28）：开机 0x42 只写固件也一样跑飞 → 不是系数/场景数据。设好 PLL 后 0x10014 锁定位为 0（位时钟在也没锁；安卓 PLL Lock 也在 GLOBAL_EN 之后才出现，安卓首次起核时同样没锁）。照安卓顺序复位、PLL、加载起核仍跑飞。下一步（spk13，待写）：照 cs35l43_dsp_preload_ev 事件 1，先置 0x2C04 bit 16（强制开 PLL）再加载、配 MPU、起核，起核后再清（spk4/spk7 只在出故障后才置过）；配 MPU 后立刻读回访问寄存器看 bit 是否写满。推测：MPU 在 DSP 时钟域，没时钟时解锁/写入只生效一部分，核碰 XM 顶端系统寄存器区（0xffffe = 0x2BFFFF8）被拦。
+- 用户（2026-10-28）：「本地的几个东西你先看看，感觉unixnu的可能比较大」→ UniXNU 主仓库（unixnu_review/src，origin/main 40d21cc）自 dec4c7b 起 277 个提交，116 个是文档/设备目录。GPU 拆成单独仓库：NativeMetal → AdrenoMetal（我们插件基于的 c6d29ca 之后 24 个提交）、NativeAdreno → Adreno740（29 个）。已克隆到 unixnu_review/AdrenoMetal、Adreno740。和我们相关的：477e530（签名文件 1 MiB 一块读、dyld 缓存不进页缓存，我们开了同一个 hash cache）、8b6a0f5（work interval 操作 6/7/8，音频服务用）、1640f6f/AdrenoMetal（两平面 IOSurface 纹理，对应暂停的 RGB8_444_2P）、系统内存渲染和关并发 binning、着色器预热整套、Adreno740 的提交路径优化。列给用户选。
+- **用户插入（2026-10-28）：** 「记得今天同步一下上游」→ 今天内做：拉 UniXNU-sheng（本地 ../unixnu_review/UniXNU-sheng，上次 d76556b 2026-10-25；wsl/qcom/SOURCE.txt 记了我们拷的提交）、ios-sweet（425b251）、ios-fuxi（ba239fc）的新提交，列出和我们相关的改动，拷过来的库照新提交更新，再问用户要不要合。不打断扬声器 spk11。
+- 0267（k0267）：pa_halo 加读越界地址（HALO_MPU_XM/YM/PM_VIO_ADDR 0x2BC3100/08/10）和 AHB 主口错误（0x2B82040/44），加载完未起核时也记一次；去掉不起作用的强制开 PLL；TDM 那一步改成 0x40 在有位时钟时从头重新加载（停核、写固件/系数/场景并核对、MPU、起核），0x42 不动作对照；喇叭图跑 16 s。测试 spk10 参数同 spk9。

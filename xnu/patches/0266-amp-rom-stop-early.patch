@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 83b3f98..9ed8aba 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -641,6 +641,34 @@ pa_beating(uint8_t addr)
+ 	return !pa_reg(addr, pa_r_beat, &b1) && b1 != b0;
+ }
+ 
++/*
++ * 0266: the ROM stopped when Android stops it, a few register writes after the reset: cs35l43_probe reads the ids,
++ * writes its patch and the interrupt masks and calls cs35l43_dsp_init, whose cs_dsp_stop stops the watchdog and
++ * the core (cs_dsp_halo_stop_core: EN cleared, HALO_CORE_SOFT_RESET set). Until 0265 the ROM ran on until the
++ * firmware files were read, for the second amp until the first one was loaded (seconds). spk8: the MPU took none
++ * of pa_core_run's writes (access 3 1 ff0000 fffff 0, lock 0x800000, violations in 0x2BC3104/310C/3114) where
++ * Android's dump has 0xffffffff, 0xbeef and none. The MPU before and after the stop: whether the ROM sets it.
++ */
++static int
++pa_rom_stop(uint8_t addr, const char *when)
++{
++	uint32_t core = 0, lock = 0, mpu0 = 0, wdt = 0, rst = 0;
++	int err = pa_reg(addr, PA_HALO_CORE, &core);
++	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
++	err = err ? err : pa_reg(addr, PA_HALO_MPU, &mpu0);
++	err = err ? err : pa_reg(addr, PA_HALO_WDT, &wdt);
++	err = err ? err : pa_write1(addr, PA_HALO_WDT, wdt & ~1u);
++	err = err ? err : pa_write1(addr, PA_HALO_CORE, core & ~1u);
++	err = err ? err : pa_reg(addr, PA_HALO_RST, &rst);
++	err = err ? err : pa_write1(addr, PA_HALO_RST, rst | 1u);
++	printf("PANDORA AMP: %#x ROM stopped %s: core %#x lock %#x mpu0 %#x wdt %#x (err %d)\n", addr, when, core, lock,
++	    mpu0, wdt, err);
++	if (!err) {
++		pa_halo(addr, "ROM stopped");
++	}
++	return err;
++}
++
+ static int
+ pa_key(uint8_t addr, uint32_t test)
+ {
+@@ -827,17 +855,9 @@ pa_load(uint8_t addr, char side)
+ 		err = pa_write1(addr, patch[i][0], patch[i][1]);
+ 	}
+ 	if (!err && (core & 1u)) {
+-		/* Out of reset the core runs its ROM (spk3: 0x81 right after the reset, the serial port at
+-		 * its defaults). cs35l43_dsp_init stops it before anything is written (cs_dsp_stop:
+-		 * cs_dsp_halo_stop_watchdog, then cs_dsp_halo_stop_core: EN cleared, soft reset set). */
+-		uint32_t wdt = 0, rst = 0;
+-		err = pa_reg(addr, PA_HALO_WDT, &wdt);
+-		err = err ? err : pa_write1(addr, PA_HALO_WDT, wdt & ~1u);
+-		err = err ? err : pa_write1(addr, PA_HALO_CORE, core & ~1u);
+-		err = err ? err : pa_reg(addr, PA_HALO_RST, &rst);
+-		err = err ? err : pa_write1(addr, PA_HALO_RST, rst | 1u);
++		/* 0266: normally stopped right after the reset already (pa_rom_stop from pa_thread). */
++		err = pa_rom_stop(addr, "at load");
+ 		err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+-		printf("PANDORA AMP: %#x ROM stopped: watchdog %#x, core control now %#x (err %d)\n", addr, wdt, core, err);
+ 		if (!err && (core & 1u)) {
+ 			goto out;
+ 		}
+@@ -896,6 +916,7 @@ pa_load(uint8_t addr, char side)
+ 	}
+ 	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
+ 		pa_start(addr, fw, fw_size, &info);
++		pa_halo(addr, "started");
+ 		pa_dump(addr);
+ 	}
+ out:
+@@ -1182,6 +1203,18 @@ pa_thread(void *arg, wait_result_t result)
+ 	pa_gpio(54, 0, 0, 16, 1);
+ 	pa_sleep(5);
+ 	static const uint8_t amps[2] = {0x40, 0x42};
++	if (pa_level >= 2) {
++		/* as cs35l43_probe: the ids, the register patch, then (cs35l43_dsp_init) the ROM stopped */
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t id = 0;
++			int err = pa_reg(amps[i], 0x0, &id);
++			err = err ? err : pa_write1(amps[i], 0x7404, 0x11330000);
++			err = err ? err : pa_write1(amps[i], 0x3850, 0x50000802);
++			if (!err && id == 0x35a43) {
++				(void)pa_rom_stop(amps[i], "right after reset");
++			}
++		}
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		uint32_t devid = 0, revid = 0;
+ 		int e1 = pa_reg(amps[i], 0x0, &devid);

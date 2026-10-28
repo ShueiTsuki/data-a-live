@@ -1,0 +1,152 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 4f5842e..9d8ad11 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1448,7 +1448,7 @@ gpr_step(void)
+ #define SPK_ANSWER_MS         1000u
+ #define SPK_GRAPH_ANSWER_MS   3000u
+ #define SPK_HOLD_MS           2000u
+-#define SPK_RUN_MS            30000u    /* 0268: 30 s, room for pandora_amp_tdm reloading both amps */
++#define SPK_RUN_MS            20000u    /* 0269: 20 s, room for pandora_amp_tdm reloading both amps */
+ #define APM_CMD_GRAPH_OPEN    0x01001000u
+ #define APM_CMD_GRAPH_PREPARE 0x01001001u
+ #define APM_CMD_GRAPH_START   0x01001002u
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 195088e..2d286e8 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -395,6 +395,9 @@ pa_fw_file(const char *name, uint32_t *size)
+ }
+ 
+ static unsigned pa_chunk;       /* bytes per firmware write transfer, 0 = whole block (0268) */
++static bool pa_check_fw = true; /* read the whole firmware back after writing it (0268) */
++#define PA_COEFF 1u                 /* pa_load: the coefficients before the start */
++#define PA_SCENE 2u                 /* pa_load: the music scene before the start */
+ 
+ /* Every write of one file; with check, unpacked XM blocks are read back. Returns 0 or an errno. */
+ static int
+@@ -711,7 +714,7 @@ pa_key(uint8_t addr, uint32_t test)
+ }
+ 
+ static void pa_dump(uint8_t addr);
+-static void pa_load(uint8_t addr, char side);
++static void pa_load(uint8_t addr, char side, unsigned what);
+ static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
+ 
+ static void
+@@ -730,10 +733,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ 	/*
+-	 * 0268: both amps loaded again with the bit clock running, after a hardware reset (spk10: a core the MPU has
+-	 * stopped keeps its enable bit, so pa_load gave up). Two ways of writing, one per amp: 0x40 in transfers of 120
+-	 * bytes (whole packed groups), 0x42 one transfer per block as at boot. Whole firmware read back for both.
+-	 * Then the configuration (the reset cleared it), the PLL, routing, enables.
++	 * 0269: Android's order at a stream start: hw_params (the serial port, GLOBAL_FS, set_sysclk: the PLL on the bit
++	 * clock), then DAPM powers the widgets, and the DSP preload loads and starts the core. spk11's reload started the
++	 * core before the PLL was set (the reset had put 0x2C04 back to 0x10). Now: reset, configuration, PLL, routing,
++	 * enables, the PLL lock checked (IRQ1_EINT_2 0x10014 bit 0, "PLL Lock INT" in cs35l43_irq; bit 3 unlock), then
++	 * the load and start. 0x40 with all of it (firmware, coefficients, scene), 0x42 without the scene (Android lays it
++	 * on once the DSP runs). spk11 read the whole firmware back four times without a difference: not again.
+ 	 */
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		uint32_t xm0 = 0;
+@@ -742,18 +747,8 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		    pa_beating(amps[i]) ? "counting" : "still", xm0, pa_xm0, err);
+ 	}
+ 	pa_reset();
+-	pa_chunk = 120;
+-	pa_load(0x40, 'B');
+-	pa_chunk = 0;
+-	pa_load(0x42, 'T');
+ 	for (unsigned i = 0; i < 2; i++) {
+-		uint32_t xm0 = 0;
+-		int err = pa_reg(amps[i], CSFW_XM, &xm0);
+-		printf("PANDORA AMP: %#x loaded with the clock (%s): heartbeat %s, XM[0] %#x, err %d\n", amps[i],
+-		    i ? "one transfer per block" : "120-byte transfers", pa_beating(amps[i]) ? "counting" : "still", xm0, err);
+-	}
+-	for (unsigned i = 0; i < 2; i++) {
+-		int err = 0;
++		int err = pa_write1(amps[i], 0x10014, 0xffffffffu);     /* latched status cleared (write 1) */
+ 		for (unsigned k = 0; k < sizeof(pa_cfg) / sizeof(pa_cfg[0]) && !err; k++) {
+ 			err = pa_write1(amps[i], pa_cfg[k].reg, i ? pa_cfg[k].v42 : pa_cfg[k].v40);
+ 		}
+@@ -765,7 +760,24 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		printf("PANDORA AMP: %#x configuration (err %d), PLL as set_sysclk, routing, enables: err %d\n", amps[i],
+ 		    cfg_err, err);
+ 	}
+-	pa_sleep(100);
++	pa_sleep(20);
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t st = 0, pll = 0, s14 = 0;
++		int err = pa_reg(amps[i], 0x10014, &st);
++		err = err ? err : pa_reg(amps[i], 0x2c04, &pll);
++		err = err ? err : pa_reg(amps[i], 0x2c14, &s14);
++		printf("PANDORA AMP: %#x PLL before the load: 0x10014 %#x (lock %u unlock %u) 2c04 %#x 2c14 %#x err %d\n",
++		    amps[i], st, st & 1u, (st >> 3) & 1u, pll, s14, err);
++	}
++	pa_check_fw = false;
++	pa_load(0x40, 'B', PA_COEFF | PA_SCENE);
++	pa_load(0x42, 'T', PA_COEFF);
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t xm0 = 0;
++		int err = pa_reg(amps[i], CSFW_XM, &xm0);
++		printf("PANDORA AMP: %#x loaded on the locked PLL (%s): heartbeat %s, XM[0] %#x, err %d\n", amps[i],
++		    i ? "no scene" : "all", pa_beating(amps[i]) ? "counting" : "still", xm0, err);
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		pa_state(amps[i], "PLL set");
+ 		pa_halo(amps[i], "PLL set");
+@@ -902,7 +914,7 @@ pa_verify_fw(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *
+ 
+ /* One amplifier's firmware, coefficients and music scene, checked; with pandora_amp=3 started. */
+ static void
+-pa_load(uint8_t addr, char side)
++pa_load(uint8_t addr, char side, unsigned what)
+ {
+ 	static CsfwInfo info;
+ 	char name[48];
+@@ -956,7 +968,9 @@ pa_load(uint8_t addr, char side)
+ 	if (pa_write_file(addr, "firmware", fw, fw_size, false, &info, false)) {
+ 		goto out;
+ 	}
+-	pa_verify_fw(addr, fw, fw_size, &info);
++	if (pa_check_fw) {
++		pa_verify_fw(addr, fw, fw_size, &info);
++	}
+ 	/* What the DSP will read as its id header and algorithm list: as decoded from the file. */
+ 	uint32_t want[10 + 6 * CSFW_MAX_ALGS + 1];
+ 	const unsigned n = 10 + 6 * info.n_algs + 1;
+@@ -992,10 +1006,20 @@ pa_load(uint8_t addr, char side)
+ 			}
+ 		}
+ 	}
+-	if (err || pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
++	if (err) {
+ 		goto out;
+ 	}
+-	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
++	/* 0269: what of it goes in before the start (PA_COEFF, PA_SCENE): Android lays the scene (delta tuning) on
++	 * only once the DSP runs (cs35l43_main_amp_event) */
++	printf("PANDORA AMP: %#x before the start: firmware%s%s\n", addr, (what & PA_COEFF) ? ", coefficients" : "",
++	    (what & PA_SCENE) ? ", music scene" : "");
++	if ((what & PA_COEFF) && pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
++		goto out;
++	}
++	if ((what & PA_SCENE) && pa_write_file(addr, "music scene", d, d_size, true, &info, true)) {
++		goto out;
++	}
++	if (pa_level >= 3) {
+ 		pa_halo(addr, "loaded");
+ 		pa_start(addr, fw, fw_size, &info);
+ 		pa_halo(addr, "started");
+@@ -1302,7 +1326,8 @@ pa_thread(void *arg, wait_result_t result)
+ 		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
+ 		    back[0], back[1], back[2]);
+ 		if (pa_level >= 2 && !e1 && devid == 0x35a43) {
+-			pa_load(amps[i], i ? 'T' : 'B');
++			/* 0269: 0x42 at boot with the firmware alone, against 0x40 with all of it */
++			pa_load(amps[i], i ? 'T' : 'B', i ? 0 : PA_COEFF | PA_SCENE);
+ 		}
+ 	}
+ 	pa_ready = pa_level >= 3 && pa_r_beat != 0;

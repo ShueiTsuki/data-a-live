@@ -1448,7 +1448,7 @@ gpr_step(void)
 #define SPK_ANSWER_MS         1000u
 #define SPK_GRAPH_ANSWER_MS   3000u
 #define SPK_HOLD_MS           2000u
-#define SPK_RUN_MS            12000u
+#define SPK_RUN_MS            20000u    /* 0269: 20 s, room for pandora_amp_tdm reloading both amps */
 #define APM_CMD_GRAPH_OPEN    0x01001000u
 #define APM_CMD_GRAPH_PREPARE 0x01001001u
 #define APM_CMD_GRAPH_START   0x01001002u

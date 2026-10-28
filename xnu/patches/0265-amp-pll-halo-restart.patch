@@ -1,0 +1,237 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 650c20d..83b3f98 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -444,8 +444,17 @@ pa_ctl(const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info, uint32_t alg,
+  * RESET | EN, then clear RESET). Android's idle dump: core control 0x81, MPU lock reads 0xbeef,
+  * HALO_STATE 2, HALO_HEARTBEAT counting with no audio clock.
+  */
+-static void
+-pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
++static int
++pa_bits(uint8_t addr, uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t v = 0;
++	int err = pa_reg(addr, reg, &v);
++	return err ? err : pa_write1(addr, reg, (v & ~mask) | (val & mask));
++}
++
++/* MEM_RDY, the MPU and the core out of reset (the part of pa_start that 0265 also does with the clock running). */
++static int
++pa_core_run(uint8_t addr)
+ {
+ 	static const uint16_t group[5] = {0x0, 0x4, 0x8, 0xc, 0x14};   /* XMEM, YMEM, WINDOW, XREG, YREG access */
+ 	int err = pa_write1(addr, 0x2900, 2);
+@@ -461,6 +470,14 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
+ 	err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+ 	err = err ? err : pa_write1(addr, PA_HALO_CORE, core | 0x201u);
+ 	err = err ? err : pa_write1(addr, PA_HALO_CORE, (core | 0x201u) & ~0x200u);
++	return err;
++}
++
++static void
++pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
++{
++	uint32_t core = 0;
++	int err = pa_core_run(addr);
+ 	if (err) {
+ 		printf("PANDORA AMP: %#x DSP start: I2C error %d\n", addr, err);
+ 		return;
+@@ -516,12 +533,18 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
+  * The state: enables, PLL / clock status 0x2C14 (3 during Android's playback), monitors, the latched and raw
+  * interrupt status 0x10010-0x1001C / 0x10090-0x100A0, the Halo core, MPU lock, HALO_STATE, heartbeat over
+  * 100 ms, AUDIO_STATE.
++ * 0265 (spk7: the clock and the power stage as Android's, the Halo core still 0x1 with the heartbeat at 0):
++ *  - the PLL as Android's set_sysclk does it (pa_sysclk) instead of one write of 0x430;
++ *  - then, if the heartbeat still does not count, the core stopped and started again with the clock running;
++ *  - the Halo registers Android's dump has (pa_halo), and the whole dump after power-up, against Android's
++ *    dump during playback (speakercheck raw/during);
++ *  - the lines short: spk7's long ones were cut by other threads' output.
+  */
+ static const struct {
+ 	uint32_t reg, v40, v42;
+ } pa_cfg[] = {
+ 	{0x0104, 0, 0}, {0x0124, 0, 0}, {0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
+-	{0x2c04, 0x430, 0x430}, {0x2d10, 0x3c024, 0x3c024}, {0x3808, 0x40, 0x40}, {0x4808, 0x20200000, 0x20200000},
++	{0x3808, 0x40, 0x40}, {0x4808, 0x20200000, 0x20200000},
+ 	{0x480c, 3, 3}, {0x4810, 1, 0}, {0x4820, 0x20401, 0x20200}, {0x4830, 0x20, 0x20}, {0x4840, 0x20, 0x20},
+ 	{0x4c20, 0x36, 0x36}, {0x4c24, 0, 0}, {0x4c44, 8, 8}, {0x6000, 0x8004, 0x8004}, {0x6404, 0x02005604, 0x02005604},
+ 	{0x6800, 0x40405, 0x40405}, {0x6c04, 0x240, 0x240}, {0x7424, 3, 3},
+@@ -529,8 +552,8 @@ static const struct {
+ static void
+ pa_state(uint8_t addr, const char *when)
+ {
+-	static const uint32_t regs[] = {0x2014, 0x2018, 0x2c14, 0x2038, 0x2040, 0x2044, 0x4300, 0x4304, 0x4800, 0x7400,
+-	    0x10010, 0x10014, 0x10018, 0x1001c, 0x10090, 0x10094, 0x10098, 0x1009c, 0x100a0};
++	static const uint32_t regs[] = {0x2014, 0x2018, 0x2c04, 0x2c14, 0x2038, 0x2040, 0x2044, 0x4300, 0x4304, 0x4800,
++	    0x7400, 0x10010, 0x10014, 0x10018, 0x1001c, 0x10090, 0x10094, 0x10098, 0x1009c, 0x100a0};
+ 	uint32_t v[sizeof(regs) / 4], core = 0, lock = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
+ 	int err = 0;
+ 	for (unsigned i = 0; i < sizeof(regs) / 4 && !err; i++) {
+@@ -543,10 +566,79 @@ pa_state(uint8_t addr, const char *when)
+ 	pa_sleep(100);
+ 	err = err || !pa_r_beat ? err : pa_reg(addr, pa_r_beat, &beat1);
+ 	err = err || !pa_r_audio ? err : pa_reg(addr, pa_r_audio, &audio);
+-	printf("PANDORA AMP: %#x %s: 2014 %x 2018 %x 2c14 %x 2038 %x 2040 %x 2044 %x 4300 %x 4304 %x 4800 %x 7400 %x; "
+-	    "irq latched %x %x %x %x raw %x %x %x %x %x; core %#x MPU lock %#x HALO_STATE %#x heartbeat %#x -> %#x "
+-	    "AUDIO_STATE %#x err %d\n", addr, when, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+-	    v[12], v[13], v[14], v[15], v[16], v[17], v[18], core, lock, state, beat0, beat1, audio, err);
++	printf("PANDORA AMP: %#x %s: 2014 %x 2018 %x 2c04 %x 2c14 %x 2038 %x 2040 %x 2044 %x\n", addr, when, v[0], v[1],
++	    v[2], v[3], v[4], v[5], v[6]);
++	printf("PANDORA AMP: %#x %s: 4300 %x 4304 %x 4800 %x 7400 %x\n", addr, when, v[7], v[8], v[9], v[10]);
++	printf("PANDORA AMP: %#x %s: irq latched %x %x %x %x raw %x %x %x %x %x\n", addr, when, v[11], v[12], v[13],
++	    v[14], v[15], v[16], v[17], v[18], v[19]);
++	printf("PANDORA AMP: %#x %s: core %#x MPU lock %#x HALO_STATE %#x beat %#x -> %#x AUDIO_STATE %#x err %d\n", addr,
++	    when, core, lock, state, beat0, beat1, audio, err);
++}
++
++/* The Halo registers in Android's dump (speakercheck amp_*_regs_before.txt: 0x2BC1000 0x81, MPU 0xffffffff,
++ * 0x2BC3140 0xbeef, 0x2BC5608 0x580, 0x2BC5618 0x660, 0x2BC7000 0x111000, the rest 0). */
++static void
++pa_halo(uint8_t addr, const char *when)
++{
++	static const uint32_t regs[] = {0x2b80000, 0x2b80010, 0x2b805c0, 0x2b805c8, 0x2b805d0, 0x2b805d8, 0x2bc1000,
++	    0x2bc3104, 0x2bc310c, 0x2bc3114, 0x2bc3140, 0x2bc5608, 0x2bc5618, 0x2bc7000, 0x2bc7008};
++	uint32_t v[sizeof(regs) / 4], mpu[20];
++	int err = 0;
++	for (unsigned i = 0; i < sizeof(regs) / 4 && !err; i++) {
++		err = pa_reg(addr, regs[i], &v[i]);
++	}
++	static const uint16_t group[5] = {0x0, 0x4, 0x8, 0xc, 0x14};
++	for (unsigned i = 0; i < 20 && !err; i++) {
++		err = pa_reg(addr, PA_HALO_MPU + 0x18u * (i / 5) + group[i % 5], &mpu[i]);
++	}
++	if (err) {
++		printf("PANDORA AMP: %#x %s: Halo registers: I2C error %d\n", addr, when, err);
++		return;
++	}
++	printf("PANDORA AMP: %#x %s: halo 0 %x rst %x scratch %x %x %x %x core %x\n", addr, when, v[0], v[1], v[2], v[3],
++	    v[4], v[5], v[6]);
++	printf("PANDORA AMP: %#x %s: mpu 3104 %x 310c %x 3114 %x lock %x 5608 %x 5618 %x wdt %x %x\n", addr, when, v[7],
++	    v[8], v[9], v[10], v[11], v[12], v[13], v[14]);
++	unsigned full = 0;
++	for (unsigned i = 0; i < 20; i++) {
++		full += mpu[i] == 0xffffffffu;
++	}
++	printf("PANDORA AMP: %#x %s: mpu access %u of 20 at ffffffff (first %x %x %x %x %x)\n", addr, when, full, mpu[0],
++	    mpu[1], mpu[2], mpu[3], mpu[4]);
++}
++
++/*
++ * The PLL as Android sets it at each stream start (cs35l43_pcm_hw_params: 0x2C0C GLOBAL_FS 3 = 48 kHz, then
++ * cs35l43_component_set_sysclk with clock 0, the bit clock, 3.072 MHz = code 0x21 of cs35l43_pll_sysclk):
++ * 0x2C04 open loop (bit 11), the reference frequency (bits 5-10), PLL off (bit 4), the source (bits 0-2), closed
++ * loop, PLL on; then FS_MON 0x2D10 (0x3c024 in Android's dumps). Bit 16 (forced on in pa_start, spk4) cleared at
++ * the end: Android's dumps have 0x430.
++ */
++static int
++pa_sysclk(uint8_t addr)
++{
++	int err = pa_bits(addr, 0x2c0c, 0x1f, 3);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0x800);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x7e0, 0x21u << 5);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x7, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0x10);
++	err = err ? err : pa_write1(addr, 0x2d10, 0x3c024);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10000, 0);
++	return err;
++}
++
++/* Whether HALO_HEARTBEAT moves within 100 ms. */
++static bool
++pa_beating(uint8_t addr)
++{
++	uint32_t b0 = 0, b1 = 0;
++	if (!pa_r_beat || pa_reg(addr, pa_r_beat, &b0)) {
++		return false;
++	}
++	pa_sleep(100);
++	return !pa_reg(addr, pa_r_beat, &b1) && b1 != b0;
+ }
+ 
+ static int
+@@ -560,6 +652,9 @@ pa_key(uint8_t addr, uint32_t test)
+ 	return err;
+ }
+ 
++static void pa_dump(uint8_t addr);
++static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
++
+ static void
+ pa_tdm_thread(void *arg, wait_result_t result)
+ {
+@@ -571,14 +666,39 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		for (unsigned k = 0; k < sizeof(pa_cfg) / sizeof(pa_cfg[0]) && !err; k++) {
+ 			err = pa_write1(amps[i], pa_cfg[k].reg, i ? pa_cfg[k].v42 : pa_cfg[k].v40);
+ 		}
++		const int cfg_err = err;
++		err = err ? err : pa_sysclk(amps[i]);
+ 		err = err ? err : pa_write1(amps[i], 0x4c00, 0x36);
+ 		err = err ? err : pa_write1(amps[i], 0x2018, 0x3720);
+ 		err = err ? err : pa_write1(amps[i], 0x4800, 0x10001);
+-		printf("PANDORA AMP: %#x Android's configuration, playback routing and enables written, err %d\n", amps[i], err);
++		printf("PANDORA AMP: %#x configuration (err %d), PLL as set_sysclk, routing, enables: err %d\n", amps[i],
++		    cfg_err, err);
++	}
++	pa_sleep(100);
++	for (unsigned i = 0; i < 2; i++) {
++		pa_state(amps[i], "PLL set");
++		pa_halo(amps[i], "PLL set");
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		if (pa_beating(amps[i])) {
++			printf("PANDORA AMP: %#x heartbeat counting with the PLL set\n", amps[i]);
++			continue;
++		}
++		/* cs_dsp_halo_stop_core (core EN cleared, HALO_CORE_SOFT_RESET bit 0 set), then pa_core_run again.
++		 * The firmware stays where it was loaded: XM word 0 checked before and after. */
++		uint32_t xm0 = 0, xm1 = 0;
++		int err = pa_reg(amps[i], CSFW_XM, &xm0);
++		err = err ? err : pa_bits(amps[i], PA_HALO_CORE, 1u, 0);
++		err = err ? err : pa_bits(amps[i], PA_HALO_RST, 1u, 1u);
++		pa_sleep(1);
++		err = err ? err : pa_core_run(amps[i]);
++		pa_sleep(20);
++		err = err ? err : pa_reg(amps[i], CSFW_XM, &xm1);
++		const bool beat = !err && pa_beating(amps[i]);
++		printf("PANDORA AMP: %#x core restarted with the clock: XM[0] %#x -> %#x (loaded %#x), heartbeat %s, err %d\n",
++		    amps[i], xm0, xm1, pa_xm0, beat ? "counting" : "still", err);
++		pa_halo(amps[i], "restarted");
+ 	}
+-	pa_sleep(500);
+-	pa_state(0x40, "TDM clock, configured");
+-	pa_state(0x42, "TDM clock, configured");
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		int err = pa_key(amps[i], 0x000f1aa0);
+ 		err = err ? err : pa_write1(amps[i], 0x2014, 1);
+@@ -586,11 +706,15 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		printf("PANDORA AMP: %#x powered up, err %d\n", amps[i], err);
+ 	}
+ 	pa_sleep(500);
+-	pa_state(0x40, "powered up 0.5 s");
+-	pa_state(0x42, "powered up 0.5 s");
+-	pa_sleep(3000);
+-	pa_state(0x40, "powered up 3.5 s");
+-	pa_state(0x42, "powered up 3.5 s");
++	for (unsigned i = 0; i < 2; i++) {
++		pa_state(amps[i], "up 0.5 s");
++		pa_halo(amps[i], "up 0.5 s");
++	}
++	pa_dump(0x40);
++	pa_dump(0x42);
++	pa_sleep(1500);
++	pa_state(0x40, "up 3 s");
++	pa_state(0x42, "up 3 s");
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		uint32_t en = 0, irq = 0;
+ 		int err = pa_reg(amps[i], 0x2018, &en);
+@@ -690,6 +814,7 @@ pa_load(uint8_t addr, char side)
+ 	}
+ 	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
+ 	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
++	pa_xm0 = info.core_id;
+ 	uint32_t core = 0;
+ 	int err = pa_reg(addr, PA_HALO_CORE, &core);
+ 	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);

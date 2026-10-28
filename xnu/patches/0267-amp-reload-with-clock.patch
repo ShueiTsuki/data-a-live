@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 7a44e99..da8c25e 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1448,7 +1448,7 @@ gpr_step(void)
+ #define SPK_ANSWER_MS         1000u
+ #define SPK_GRAPH_ANSWER_MS   3000u
+ #define SPK_HOLD_MS           2000u
+-#define SPK_RUN_MS            12000u
++#define SPK_RUN_MS            16000u    /* 0267: 16 s, room for pandora_amp_tdm reloading one amp */
+ #define APM_CMD_GRAPH_OPEN    0x01001000u
+ #define APM_CMD_GRAPH_PREPARE 0x01001001u
+ #define APM_CMD_GRAPH_START   0x01001002u
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 9ed8aba..a9acf53 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -498,25 +498,11 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
+ 	pa_sleep(100);
+ 	err = err || !r_beat ? err : pa_reg(addr, r_beat, &beat1);
+ 	err = err || !r_audio ? err : pa_reg(addr, r_audio, &audio);
+-	printf("PANDORA AMP: %#x DSP started: core control %#x (Android 0x81), MPU lock %#x (0xbeef), 0x2900 %#x, "
+-	    "HALO_STATE %#x (2), heartbeat %#x -> %#x in 100 ms, AUDIO_STATE %#x, err %d\n", addr, core, lock, mem, state,
+-	    beat0, beat1, audio, err);
+-	if (!err && r_beat && beat0 == beat1) {
+-		/* spk4: the core enabled but not counting, as if unclocked. cs35l43_dsp_preload_ev forces the
+-		 * PLL on (0x2C04 bit 16) before Android's boot-time load when its clock hook is set. */
+-		uint32_t pll = 0;
+-		err = pa_reg(addr, 0x2c04, &pll);
+-		err = err ? err : pa_write1(addr, 0x2c04, pll | 0x10000u);
+-		pa_sleep(50);
+-		err = err ? err : pa_reg(addr, r_beat, &beat0);
+-		pa_sleep(100);
+-		err = err ? err : pa_reg(addr, r_beat, &beat1);
+-		err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+-		err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+-		err = err || !r_state ? err : pa_reg(addr, r_state, &state);
+-		printf("PANDORA AMP: %#x PLL forced (0x2c04 %#x -> %#x): core control %#x, MPU lock %#x, HALO_STATE %#x, "
+-		    "heartbeat %#x -> %#x in 100 ms, err %d\n", addr, pll, pll | 0x10000u, core, lock, state, beat0, beat1, err);
+-	}
++	/* 0267: no more forcing the PLL on when the heartbeat stands (spk4-spk9: it never helped) */
++	printf("PANDORA AMP: %#x DSP started: core %#x (Android 0x81) lock %#x (0xbeef) 0x2900 %#x\n", addr, core, lock,
++	    mem);
++	printf("PANDORA AMP: %#x DSP started: HALO_STATE %#x beat %#x -> %#x AUDIO_STATE %#x err %d\n", addr, state, beat0,
++	    beat1, audio, err);
+ }
+ 
+ /*
+@@ -605,6 +591,16 @@ pa_halo(uint8_t addr, const char *when)
+ 	}
+ 	printf("PANDORA AMP: %#x %s: mpu access %u of 20 at ffffffff (first %x %x %x %x %x)\n", addr, when, full, mpu[0],
+ 	    mpu[1], mpu[2], mpu[3], mpu[4]);
++	/* 0267: where the violations were (cs_dsp_halo_bus_error reads HALO_MPU_XM/YM/PM_VIO_ADDR, 0x43100/08/10),
++	 * and the AHB master's error (HALO_AHBM_WINDOW_DEBUG_0/1, base + 0x2040/0x2044), each read on its own. */
++	uint32_t va[3] = {0, 0, 0}, ahb[2] = {0, 0};
++	int e1 = pa_reg(addr, PA_HALO_MPU + 0x100, &va[0]);
++	e1 = e1 ? e1 : pa_reg(addr, PA_HALO_MPU + 0x108, &va[1]);
++	e1 = e1 ? e1 : pa_reg(addr, PA_HALO_MPU + 0x110, &va[2]);
++	int e2 = pa_reg(addr, 0x2b82040, &ahb[0]);
++	e2 = e2 ? e2 : pa_reg(addr, 0x2b82044, &ahb[1]);
++	printf("PANDORA AMP: %#x %s: violation at XM %x YM %x PM %x (err %d); AHB debug %x %x (err %d)\n", addr, when,
++	    va[0], va[1], va[2], e1, ahb[0], ahb[1], e2);
+ }
+ 
+ /*
+@@ -681,6 +677,7 @@ pa_key(uint8_t addr, uint32_t test)
+ }
+ 
+ static void pa_dump(uint8_t addr);
++static void pa_load(uint8_t addr, char side);
+ static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
+ 
+ static void
+@@ -707,25 +704,21 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		pa_state(amps[i], "PLL set");
+ 		pa_halo(amps[i], "PLL set");
+ 	}
++	/* 0267: spk8/spk9 restarted the core without loading again, after XM already read 0: not a clean test. Now 0x40
++	 * (bottom) is loaded from the start with the clock running: core stopped, firmware, coefficients and scene
++	 * written and checked again, MPU, core started (pa_load). 0x42 stays as loaded at boot, for comparison. */
+ 	for (unsigned i = 0; i < 2; i++) {
+-		if (pa_beating(amps[i])) {
+-			printf("PANDORA AMP: %#x heartbeat counting with the PLL set\n", amps[i]);
+-			continue;
+-		}
+-		/* cs_dsp_halo_stop_core (core EN cleared, HALO_CORE_SOFT_RESET bit 0 set), then pa_core_run again.
+-		 * The firmware stays where it was loaded: XM word 0 checked before and after. */
+-		uint32_t xm0 = 0, xm1 = 0;
++		uint32_t xm0 = 0;
+ 		int err = pa_reg(amps[i], CSFW_XM, &xm0);
+-		err = err ? err : pa_bits(amps[i], PA_HALO_CORE, 1u, 0);
+-		err = err ? err : pa_bits(amps[i], PA_HALO_RST, 1u, 1u);
+-		pa_sleep(1);
+-		err = err ? err : pa_core_run(amps[i]);
+-		pa_sleep(20);
+-		err = err ? err : pa_reg(amps[i], CSFW_XM, &xm1);
+-		const bool beat = !err && pa_beating(amps[i]);
+-		printf("PANDORA AMP: %#x core restarted with the clock: XM[0] %#x -> %#x (loaded %#x), heartbeat %s, err %d\n",
+-		    amps[i], xm0, xm1, pa_xm0, beat ? "counting" : "still", err);
+-		pa_halo(amps[i], "restarted");
++		printf("PANDORA AMP: %#x before reload: heartbeat %s, XM[0] %#x (loaded %#x), err %d\n", amps[i],
++		    pa_beating(amps[i]) ? "counting" : "still", xm0, pa_xm0, err);
++	}
++	pa_load(0x40, 'B');
++	{
++		uint32_t xm0 = 0;
++		int err = pa_reg(0x40, CSFW_XM, &xm0);
++		printf("PANDORA AMP: 0x40 loaded with the clock: heartbeat %s, XM[0] %#x, err %d\n",
++		    pa_beating(0x40) ? "counting" : "still", xm0, err);
+ 	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		int err = pa_key(amps[i], 0x000f1aa0);
+@@ -915,6 +908,7 @@ pa_load(uint8_t addr, char side)
+ 		goto out;
+ 	}
+ 	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
++		pa_halo(addr, "loaded");
+ 		pa_start(addr, fw, fw_size, &info);
+ 		pa_halo(addr, "started");
+ 		pa_dump(addr);
