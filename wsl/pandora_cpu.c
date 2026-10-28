@@ -514,6 +514,8 @@ cpu_temps(bool all)
  * (reset-mon-cfg) resets the SoC. Each core has two sensors: tsens1 2N and 2N+1 for core N of 0-5,
  * tsens3 0-1 for core 6 and 2-3 for core 7.
  * Boot-arg pandora_thermal_test=N: every threshold N degrees lower, to exercise this at an ordinary load.
+ * Patch 0257: under these, the body temperature's caps (pandora_cpu_body_cap, from pandora_therm.c), which
+ * hold the clusters far below such junction temperatures, as Android's mi_thermald does.
  */
 #define T_HAL       1050    /* tenths of a degree */
 #define T_HAL_HYST  50
@@ -525,6 +527,7 @@ extern uint32_t pandora_gpu_thermal_top;             /* bsd/dev/pandora_gpu.c: G
 extern const uint32_t pandora_gpu_level_count;
 extern void pandora_cpu_recommend(uint64_t cores);  /* osfmk/arm/pandora_cpu_idle.c */
 static uint32_t cpu_tcap[2] = { ~0u, ~0u };          /* level cap per domain, ~0u = none */
+static uint32_t cpu_bcap[2] = { ~0u, ~0u };          /* 0257: the body temperature's level cap, ~0u = none */
 static uint64_t cpu_t_out;                           /* cores taken from the scheduler for heat */
 static int32_t cpu_t_test;                           /* tenths added to readings (pandora_thermal_test) */
 static uint32_t cpu_t_logged;
@@ -617,6 +620,26 @@ cpu_thermal(void)
 	}
 }
 
+/* 0257: the body temperature's caps (bsd/dev/pandora_therm.c, mi_thermald's SS-CPU0 and SS-CPU6), the
+ * highest kHz for each domain, 0 = none; kept as the highest level at or under it, which the governor
+ * holds to as it does the junction cap. */
+void pandora_cpu_body_cap(uint32_t khz0, uint32_t khz6);
+void
+pandora_cpu_body_cap(uint32_t khz0, uint32_t khz6)
+{
+	const uint32_t khz[2] = { khz0, khz6 };
+	for (uint32_t d = 0; d < 2; d++) {
+		uint32_t cap = ~0u;
+		if (khz[d]) {
+			cap = 0;
+			while (cap + 1 < cpu_dom[d].levels && cpu_dom[d].khz[cap + 1] <= khz[d]) {
+				cap++;
+			}
+		}
+		__atomic_store_n(&cpu_bcap[d], cap, __ATOMIC_RELAXED);
+	}
+}
+
 static void
 cpu_governor(void)
 {
@@ -692,7 +715,9 @@ cpu_governor(void)
 			}
 			/* the floor (the bootloader's 1.67 GHz) unless nearly idle for about 0.2 s */
 			dm->quiet = busy < 100 ? dm->quiet + 1 : 0;
-			const uint32_t top = cpu_tcap[d] < dm->top ? cpu_tcap[d] : dm->top;   /* 0213: the temperature cap */
+			const uint32_t bcap = __atomic_load_n(&cpu_bcap[d], __ATOMIC_RELAXED);
+			uint32_t top = cpu_tcap[d] < dm->top ? cpu_tcap[d] : dm->top;   /* 0213: the temperature cap */
+			top = bcap < top ? bcap : top;                                  /* 0257: the body temperature's */
 			const uint32_t floor = dm->quiet >= 12 ? 0 : (dm->floor < top ? dm->floor : top);
 			uint32_t want = floor;
 			while (want < top && dm->khz[want] < need) {

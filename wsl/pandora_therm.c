@@ -11,7 +11,9 @@
  * Every second the slots are read; every 10 s a line with mi_thermald's seven inputs and its
  * VIRTUAL-SENSOR-FORMULA (five weighted sums, the largest: thermadc §5.1), and how many slots changed,
  * which says whether the PMIC still measures under iOS. "battery" is Android's battery thermal zone;
- * the gauge's temperature stands in for it here. Nothing is limited yet.
+ * the gauge's temperature stands in for it here. pandora_therm=2 also limits by it every second, with
+ * mi_thermald's tables for the CPU clusters and the GPU (pt_rule below), as long as a whole reading is
+ * there; the junction-temperature rules of pandora_cpu.c (105 C and up) stay as the last guard.
  * Under iOS the slots read 0 (bat4): the PMIC measures a channel only once a driver has set it up, and
  * Android's setup does not survive the restart. pandora_therm=2 sets the 14 channels up first, as Linux
  * qcom-spmi-adc-tm5-gen3 adc_tm5_gen3_configure: per channel, on its SDAM, wait until HS (0x45) says
@@ -262,6 +264,65 @@ pt_gpio_high_z(void)
 	    err[3], err[4], err[5], err[6]);
 }
 
+/* mi_thermald's thermal-normal.conf (thermalcheck raw/data/decrypt.txt [SS-CPU0], [SS-CPU6], [MONITOR-GPU]),
+ * all on VIRTUAL-SENSOR-FORMULA (the body temperature), polling 1000: step i holds from trig[i] on until the
+ * body is under clr[i]; under the first step nothing is limited. SS-CPU0 and SS-CPU6 cap cpufreq-cpu0 and
+ * cpufreq-cpu6 (kHz); MONITOR-GPU sets a level of the kgsl cooling device, which counts qcom,gpu-pwrlevels-1
+ * from the top (0 = 1200 MHz .. 17 = 160 MHz): pandora_gpu.c's level count - L, its levels going 1 = 160 MHz
+ * .. 18 = 1200 MHz. Every frequency named is in this phone's tables (pandora_cpu.c, pandora_gpu.c). */
+#define PT_STEPS 15
+static const struct {
+	const char *name;
+	unsigned n;
+	int32_t trig[PT_STEPS], clr[PT_STEPS];
+	uint32_t target[PT_STEPS];
+} pt_rule[3] = {
+	{"cpu0", 15, {25000, 35000, 37000, 39000, 40000, 41000, 42000, 43000, 44000, 45000, 46000, 47000, 48000, 49000, 50000},
+	 {23000, 32000, 35000, 37000, 39000, 40000, 41000, 42000, 43000, 44000, 45000, 46000, 47000, 48000, 49000},
+	 {2745600, 2745600, 2361600, 2227200, 2227200, 1670400, 1670400, 1440000, 1440000, 1324800, 1324800, 1113600, 1113600,
+	  1113600, 1113600}},
+	{"cpu6", 15, {25000, 34000, 37000, 39000, 40000, 41000, 42000, 43000, 44000, 45000, 46000, 47000, 48000, 49000, 50000},
+	 {23000, 32000, 34000, 37000, 39000, 40000, 41000, 42000, 43000, 44000, 45000, 46000, 47000, 48000, 49000},
+	 {2668800, 2438400, 1862400, 1497600, 1267200, 1267200, 1267200, 1132800, 1132800, 1267200, 1267200, 1017600, 1017600,
+	  1017600, 1017600}},
+	{"gpu", 6, {35000, 37000, 40000, 45000, 47000, 50000}, {33000, 35000, 38000, 43000, 45000, 48000}, {5, 6, 8, 11, 13, 15}},
+};
+static int pt_step[3] = {-1, -1, -1};
+
+extern void pandora_cpu_body_cap(uint32_t khz0, uint32_t khz6);   /* bsd/dev/pandora_cpu.c */
+extern uint32_t pandora_gpu_body_top;                             /* bsd/dev/pandora_gpu.c */
+extern const uint32_t pandora_gpu_level_count;
+
+static uint32_t
+pt_target(unsigned r)
+{
+	return pt_step[r] < 0 ? 0 : pt_rule[r].target[pt_step[r]];
+}
+
+/* The steps for body temperature b (millidegrees), handed on when one moved; true then. */
+static bool
+pt_limit(int32_t b)
+{
+	bool moved = false;
+	for (unsigned r = 0; r < 3; r++) {
+		int s = pt_step[r];
+		while (s + 1 < (int)pt_rule[r].n && b >= pt_rule[r].trig[s + 1]) {
+			s++;
+		}
+		while (s >= 0 && b < pt_rule[r].clr[s]) {
+			s--;
+		}
+		moved |= s != pt_step[r];
+		pt_step[r] = s;
+	}
+	if (moved) {
+		pandora_cpu_body_cap(pt_target(0), pt_target(1));
+		__atomic_store_n(&pandora_gpu_body_top, pt_step[2] < 0 ? 0 : pandora_gpu_level_count - pt_target(2),
+		    __ATOMIC_RELAXED);
+	}
+	return moved;
+}
+
 static int pt_level, pt_gpio_level;
 
 static void
@@ -269,7 +330,7 @@ pt_thread(void *arg, wait_result_t result)
 {
 	(void)arg;
 	(void)result;
-	pt_sleep(10000);
+	pt_sleep(2000);
 	pt_dump_config(PT_SDAM0);
 	pt_dump_config(PT_SDAM1);
 	if (pt_level >= 2) {
@@ -304,29 +365,45 @@ pt_thread(void *arg, wait_result_t result)
 			continue;
 		}
 		int32_t t[PT_CHANS];
+		bool measured = true;    /* the six inputs from the PMIC hold results */
 		for (unsigned i = 0; i < PT_CHANS; i++) {
 			const uint16_t code = pt_chan[i].sdam ? s1[pt_chan[i].slot] : s0[pt_chan[i].slot];
 			changed += reads && code != last[i];
 			last[i] = code;
 			t[i] = pandora_ntc_mdeg(code);
 		}
+		for (unsigned k = 0; k < 7; k++) {
+			if (pt_in[k] >= 0) {
+				const uint16_t code = last[pt_in[k]];
+				measured = measured && code != 0 && code != 0xffff;
+			}
+		}
 		reads++;
-		if (n % PT_LOG_EVERY == 0 || n == 1) {
-			struct pandora_gauge g;
-			const bool gauge = pandora_gauge_get(&g, sizeof(g));
-			const int32_t battery = gauge ? (g.temperature_dk - 2730) * 100 : 0;
-			int32_t in[7], body = INT32_MIN, vs[PT_VS];
+		struct pandora_gauge g;
+		const bool gauge = pandora_gauge_get(&g, sizeof(g));
+		const int32_t battery = gauge ? (g.temperature_dk - 2730) * 100 : 0;
+		int32_t in[7], body = INT32_MIN, vs[PT_VS];
+		for (unsigned k = 0; k < 7; k++) {
+			in[k] = pt_in[k] < 0 ? battery : t[pt_in[k]];
+		}
+		for (unsigned v = 0; v < PT_VS; v++) {
+			int64_t sum = 0;
 			for (unsigned k = 0; k < 7; k++) {
-				in[k] = pt_in[k] < 0 ? battery : t[pt_in[k]];
+				sum += (int64_t)pt_vs[v].w[k] * in[k];
 			}
-			for (unsigned v = 0; v < PT_VS; v++) {
-				int64_t sum = 0;
-				for (unsigned k = 0; k < 7; k++) {
-					sum += (int64_t)pt_vs[v].w[k] * in[k];
-				}
-				vs[v] = pt_vs[v].comp + (int32_t)(sum / 1000);
-				body = vs[v] > body ? vs[v] : body;
-			}
+			vs[v] = pt_vs[v].comp + (int32_t)(sum / 1000);
+			body = vs[v] > body ? vs[v] : body;
+		}
+		/* limits only from a whole reading: all six PMIC inputs and the gauge */
+		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(body);
+		if (moved) {
+			char b[12];
+			printf("PANDORA THERM: body %s: limits cpu0 %u kHz, cpu6 %u kHz, gpu kgsl level %d (pandora_gpu level %u); "
+			    "steps %d %d %d\n", pt_fmt(b, sizeof(b), body), pt_target(0), pt_target(1),
+			    pt_step[2] < 0 ? -1 : (int)pt_target(2), __atomic_load_n(&pandora_gpu_body_top, __ATOMIC_RELAXED),
+			    pt_step[0], pt_step[1], pt_step[2]);
+		}
+		if (n % PT_LOG_EVERY == 0 || n == 1) {
 			char a[7][12], f[PT_VS][12], b[12], o[8][12];
 			printf("PANDORA THERM: body %s (front %s back %s left %s right %s top %s) from pa1 %s charger %s pa2 %s "
 			    "quiet %s wifi %s battery%s %s cpu %s; slots changed %u in %u reads\n", pt_fmt(b, sizeof(b), body),

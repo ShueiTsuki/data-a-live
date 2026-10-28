@@ -3370,6 +3370,7 @@ gpu_watch(void)
  * for, the boost floor included, never goes over it.
  */
 uint32_t pandora_gpu_thermal_top;           /* 0213: highest level allowed, 0 = no temperature cap */
+uint32_t pandora_gpu_body_top;              /* 0257: the same from the body temperature (pandora_therm.c) */
 const uint32_t pandora_gpu_level_count = NGPU - 1;   /* levels 1 .. this */
 #define GMU_AO_GPU_CX_BUSY_MASK       0x23b0eu
 #define GMU_POWER_COUNTER_ENABLE_A8   0x1fc10u
@@ -3507,6 +3508,10 @@ gpu_dcvs_thread(void *arg, wait_result_t result)
 		const uint32_t tcap = __atomic_load_n(&pandora_gpu_thermal_top, __ATOMIC_RELAXED);
 		if (tcap != 0 && want > tcap) {
 			want = tcap;    /* 0213: temperature cap, over every other reason */
+		}
+		const uint32_t bcap = __atomic_load_n(&pandora_gpu_body_top, __ATOMIC_RELAXED);
+		if (bcap != 0 && want > bcap) {
+			want = bcap;    /* 0257: the body temperature's cap, likewise */
 		}
 		if (want != cur) {
 			if (gpu_vote(want)) {
