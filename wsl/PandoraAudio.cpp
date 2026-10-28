@@ -154,23 +154,57 @@ public:
 
 OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
 
-/* pandora_audio_delay (0288): publish the device once the uptime reaches the boot-arg's seconds. */
+/*
+ * 0290: when the device is published. VirtualAudio picks a route in full only when ports come or go; on a ringer
+ * switch change it keeps any route that still works (aud12: "Ringer switch update." -> "Route did not change", the
+ * system sounds stay on Null_Device). Our speaker existed from boot, long before SpringBoard sets the ringer state,
+ * so its port was culled as "ringer switch is off". backboardd reads the switch once (SweetHIDButtons::copyEvent, ring
+ * or silent) and SpringBoard posts the state some 0.2 s later: the device is published 3 s after that read, and
+ * VirtualAudio routes it under the right ringer state. Fallbacks: published at 120 s uptime if nobody reads the
+ * switch; boot-arg pandora_audio_delay=SECONDS (0288) a fixed time instead; pandora_audio_now=1 at once.
+ */
+static volatile bool pa_ringer_known;
+
+extern "C" void pandora_audio_ringer_known(void);
+void
+pandora_audio_ringer_known(void)
+{
+	pa_ringer_known = true;
+}
+
+static uint64_t
+pa_uptime_ms(void)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
 static void
 pa_publish_later(void *arg, wait_result_t)
 {
 	IOAudio2Device *d = static_cast<IOAudio2Device *>(arg);
 	int delay = 0;
 	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
-	uint64_t ns = 0;
-	for (;;) {
-		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-		if (ns >= (uint64_t)delay * NSEC_PER_SEC) {
-			break;
+	const char *why;
+	if (delay > 0) {
+		while (pa_uptime_ms() < (uint64_t)delay * 1000) {
+			IOSleep(200);
 		}
-		IOSleep(200);
+		why = "fixed delay";
+	} else {
+		while (!pa_ringer_known && pa_uptime_ms() < 120000) {
+			IOSleep(100);
+		}
+		if (pa_ringer_known) {
+			IOSleep(3000);
+			why = "3 s after the ring/silent switch was read";
+		} else {
+			why = "nobody read the ring/silent switch by 120 s";
+		}
 	}
 	d->registerService();
-	IOLog("PANDORA AUDIO: IOAudio2Device registered at %llu ms\n", ns / NSEC_PER_MSEC);
+	IOLog("PANDORA AUDIO: IOAudio2Device registered at %llu ms (%s)\n", pa_uptime_ms(), why);
 	d->release();
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
@@ -229,15 +263,10 @@ IOAudio2Device::start(IOService *provider)
 	OSSafeReleaseNULL(outs);
 	OSSafeReleaseNULL(ins);
 	OSSafeReleaseNULL(controls);
-	/*
-	 * 0288: boot-arg pandora_audio_delay=SECONDS publishes the device that many seconds after boot. aud9: VirtualAudio
-	 * routes the default device the moment the speaker appears ("Culling route connection because ringer switch is
-	 * off", pap -> pspk) and keeps the null device after SpringBoard turns the ringer on 0.3 s later; system sounds
-	 * then run on Null_Device. Published after SpringBoard has set the ringer state, the speaker is routed.
-	 */
-	int delay = 0;
-	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
-	if (delay > 0) {
+	/* 0288/0290: published later, see pa_publish_later. */
+	int now = 0;
+	(void)PE_parse_boot_argn("pandora_audio_now", &now, sizeof(now));
+	if (!now) {
 		retain();
 		thread_t thread;
 		if (kernel_thread_start(pa_publish_later, this, &thread) == KERN_SUCCESS) {
@@ -250,7 +279,7 @@ IOAudio2Device::start(IOService *provider)
 		registerService();
 	}
 	IOLog("PANDORA AUDIO: IOAudio2Device %s: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n",
-	    delay > 0 ? "made, published later" : "registered", PA_RATE, PA_CHANNELS, PA_RING_FRAMES);
+	    now ? "registered" : "made, published later", PA_RATE, PA_CHANNELS, PA_RING_FRAMES);
 	return true;
 }
 
