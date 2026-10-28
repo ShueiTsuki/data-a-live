@@ -13,7 +13,8 @@
 #      vktest, the Turnip library and files.txt installing them (bsd/dev/pandora_files.c)
 #      --amp-fw DIR: also the speaker amplifiers' firmware from DIR (Android's /odm/firmware:
 #      cs35l43-dsp1-spk-prot.wmfw, T-/B-cs35l43-dsp1-spk-prot.bin, T-/B-cs35l43-delta-music-spk-prot.bin),
-#      read by bsd/dev/pandora_amp.c; copies of phone files, kept outside the repo
+#      read by bsd/dev/pandora_amp.c; copies of phone files, kept outside the repo. spkgraph.bin there too when
+#      made (tools/spk_graph.py from the phone's ACDB), for pandora_adsp.c's speaker graph
 #   4. with --write-pack only: checks the pinned pack file on the phone and writes the new pack
 #      over it raw (tools/pinfile rawwrite), then hashes it back. Without the flag the phone's pack
 #      must already be this pack, or the run stops.
@@ -140,6 +141,10 @@ if [ -n "${AMP_FW:-}" ]; then
 		[ -f "$AMP_FW/$f" ] || { echo "no $AMP_FW/$f"; exit 1; }
 		PARTS+=("$(winp "$AMP_FW/$f")")
 	done
+	# the speaker graph from the phone's ACDB (tools/spk_graph.py), when made
+	if [ -f "$AMP_FW/spkgraph.bin" ]; then
+		PARTS+=("$(winp "$AMP_FW/spkgraph.bin")")
+	fi
 fi
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"

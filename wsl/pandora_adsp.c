@@ -46,6 +46,7 @@
 #include <pexpert/device_tree.h>
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
+#include <kern/kalloc.h>
 #include <arm/caches_internal.h>
 #include "qcom/QcomSmem.h"
 #include "qcom/QcomSmp2p.h"
@@ -1411,7 +1412,21 @@ gpr_step(void)
  *     Android asks the PRM for it (machine_dlkm msm_common_snd_hw_params, D:\DeepSeekHarness\prmcheck:
  *     PARAM_ID_RSC_AUDIO_HW_CLK, clock 0x200 at 48 kHz x 2 slots x 32 bits, attribute 4 from the DT's
  *     tdm-clk-attribute, root 0), held 2 s and released.
- * Nothing plays: the amplifiers are not configured.
+ *  3 (0262): the speaker graph Android opens for a playback (D:\DeepSeekHarness\spkstart, acdbcheck), in its
+ *     order (AGM / PAL, spkstart 1.3): the buffer stays mapped and the clock held; APM_CMD_GRAPH_OPEN with the
+ *     ACDB's subgraph and connection data and APM_CMD_SET_CFG with its calibration, both from spkgraph.bin of
+ *     the pinned pack (tools/spk_graph.py) and sent out of band in the DSP buffer as gsl does; then the
+ *     settings AGM and PAL make at run time, out of band too: the stream MFC (PAL payloadMFCConfig: 48 kHz,
+ *     32 bits, 2 channels L R), the shared-memory endpoint's media format (configure_pcm_shared_mem_ep), the
+ *     TDM endpoint's media format (configure_hw_ep_media_config: 48 kHz, 32 bits, 2 channels, fixed point)
+ *     and its interface (configure_tdm_ep: the ACDB's tag data, primary TDM of LPAIF, 2 slots of 32 bits),
+ *     the PCM decoder's and converter's output (configure_output_media_format: 32 bits, q31, deinterleaved
+ *     unpacked), the SPR's path end and session-time reset (configure_spr); GRAPH_PREPARE and GRAPH_START
+ *     with the four subgraphs. The stream side is our choice (iOS hands its own format): 48 kHz, 32 bits,
+ *     2 channels. Then pandora_amp_tdm looks at the amps on the running clock; after SPK_RUN_MS the graph is
+ *     stopped and closed, the clock released and the buffer unmapped. Nothing is written to the stream:
+ *     the DSP plays silence.
+ * Nothing plays: the amplifiers are not configured (level 3: not told to play).
  */
 #define SPK_APM_PORT          GPR_PORT_APM
 #define SPK_PRM_PORT          2u        /* the PRM instance (Linux q6prm GPR_PRM_MODULE_IID) */
@@ -1431,20 +1446,44 @@ gpr_step(void)
 #define SPK_TLMM_PA           0x0f100000u
 #define SPK_TDM_GPIO0         122u
 #define SPK_ANSWER_MS         1000u
+#define SPK_GRAPH_ANSWER_MS   3000u
 #define SPK_HOLD_MS           2000u
+#define SPK_RUN_MS            12000u
+#define APM_CMD_GRAPH_OPEN    0x01001000u
+#define APM_CMD_GRAPH_PREPARE 0x01001001u
+#define APM_CMD_GRAPH_START   0x01001002u
+#define APM_CMD_GRAPH_STOP    0x01001003u
+#define APM_CMD_GRAPH_CLOSE   0x01001004u
+#define APM_CMD_SET_CFG       0x01001006u
+#define GPR_RSP_BASIC         0x02001005u   /* GPR_IBASIC_RSP_RESULT {opcode, status} */
+#define APM_MODULE_IID        1u
+#define APM_PARAM_SG_LIST     0x08001005u
+#define SPK_SHM_CMDS          0x40000u      /* command payloads below, the stream's buffers above */
 
-enum {SpkOff, SpkWait, SpkMap, SpkUnmap, SpkClock, SpkHold, SpkRelease, SpkDone};
+enum {SpkOff, SpkWait, SpkMap, SpkUnmap, SpkClock, SpkHold, SpkRelease, SpkDone, SpkGraph, SpkRunning, SpkUnmapEnd};
 
 static vm_offset_t ad_shm_va;            /* the DSP buffer (smmu_survey) */
 static uint64_t ad_shm_pa, ad_shm_size;
 static bool ad_smmu_audio;               /* the audio streams pass the apps SMMU */
+
+/* One APM command of the graph sequence: out of band (its payload at shm offset off) or in band. */
+struct spk_cmd {
+	const char *what;
+	uint32_t opcode, off, len;
+	bool oob, must;
+	uint8_t inband[56];
+};
 
 static struct {
 	int level;
 	unsigned state;
 	uint8_t tx[128];
 	uint32_t tx_len, token, handle, others;
-	uint64_t answer_by, hold_until, t0;
+	uint64_t answer_by, hold_until, t0, run_until;
+	struct spk_cmd cmds[16];
+	unsigned ncmd, icmd, failed;
+	bool opened, closing;
+	uint32_t cursor, nsg, sg[8];
 } spk;
 
 static void
@@ -1535,6 +1574,277 @@ spk_level2(void)
 	spk_clock(SPK_TDM_HZ);
 }
 
+/* ---- level 3: the speaker graph (0262) ---- */
+extern uint8_t *pandora_fw_file(const char *name, uint32_t *size);   /* pandora_amp.c: a file of the pinned pack */
+extern void pandora_amp_tdm(void);                                    /* pandora_amp.c */
+
+static void
+spk_put16(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+/* Into the DSP buffer's command area; the offset, ~0u when it does not fit. */
+static uint32_t
+spk_shm(const void *data, uint32_t len)
+{
+	const uint32_t off = spk.cursor;
+	if ((uint64_t)off + len > SPK_SHM_CMDS || (uint64_t)off + len > ad_shm_size) {
+		return ~0u;
+	}
+	memcpy((void *)(ad_shm_va + off), data, len);
+	spk.cursor = (off + len + 0xffu) & ~0xffu;
+	return off;
+}
+
+/* An apm_module_param_data_t {instance, parameter, size, error code 0} and its data, padded to 8; its length. */
+static uint32_t
+spk_param(uint8_t *b, uint32_t miid, uint32_t pid, const void *data, uint32_t n)
+{
+	const uint32_t len = (16u + n + 7u) & ~7u;
+	bzero(b, len);
+	spk_put32(b, miid);
+	spk_put32(b + 4, pid);
+	spk_put32(b + 8, n);
+	memcpy(b + 16, data, n);
+	return len;
+}
+
+static void
+spk_add_oob(const char *what, uint32_t opcode, const void *data, uint32_t len, bool must)
+{
+	const uint32_t off = spk_shm(data, len);
+	if (spk.ncmd >= 16 || off == ~0u) {
+		printf("PANDORA SPK: %s (%u bytes) does not fit\n", what, len);
+		spk.failed++;
+		return;
+	}
+	struct spk_cmd *c = &spk.cmds[spk.ncmd++];
+	c->what = what;
+	c->opcode = opcode;
+	c->off = off;
+	c->len = len;
+	c->oob = true;
+	c->must = must;
+}
+
+/* PREPARE, START, STOP, CLOSE: APM_PARAM_ID_SUB_GRAPH_LIST of the graph's subgraphs, in band. */
+static void
+spk_add_sgs(const char *what, uint32_t opcode, bool must)
+{
+	if (spk.ncmd >= 16) {
+		return;
+	}
+	uint8_t list[4 + 4 * 8];
+	spk_put32(list, spk.nsg);
+	for (unsigned i = 0; i < spk.nsg; i++) {
+		spk_put32(list + 4 + 4 * i, spk.sg[i]);
+	}
+	struct spk_cmd *c = &spk.cmds[spk.ncmd++];
+	c->what = what;
+	c->opcode = opcode;
+	c->oob = false;
+	c->must = must;
+	c->len = spk_param(c->inband, APM_MODULE_IID, APM_PARAM_SG_LIST, list, 4 + 4 * spk.nsg);
+}
+
+/* apm_cmd_header {payload address lsw, msw, mem map handle, payload size}: out of band the DSP buffer's address
+ * as it was mapped (the stream index in the upper word), in band the payload after it. */
+static void
+spk_cmd_send(void)
+{
+	const struct spk_cmd *c = &spk.cmds[spk.icmd];
+	uint8_t pl[16 + sizeof(c->inband)];
+	bzero(pl, sizeof(pl));
+	if (c->oob) {
+		const uint64_t a = ad_shm_pa + c->off;
+		spk_put32(pl, (uint32_t)a);
+		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
+		spk_put32(pl + 8, spk.handle);
+	} else {
+		memcpy(pl + 16, c->inband, c->len);
+	}
+	spk_put32(pl + 12, c->len);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	spk_send(SPK_APM_PORT, c->opcode, pl, c->oob ? 16u : 16u + c->len, SpkGraph);
+	clock_interval_to_deadline(SPK_GRAPH_ANSWER_MS, NSEC_PER_MSEC, &spk.answer_by);
+}
+
+/* The PCM decoder's and converter's output (payload_pcm_output_format_cfg_t in a media_format_t). */
+static uint32_t
+spk_pcm_out(uint8_t *b, uint32_t miid)
+{
+	uint8_t d[30];
+	bzero(d, sizeof(d));
+	spk_put32(d, 1);                       /* DATA_FORMAT_FIXED_POINT */
+	spk_put32(d + 4, 0x09001000u);         /* MEDIA_FMT_ID_PCM */
+	spk_put32(d + 8, 18);
+	spk_put16(d + 12, 32);                 /* bit width */
+	spk_put16(d + 14, 1);                  /* PCM_LSB_ALIGNED */
+	spk_put16(d + 16, 32);                 /* bits per sample */
+	spk_put16(d + 18, 31);                 /* q factor */
+	spk_put16(d + 20, 1);                  /* PCM_LITTLE_ENDIAN */
+	spk_put16(d + 22, 3);                  /* PCM_DEINTERLEAVED_UNPACKED: playback */
+	spk_put16(d + 26, 2);                  /* channels */
+	d[28] = 1;                             /* PCM_CHANNEL_L */
+	d[29] = 2;                             /* PCM_CHANNEL_R */
+	return spk_param(b, miid, 0x08001008u, d, sizeof(d));
+}
+
+static void spk_graph_done(bool aborted);
+
+/* spkgraph.bin: "PSPKGR01", u32 sections, {u32 type, u32 bytes, data padded to 8}: 1 open, 2 calibration,
+ * 3 TDM tag data, 4 subgraphs (tools/spk_graph.py). */
+static void
+spk_graph_begin(void)
+{
+	uint32_t size = 0;
+	uint8_t *f = pandora_fw_file("spkgraph.bin", &size);
+	const uint8_t *sec[5] = {NULL};
+	uint32_t len[5] = {0};
+	spk.ncmd = spk.icmd = spk.failed = 0;
+	spk.cursor = 0;
+	spk.opened = spk.closing = false;
+	if (f && size >= 12 && memcmp(f, "PSPKGR01", 8) == 0) {
+		const uint32_t n = spk_le32(f + 8);
+		uint32_t o = 12;
+		for (uint32_t i = 0; i < n && o + 8 <= size; i++) {
+			const uint32_t t = spk_le32(f + o), b = spk_le32(f + o + 4);
+			if (o + 8 + b > size) {
+				break;
+			}
+			if (t >= 1 && t <= 4) {
+				sec[t] = f + o + 8;
+				len[t] = b;
+			}
+			o += 8 + ((b + 7u) & ~7u);
+		}
+	}
+	if (!sec[1] || !sec[3] || len[4] < 8 || spk_le32(sec[4]) == 0 || spk_le32(sec[4]) > 8) {
+		printf("PANDORA SPK: spkgraph.bin %s: no graph\n", f ? "incomplete" : "not in the pack");
+		if (f) {
+			kfree_data(f, (vm_size_t)size);
+		}
+		spk.closing = true;
+		spk_graph_done(true);
+		return;
+	}
+	spk.nsg = spk_le32(sec[4]);
+	for (unsigned i = 0; i < spk.nsg; i++) {
+		spk.sg[i] = spk_le32(sec[4] + 4 + 4 * i);
+	}
+	spk_add_oob("graph open", APM_CMD_GRAPH_OPEN, sec[1], len[1], true);
+	if (len[2]) {
+		spk_add_oob("calibration", APM_CMD_SET_CFG, sec[2], len[2], false);
+	}
+	uint8_t b[64], d[32];
+	/* the stream MFC (pspd_mfc): param_id_mfc_output_media_fmt_t {sample rate, bit width, channels, types} */
+	bzero(d, sizeof(d));
+	spk_put32(d, 48000);
+	spk_put16(d + 4, 32);
+	spk_put16(d + 6, 2);
+	spk_put16(d + 8, 1);
+	spk_put16(d + 10, 2);
+	spk_add_oob("stream MFC", APM_CMD_SET_CFG, b, spk_param(b, 0x40b6, 0x08001024u, d, 12), false);
+	/* the shared-memory endpoint (sh_ep): PARAM_ID_MEDIA_FORMAT, payload_media_fmt_pcm_t */
+	bzero(d, sizeof(d));
+	spk_put32(d, 1);
+	spk_put32(d + 4, 0x09001000u);
+	spk_put32(d + 8, 18);
+	spk_put32(d + 12, 48000);
+	spk_put16(d + 16, 32);                 /* bit width */
+	d[18] = 1;                             /* PCM_LSB_ALIGNED; interleaved left 0, as AGM leaves it */
+	spk_put16(d + 20, 32);                 /* bits per sample */
+	spk_put16(d + 22, 31);                 /* q factor */
+	spk_put16(d + 24, 1);                  /* PCM_LITTLE_ENDIAN */
+	spk_put16(d + 26, 2);
+	d[28] = 1;
+	d[29] = 2;
+	spk_add_oob("stream media format", APM_CMD_SET_CFG, b, spk_param(b, 0x4001, 0x0800100Cu, d, 30), false);
+	/* the TDM endpoint's media format: param_id_hw_ep_mf_t */
+	bzero(d, sizeof(d));
+	spk_put32(d, 48000);
+	spk_put16(d + 4, 32);
+	spk_put16(d + 6, 2);
+	spk_put32(d + 8, 1);
+	spk_add_oob("TDM media format", APM_CMD_SET_CFG, b, spk_param(b, 0x4023, 0x08001017u, d, 12), false);
+	spk_add_oob("TDM interface", APM_CMD_SET_CFG, sec[3], len[3], false);
+	spk_add_oob("PCM decoder output", APM_CMD_SET_CFG, b, spk_pcm_out(b, 0x4003), false);
+	spk_add_oob("PCM converter output", APM_CMD_SET_CFG, b, spk_pcm_out(b, 0x4004), false);
+	spk_put32(d, 0x4023);                  /* param_id_spr_delay_path_end_t: the TDM endpoint */
+	spk_add_oob("SPR path end", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x080010C4u, d, 4), false);
+	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
+	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x08001B07u, d, 4), false);
+	spk_add_sgs("graph prepare", APM_CMD_GRAPH_PREPARE, true);
+	spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
+	kfree_data(f, (vm_size_t)size);
+	printf("PANDORA SPK: speaker graph: %u subgraphs, open %u bytes, calibration %u, TDM %u; %u commands\n",
+	    spk.nsg, len[1], len[2], len[3], spk.ncmd);
+	spk_cmd_send();
+}
+
+/* STOP (when it started) and CLOSE. */
+static void
+spk_graph_end(bool started)
+{
+	spk.ncmd = spk.icmd = 0;
+	spk.closing = true;
+	if (started) {
+		spk_add_sgs("graph stop", APM_CMD_GRAPH_STOP, false);
+	}
+	spk_add_sgs("graph close", APM_CMD_GRAPH_CLOSE, false);
+	spk_cmd_send();
+}
+
+/* The sequence ended: started (running), or aborted (close what was opened), or closed (release the clock). */
+static void
+spk_graph_done(bool aborted)
+{
+	if (spk.closing) {
+		spk_clock(0);
+	} else if (!aborted) {
+		printf("PANDORA SPK: speaker graph running after %llu ms, %u commands refused; the amps next\n",
+		    ad_ms(spk.t0), spk.failed);
+		spk.state = SpkRunning;
+		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
+		pandora_amp_tdm();
+	} else if (spk.opened) {
+		spk_graph_end(false);
+	} else {
+		spk.closing = true;
+		spk_clock(0);
+	}
+}
+
+/* An answer (or none) to the current graph command. */
+static void
+spk_graph_answer(bool answered, uint32_t opcode, uint32_t cmd, uint32_t status)
+{
+	const struct spk_cmd *c = &spk.cmds[spk.icmd];
+	const bool ok = answered && opcode == GPR_RSP_BASIC && cmd == c->opcode && status == 0;
+	if (answered) {
+		printf("PANDORA SPK: %s: answer %#x for %#x, status %#x (%llu ms)\n", c->what, opcode, cmd, status,
+		    ad_ms(spk.t0));
+	} else {
+		printf("PANDORA SPK: %s: no answer\n", c->what);
+	}
+	if (c->opcode == APM_CMD_GRAPH_OPEN && ok) {
+		spk.opened = true;
+	}
+	if (!ok) {
+		spk.failed++;
+	}
+	if (!ok && c->must && !spk.closing) {
+		spk_graph_done(true);
+	} else if (spk.icmd + 1 >= spk.ncmd) {
+		spk_graph_done(false);
+	} else {
+		spk.icmd++;
+		spk_cmd_send();
+	}
+}
+
 static void
 spk_receive(const uint8_t *data, uint32_t len)
 {
@@ -1558,6 +1868,10 @@ spk_receive(const uint8_t *data, uint32_t len)
 			spk.handle = w0;
 			printf("PANDORA SPK: the APM mapped %#llx + %#llx (address word %#x) as handle %#x after %llu ms\n",
 			    ad_shm_pa, ad_shm_size, SPK_SID_INDEX, spk.handle, ad_ms(spk.t0));
+			if (spk.level >= 3) {
+				spk_level2();                  /* kept mapped for the graph */
+				break;
+			}
 			uint8_t pl[4];
 			spk_put32(pl, spk.handle);
 			spk_send(SPK_APM_PORT, APM_CMD_MEM_UNMAP, pl, 4, SpkUnmap);
@@ -1573,7 +1887,9 @@ spk_receive(const uint8_t *data, uint32_t len)
 	case SpkClock:
 		printf("PANDORA SPK: PRM clock request (%u Hz, attribute %u) answer opcode %#x: command %#x status %#x\n",
 		    SPK_TDM_HZ, PRM_CLK_ATTR, p.opcode, w0, w1);
-		if (p.opcode == PRM_RSP_REQUEST && w1 == 0) {
+		if (p.opcode == PRM_RSP_REQUEST && w1 == 0 && spk.level >= 3 && spk.handle) {
+			spk_graph_begin();
+		} else if (p.opcode == PRM_RSP_REQUEST && w1 == 0) {
 			spk.state = SpkHold;
 			clock_interval_to_deadline(SPK_HOLD_MS, NSEC_PER_MSEC, &spk.hold_until);
 		} else {
@@ -1582,6 +1898,20 @@ spk_receive(const uint8_t *data, uint32_t len)
 		break;
 	case SpkRelease:
 		printf("PANDORA SPK: PRM clock release answer opcode %#x: command %#x status %#x\n", p.opcode, w0, w1);
+		if (spk.level >= 3 && spk.handle) {
+			uint8_t pl[4];
+			spk_put32(pl, spk.handle);
+			spk_send(SPK_APM_PORT, APM_CMD_MEM_UNMAP, pl, 4, SpkUnmapEnd);
+		} else {
+			spk.state = SpkDone;
+		}
+		break;
+	case SpkGraph:
+		spk_graph_answer(true, p.opcode, w0, w1);
+		break;
+	case SpkUnmapEnd:
+		printf("PANDORA SPK: unmap answer opcode %#x: command %#x status %#x; done\n", p.opcode, w0, w1);
+		spk.handle = 0;
 		spk.state = SpkDone;
 		break;
 	default:
@@ -1623,11 +1953,17 @@ spk_step(void)
 	if (spk.state == SpkHold && now >= spk.hold_until) {
 		spk_clock(0);
 	}
+	if (spk.state == SpkRunning && now >= spk.run_until) {
+		printf("PANDORA SPK: %u ms up: stopping the speaker graph\n", SPK_RUN_MS);
+		spk_graph_end(true);
+	}
 	if (spk.answer_by && now >= spk.answer_by) {
 		spk.answer_by = 0;
 		spk.tx_len = 0;
 		printf("PANDORA SPK: no answer in state %u\n", spk.state);
-		if (spk.state == SpkMap || spk.state == SpkUnmap) {
+		if (spk.state == SpkGraph) {
+			spk_graph_answer(false, 0, 0, 0);
+		} else if (spk.state == SpkMap || spk.state == SpkUnmap) {
 			spk_level2();
 		} else if (spk.state == SpkClock) {
 			spk_clock(0);                          /* in case it was taken */
