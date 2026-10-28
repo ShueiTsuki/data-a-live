@@ -30,3 +30,8 @@ ASAN_OPTIONS=detect_leaks=0 "$OUT/ar_host"
 $CC -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
 	-o "$OUT/gpi_host" "$H/gpi_host.c"
 ASAN_OPTIONS=detect_leaks=0 "$OUT/gpi_host"
+
+# Board thermistor code to temperature (Android qcom_vadc7_scale_hw_calib_therm).
+$CC -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+	-o "$OUT/therm_host" "$H/therm_host.c"
+ASAN_OPTIONS=detect_leaks=0 "$OUT/therm_host"
