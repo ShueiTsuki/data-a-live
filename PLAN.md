@@ -517,3 +517,15 @@
 - 0262（2026-10-28，k0262 已编译，未测）：喇叭播放图。tools/spk_graph.py 照 AudioReach 源码（acdb_command.c BuildSubgraphDataRsp/BuildSpfPropertyBlob、AcdbCmdGetSubgraphConnections、AcdbGetSubgraphCalibration、AcdbCmdGetModuleTagData；gsl_graph.c 开图）从手机 ACDB 生成 spkgraph.bin（不进仓库，放 ref/ampfw，gpu_test.sh --amp-fw 时打进固件包）：开图 2776 B（4 子图 + 3 条子图连接）、校准 7128 B/168 参数（默认表 + Volume 15）、TDM 标签数据（Channels 2：LPAIF 0、主口 0、内部同步、槽掩码 3、2 槽 32 位、同步模式 1、延迟 1，28 字节旧版结构）。pandora_spk=3：映射不撤、时钟持有 → GRAPH_OPEN、校准、MFC(0x40b6)、共享内存入口格式(0x4001)、TDM 格式与接口(0x4023)、PCM 解码/转换输出(0x4003/0x4004)、SPR(0x4163) → PREPARE → START（都照 AGM/PAL 源码，命令载荷放 DSP 缓冲带外发）；跑 12 s 静音后 STOP/CLOSE、释放时钟、撤映射。pandora_amp_tdm：写安卓空闲时的功放配置（diff_spk5 的配置类寄存器），开串口和放音路由，0.5 s 后看状态；再照 cs35l43_main_amp_event 上电（解锁写 0x2084、0x2014=1、0x2018 bit0），0.5 s、3.5 s 看状态，再下电。不发 PLAY、不写校准。看点：0x2C14（安卓放音时 3）、IRQ 状态、核控制/MPU 锁/心跳。
 - spk7（k0262，2026-10-28）：DSP 侧全部成功——GRAPH_OPEN、校准、8 条运行时配置、PREPARE、START 状态全 0（29 ms 开起），12 s 后 STOP/CLOSE/释放时钟/撤映射也 0。功放上电后 0x2040=0x586dfa、0x2044=0x250cfd8a、0x4300=0xc0000000、IRQ 原始 0x10090=0x8000、0x10094=0x345027、0x100a0=0x4000000，和安卓放音中转储完全一样 → TDM 时钟到了，功放时钟/PLL/功率级照安卓运转。但 Halo 核仍不跑：核控制 0x1（安卓 0x81）、MPU 锁 0x800000（0xBEEF）、心跳 0；0x2C14=0（安卓放音中 3；CS35L41 头文件 0x2C10 是 DATA_FS_SEL，0x2C14 未定义）。下一步方向：时钟在时重新启动 Halo 核（停核、软复位、照 pa_start 再起）；放音中补 pa_dump 和安卓转储全量对比。日志行太长被别的线程截断，要拆短。
 - **用户插入（2026-10-28）：** 「亮度调不了了，而且以前调的亮度会影响进入logo的亮度，以前调的亮度实际显示也不是无极的而是有明显升降的」→ 三件事：①现在调不了亮度（先查是不是 0259 起 iOS 温控接上后它的背光控制在起作用）；②iOS 里调的亮度会带到下一次开机 logo；③亮度不是连续的，有明显台阶。扬声器（spk8：时钟在时重启 Halo 核）暂停，先查亮度。
+  - 查到的：
+    - ①：usb10、usb11、spk7（k0259 起）开机约 24 s 都有一次 FadePeriod 0、brightness = 1（面板 7，最低），usb8/usb9 没有。这是 thermalmonitord 有了传感器后第一轮背光控制：BackLightCC（-[BackLightCC defaultAction]）往 CoreBrightness 发 MaxBrightness（BacklightBrightness 表的百分比）和 BrightnessWeakCap（_maxLICeilingSoft，初值 100，第一轮必发）。CoreBrightness 收到后把亮度压到最低，滑条也被卡住。CoreBrightness 这边怎么换算没拆完；它给我们写的 DisplayBrightness 里 Nits 一直是 0。
+    - ②：每次开机我们第一次写亮度前，面板读回的都是 0x394（916）。iOS 调暗后热重启，面板保持 iOS 最后的亮度，直到有人重新写。
+    - ③：CoreBrightness 拖滑条时发的是 FadePeriod 0、每次跳 1000-6000（满 65536）；熄屏时 FadePeriod 12124 = 0.185 s（16.16 秒，和 backboardd 日志的 fade duration 0.185 对上）。我们以前忽略 FadePeriod，每次直接跳到新值。面板 DT 有小米的渐变命令：mi,mdss-dsi-dimmingon-command = 53 28，off = 53 20。
+  - 0263（k0263）：
+    - iOS 温度传感器默认关，要 pandora_therm_ios=1 才发布（温控第 2 步给出这台手机自己的 plist 时再开）。内核自己按 mi_thermald 表限频不受影响。
+    - 第一次写亮度前读回面板亮度（记作开机值），每次重启前（pl_psci_reset → sweet_bl_final）先关面板渐变、写回开机值。
+    - 打开面板自己的渐变（53 28）；FadePeriod 由一个内核线程照做：每 16 ms 走一步，在 FadePeriod 内线性走到新值；FadePeriod 0 直接写，由面板渐变平滑。
+    - 换算（平方律，0x1554 为顶）暂不改。
+  - 测试 bl1：开机后看 24 s 处不再有 brightness = 1；用户拖滑条看是否跟手、是否平滑；重启看 logo 亮度。
+  - bl1（k0263，2026-10-28）：24 s 处不再压到最低（全程 brightness 只有开机 8996、熄屏 0、亮屏 8996 和拖动）；开机读到面板 916。拖滑条时 CoreBrightness 每 8 ms 发一次、FadePeriod 0，内核立刻写；熄屏、亮屏照 0.184 s 走 10 步，面板读回对得上。**用户：「亮度变的太慢了」** → 慢在面板自己的渐变（53 28），每一步都被面板拖慢。0264：面板渐变默认关（pandora_bl_dim=1 才开），FadePeriod 仍由内核照做。
+  - bl2（k0264，2026-10-28）：**用户：「跟手了，logo也正常」**。开机读到面板 916、面板渐变关；bl1 重启前写回 916。亮度三件事完成。iOS 温度传感器要等温控第 2 步再开（pandora_therm_ios=1）。下一步回到扬声器 spk8。

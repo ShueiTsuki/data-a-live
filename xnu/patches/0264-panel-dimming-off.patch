@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0869f0e..af3cfa4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -612,11 +612,17 @@ sweet_dsi_ready(void)
+ 		}
+ 		if (sweet_dsi_bl == 1) {
+ 			sweet_bl_boot = sweet_dsi_read_level();
+-			/* the panel's dimming on: DCS short write 0x15, 53 28 (DT mi,mdss-dsi-dimmingon-command) */
+-			uint32_t dim = 0x80152853u;
+-			bool ok = sweet_dsi_send(&dim, 1);
+-			IOLog("SWEET DSI: panel level at start %u (%#x), panel dimming on %s\n", sweet_bl_boot, sweet_bl_boot,
+-			    ok ? "sent" : "TIMEOUT");
++			/* 0264: the panel's dimming only with pandora_bl_dim=1 (DCS short write 0x15, 53 28, DT
++			 * mi,mdss-dsi-dimmingon-command): it made each slider step slow (bl1). */
++			int dim_on = 0;
++			PE_parse_boot_argn("pandora_bl_dim", &dim_on, sizeof(dim_on));
++			bool ok = true;
++			if (dim_on) {
++				uint32_t dim = 0x80152853u;
++				ok = sweet_dsi_send(&dim, 1);
++			}
++			IOLog("SWEET DSI: panel level at start %u (%#x), panel dimming %s\n", sweet_bl_boot, sweet_bl_boot,
++			    !dim_on ? "off" : ok ? "on" : "TIMEOUT");
+ 		}
+ 	}
+ 	return sweet_dsi_bl == 1;

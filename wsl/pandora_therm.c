@@ -378,8 +378,11 @@ static uint64_t pt_hid_reads;             /* copyEvent calls answered */
 
 extern int32_t pandora_cpu_tsens(uint32_t g, uint32_t first, uint32_t count, int mean);   /* pandora_cpu.c */
 
-/* For PandoraThermalHID.cpp. The count is 0 unless pandora_therm=2 or more: the boot-arg is read here,
- * since IOKit matches the services before pandora_therm_init runs. */
+/* For PandoraThermalHID.cpp. The count is 0 unless pandora_therm=2 or more and pandora_therm_ios=1: the
+ * boot-args are read here, since IOKit matches the services before pandora_therm_init runs. 0263: off by
+ * default. With the sensors there, thermalmonitord runs the iPhone X plist's backlight control, and from its
+ * first round (about 24 s) CoreBrightness holds the screen at the lowest level and the slider does nothing
+ * (usb10, usb11, spk7). On again with this phone's own plist (thermal step 2). */
 unsigned pandora_therm_hid_count(void);
 const char *pandora_therm_hid_name(unsigned i);
 int pandora_therm_hid_callback(unsigned i);
@@ -388,9 +391,10 @@ int pandora_therm_hid_mdeg(unsigned i, int32_t *mdeg);
 unsigned
 pandora_therm_hid_count(void)
 {
-	int level = 0;
+	int level = 0, ios = 0;
 	(void)PE_parse_boot_argn("pandora_therm", &level, sizeof(level));
-	return level >= 2 ? (unsigned)PT_HIDS : 0;
+	(void)PE_parse_boot_argn("pandora_therm_ios", &ios, sizeof(ios));
+	return level >= 2 && ios ? (unsigned)PT_HIDS : 0;
 }
 
 const char *
