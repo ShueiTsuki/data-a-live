@@ -18,10 +18,13 @@
  * ready and CONV_REQ (0xe5) is clear, read the 12 request registers 0x4f-0x5a, write SID (the DT reg's
  * upper byte; gen4 keeps the bus there, as the bootloader's 0x27 for pmih010x), PERPH_CH 0x80 | slot,
  * TIMER_SEL 4 (every second), DIG_PARAM calibration 1 (ratiometric, all 14 have qcom,ratiometric) and
- * decimation 2 (the default; the DT names none), FAST_AVG enabled with 1 sample, the ADC channel (the
- * DT reg's lower byte), DELAY_CTL 2 (qcom,hw-settle-time 200 us in the gen3 table), CH_EN 0 (no
- * threshold interrupts: nothing here takes them), then CONV_REQ 1. Only these request registers are
- * written; nothing about voltages or power.
+ * decimation 1, FAST_AVG enabled with 1 sample, the ADC channel (the DT reg's lower byte), DELAY_CTL 2
+ * (qcom,hw-settle-time 200 us in the gen3 table), CH_EN 0 (no threshold interrupts: nothing here takes
+ * them), then CONV_REQ 1. Only these request registers are written; nothing about voltages or power.
+ * Decimation 1 is what Android writes (its regmap of vadc@9000: DIG_PARAM 0x14 on both SDAMs, thermadc
+ * regmap_0-00_9000_t1); upstream Linux's default, 2, gave SDAM0 slots 1-6 readings 20-26 degrees above
+ * Android's while the other eight read like Android (usb5). pandora_therm=3 compares the two in one
+ * boot: decimation 2 first, its codes after 5 s, then decimation 1.
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -143,9 +146,10 @@ pt_wait_ready(uint16_t ppid)
 	return -11;
 }
 
-/* Channel i measured by the PMIC every second from now on; 0 or the negative step that failed. */
+/* Channel i measured by the PMIC every second from now on, with decimation dec; 0 or the negative step
+ * that failed. */
 static int
-pt_tm_start(unsigned i)
+pt_tm_start(unsigned i, unsigned dec)
 {
 	const uint16_t ppid = pt_chan[i].sdam ? PT_SDAM1 : PT_SDAM0;
 	uint8_t b[12];
@@ -158,7 +162,7 @@ pt_tm_start(unsigned i)
 	b[0] = (uint8_t)(pt_chan[i].reg >> 8);
 	b[1] = 0x80u | pt_chan[i].slot;
 	b[2] = 4;
-	b[3] = (uint8_t)((b[3] & ~0x3cu) | 1u << 4 | 2u << 2);
+	b[3] = (uint8_t)((b[3] & ~0x3cu) | 1u << 4 | dec << 2);
 	b[4] = 0x80;
 	b[5] = (uint8_t)pt_chan[i].reg;
 	b[6] = 2;
@@ -171,20 +175,41 @@ pt_tm_start(unsigned i)
 }
 
 static void
-pt_tm_setup(void)
+pt_tm_setup(unsigned dec)
 {
 	int err[PT_CHANS];
 	unsigned ok = 0;
 	for (unsigned i = 0; i < PT_CHANS; i++) {
-		err[i] = pt_tm_start(i);
+		err[i] = pt_tm_start(i, dec);
 		ok += err[i] == 0;
 	}
 	uint8_t en0 = 0, en1 = 0;
 	(void)pandora_spmi_read(PT_SDAM0, PT_TM_EN_STS, &en0, 1);
 	(void)pandora_spmi_read(PT_SDAM1, PT_TM_EN_STS, &en1, 1);
-	printf("PANDORA THERM: thermal monitor set up, %u of %u channels (errors %d %d %d %d %d %d %d %d %d %d %d %d %d "
-	    "%d); TM_EN_STS SDAM0 %02x SDAM1 %02x\n", ok, (unsigned)PT_CHANS, err[0], err[1], err[2], err[3], err[4], err[5],
-	    err[6], err[7], err[8], err[9], err[10], err[11], err[12], err[13], en0, en1);
+	printf("PANDORA THERM: thermal monitor set up (decimation %u), %u of %u channels (errors %d %d %d %d %d %d %d %d "
+	    "%d %d %d %d %d %d); TM_EN_STS SDAM0 %02x SDAM1 %02x\n", dec, ok, (unsigned)PT_CHANS, err[0], err[1], err[2],
+	    err[3], err[4], err[5], err[6], err[7], err[8], err[9], err[10], err[11], err[12], err[13], en0, en1);
+}
+
+/* pandora_therm=3: each channel's code and temperature, one line, tagged when */
+static void
+pt_log_codes(const char *when)
+{
+	uint16_t s0[8], s1[8];
+	if (!pt_read_slots(PT_SDAM0, s0) || !pt_read_slots(PT_SDAM1, s1)) {
+		printf("PANDORA THERM: %s: SDAM read failed\n", when);
+		return;
+	}
+	char line[640];
+	size_t at = 0;
+	for (unsigned i = 0; i < PT_CHANS && at < sizeof(line); i++) {
+		const uint16_t code = pt_chan[i].sdam ? s1[pt_chan[i].slot] : s0[pt_chan[i].slot];
+		const int32_t m = pandora_ntc_mdeg(code);
+		const int32_t a = m < 0 ? -m : m;
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " %s %u %s%d.%02d", pt_chan[i].name, code,
+		    m < 0 ? "-" : "", a / 1000, (a % 1000) / 10);
+	}
+	printf("PANDORA THERM: %s:%s\n", when, line);
 }
 
 static int pt_level;
@@ -197,8 +222,17 @@ pt_thread(void *arg, wait_result_t result)
 	pt_sleep(10000);
 	pt_dump_config(PT_SDAM0);
 	pt_dump_config(PT_SDAM1);
+	if (pt_level >= 3) {
+		pt_tm_setup(2);
+		pt_sleep(5000);
+		pt_log_codes("decimation 2");
+		pt_tm_setup(1);
+		pt_sleep(3000);
+		pt_log_codes("decimation 1");
+	} else if (pt_level >= 2) {
+		pt_tm_setup(1);
+	}
 	if (pt_level >= 2) {
-		pt_tm_setup();
 		pt_sleep(2000);
 		pt_dump_config(PT_SDAM0);
 		pt_dump_config(PT_SDAM1);
