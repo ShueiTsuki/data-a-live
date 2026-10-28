@@ -323,6 +323,183 @@ pt_limit(int32_t b)
 	return moved;
 }
 
+/* ---- 0259: the temperatures for iOS's thermal monitor ----
+ * iokit/Kernel/arm/hid/PandoraThermalHID.cpp publishes one HID temperature sensor per pt_hid entry and asks for
+ * its value here; thermalmonitord pairs each by Product with the matchName of a sensor of the iPhone X's table
+ * (/System/Library/ThermalMonitor/D22AP-Info.plist, Sensors).
+ * Xiaomi's thermal model is the one that counts. On the iPhone X thermalmonitord turns PMU tdev2-4, mic1 and mic2
+ * into surface temperatures with fixed formulas of its D22 product class (updateAllThermalLoad), each one of them
+ * plus the battery, and its hotspots watch those surfaces. Those five are therefore given the values that make its
+ * formulas come out at mi_thermald's virtual sensors: TSBE (back, main board: the MLB hotspots) = back, TSRM (frame,
+ * main board) = the higher of left and right, TSRR (frame, radio) = top, TSFC (rear camera) = top, TSFL (display)
+ * = front. In hundredths of a degree, b the battery (IOPMPowerSource "Temperature", SweetBattery's gauge reading,
+ * the same as here): TSBE = 222.2 + 0.45 b + 0.48 tdev2 (+ 0.025 x the rear camera die: no camera here), TSRM =
+ * -80.17 + 0.5 b + 0.5 tdev4 (+ the same), TSRR = -109.44 + 0.63 b + 0.37 tdev3, TSFC = -55.28 + 0.64 b + 0.35 mic2,
+ * TSFL = 108.6 + 0.17 b + 0.83 mic1. thermalmonitord adds (5182 - PMU tcal) to the TP* readings (useTcalAdjust,
+ * CommonProduct calibrationResistorTempDefault): PMU tcal is given as 51.82, no correction. The others are readings:
+ * tdev1 cpu_therm, tdev5 wifi_therm, tjunc and the die sensors the SoC's tsens (pandora_cpu_tsens; the D22 table's
+ * P sensors from cores 6-7, E from cores 0-5, G from the GPU; "Avg:" the mean, the others the highest).
+ * AppleVTempDispatcher hands back what thermalmonitord computed (pandora_therm_ios_temp), logged every 10 s next to
+ * Xiaomi's numbers.
+ */
+enum { PH_TDEV1, PH_TDEV2, PH_TDEV3, PH_TDEV4, PH_TDEV5, PH_TCAL, PH_MIC1, PH_MIC2, PH_INPUTS };
+#define PH_DIE  (-1)     /* a die sensor: tsens group g, sensors first .. first + count - 1 */
+#define PH_JUNC (-2)     /* the hottest of every tsens sensor */
+static const struct {
+	const char *name;
+	int8_t input;
+	uint8_t g, first, count, mean, callback;
+} pt_hid[] = {
+	{"PMU tdev1", PH_TDEV1, 0, 0, 0, 0, 0}, {"PMU tdev2", PH_TDEV2, 0, 0, 0, 0, 0}, {"PMU tdev3", PH_TDEV3, 0, 0, 0, 0, 0},
+	{"PMU tdev4", PH_TDEV4, 0, 0, 0, 0, 0}, {"PMU tdev5", PH_TDEV5, 0, 0, 0, 0, 0}, {"PMU tcal", PH_TCAL, 0, 0, 0, 0, 0},
+	{"PMU tjunc", PH_JUNC, 0, 0, 0, 0, 0}, {"mic1", PH_MIC1, 0, 0, 0, 0, 1}, {"mic2", PH_MIC2, 0, 0, 0, 0, 1},
+	{"PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 0, 0}, {"Avg: PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 1, 0},
+	{"Max: PMGR SOC Die Temp Sensor0", PH_DIE, 1, 0, 2, 0, 0}, {"PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 0, 0},
+	{"Avg: PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 1, 0}, {"Max: PMGR SOC Die Temp Sensor1", PH_DIE, 1, 2, 2, 0, 0},
+	{"PMGR SOC Die Temp Sensor2", PH_DIE, 2, 0, 6, 0, 0}, {"Avg: PMGR SOC Die Temp Sensor2", PH_DIE, 2, 0, 6, 1, 0},
+	{"Max: PMGR SOC Die Temp Sensor2", PH_DIE, 2, 0, 6, 0, 0}, {"PMGR SOC Die Temp Sensor3", PH_DIE, 2, 6, 5, 0, 0},
+	{"Avg: PMGR SOC Die Temp Sensor3", PH_DIE, 2, 6, 5, 1, 0}, {"Max: PMGR SOC Die Temp Sensor3", PH_DIE, 2, 6, 5, 0, 0},
+	{"ACC Temp Sensor0", PH_DIE, 0, 0, 12, 0, 0}, {"Avg: ACC Temp Sensor0", PH_DIE, 0, 0, 12, 1, 0},
+	{"Max: ACC Temp Sensor0", PH_DIE, 0, 0, 12, 0, 0}, {"ACC Temp Sensor1", PH_DIE, 1, 0, 2, 0, 0},
+	{"Avg: ACC Temp Sensor1", PH_DIE, 1, 0, 2, 1, 0}, {"Max: ACC Temp Sensor1", PH_DIE, 1, 0, 2, 0, 0},
+	{"ACC Temp Sensor2", PH_DIE, 1, 2, 2, 0, 0}, {"Avg: ACC Temp Sensor2", PH_DIE, 1, 2, 2, 1, 0},
+	{"Max: ACC Temp Sensor2", PH_DIE, 1, 2, 2, 0, 0},
+};
+#define PT_HIDS (sizeof(pt_hid) / sizeof(pt_hid[0]))
+static int32_t pt_hid_val[PH_INPUTS];     /* millidegrees, written by the thread */
+static uint32_t pt_hid_ok;                /* bit per PH_* with a value */
+static uint64_t pt_hid_reads;             /* copyEvent calls answered */
+
+extern int32_t pandora_cpu_tsens(uint32_t g, uint32_t first, uint32_t count, int mean);   /* pandora_cpu.c */
+
+/* For PandoraThermalHID.cpp. The count is 0 unless pandora_therm=2 or more: the boot-arg is read here,
+ * since IOKit matches the services before pandora_therm_init runs. */
+unsigned pandora_therm_hid_count(void);
+const char *pandora_therm_hid_name(unsigned i);
+int pandora_therm_hid_callback(unsigned i);
+int pandora_therm_hid_mdeg(unsigned i, int32_t *mdeg);
+
+unsigned
+pandora_therm_hid_count(void)
+{
+	int level = 0;
+	(void)PE_parse_boot_argn("pandora_therm", &level, sizeof(level));
+	return level >= 2 ? (unsigned)PT_HIDS : 0;
+}
+
+const char *
+pandora_therm_hid_name(unsigned i)
+{
+	return i < PT_HIDS ? pt_hid[i].name : NULL;
+}
+
+int
+pandora_therm_hid_callback(unsigned i)
+{
+	return i < PT_HIDS && pt_hid[i].callback;
+}
+
+/* Sensor i's temperature now; 0 when there is none yet. */
+int
+pandora_therm_hid_mdeg(unsigned i, int32_t *mdeg)
+{
+	if (i >= PT_HIDS) {
+		return 0;
+	}
+	int32_t t = INT32_MIN;
+	if (pt_hid[i].input == PH_DIE) {
+		t = pandora_cpu_tsens(pt_hid[i].g, pt_hid[i].first, pt_hid[i].count, pt_hid[i].mean);
+	} else if (pt_hid[i].input == PH_JUNC) {
+		const int32_t a = pandora_cpu_tsens(0, 0, 12, 0), b = pandora_cpu_tsens(1, 0, 4, 0), c = pandora_cpu_tsens(2, 0, 11, 0);
+		t = a > b ? a : b;
+		t = c > t ? c : t;
+	} else {
+		const unsigned k = (unsigned)pt_hid[i].input;
+		if (!(__atomic_load_n(&pt_hid_ok, __ATOMIC_ACQUIRE) & (1u << k))) {
+			return 0;
+		}
+		*mdeg = __atomic_load_n(&pt_hid_val[k], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&pt_hid_reads, 1, __ATOMIC_RELAXED);
+		return 1;
+	}
+	if (t == INT32_MIN) {
+		return 0;
+	}
+	*mdeg = t * 100;    /* tsens counts tenths */
+	__atomic_fetch_add(&pt_hid_reads, 1, __ATOMIC_RELAXED);
+	return 1;
+}
+
+static void
+pt_hid_set(unsigned k, int32_t mdeg)
+{
+	__atomic_store_n(&pt_hid_val[k], mdeg, __ATOMIC_RELAXED);
+	__atomic_fetch_or(&pt_hid_ok, 1u << k, __ATOMIC_RELEASE);
+}
+
+/* One reading's values for iOS: in[] mi_thermald's inputs (in[5] the battery), vs[] its five virtual sensors
+ * (front back left right top), all millidegrees. The five conversions invert the D22 formulas above. */
+static void
+pt_hid_update(const int32_t in[7], const int32_t vs[PT_VS], bool whole)
+{
+	pt_hid_set(PH_TCAL, 51820);
+	if (!whole) {
+		return;
+	}
+	const int64_t b = in[5], side = vs[2] > vs[3] ? vs[2] : vs[3];
+	pt_hid_set(PH_TDEV1, in[6]);
+	pt_hid_set(PH_TDEV5, in[4]);
+	pt_hid_set(PH_TDEV2, (int32_t)((vs[1] - 2222 - 45 * b / 100) * 100 / 48));
+	pt_hid_set(PH_TDEV4, (int32_t)((side + 802 - 50 * b / 100) * 100 / 50));
+	pt_hid_set(PH_TDEV3, (int32_t)((vs[4] + 1094 - 63 * b / 100) * 100 / 37));
+	pt_hid_set(PH_MIC2, (int32_t)((vs[4] + 553 - 64 * b / 100) * 100 / 35));
+	pt_hid_set(PH_MIC1, (int32_t)((vs[0] - 1086 - 17 * b / 100) * 100 / 83));
+}
+
+/* What thermalmonitord computed, sent to AppleVTempDispatcher (PandoraThermalHID.cpp): its 4CC and the value in
+ * hundredths of a degree. The last of each of up to 16 4CCs is kept for the log. */
+void pandora_therm_ios_temp(const char *key, int32_t centi);
+static struct {
+	char key[5];
+	int32_t centi;
+} pt_ios[16];
+static uint32_t pt_nios, pt_ios_sets;
+
+void
+pandora_therm_ios_temp(const char *key, int32_t centi)
+{
+	__atomic_fetch_add(&pt_ios_sets, 1, __ATOMIC_RELAXED);
+	const uint32_t n = __atomic_load_n(&pt_nios, __ATOMIC_ACQUIRE);
+	for (uint32_t i = 0; i < n; i++) {
+		if (strncmp(pt_ios[i].key, key, 4) == 0) {
+			__atomic_store_n(&pt_ios[i].centi, centi, __ATOMIC_RELAXED);
+			return;
+		}
+	}
+	if (n < 16) {
+		strlcpy(pt_ios[n].key, key, sizeof(pt_ios[n].key));
+		pt_ios[n].centi = centi;
+		__atomic_store_n(&pt_nios, n + 1, __ATOMIC_RELEASE);
+	}
+}
+
+static void
+pt_ios_log(const int32_t vs[PT_VS])
+{
+	char line[400], b[12];
+	size_t at = 0;
+	const uint32_t n = __atomic_load_n(&pt_nios, __ATOMIC_ACQUIRE);
+	for (uint32_t i = 0; i < n && at < sizeof(line); i++) {
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " %s %s", pt_ios[i].key,
+		    pt_fmt(b, sizeof(b), __atomic_load_n(&pt_ios[i].centi, __ATOMIC_RELAXED) * 10));
+	}
+	char f[PT_VS][12];
+	printf("PANDORA THERM: iOS computed%s (%u values sent); Xiaomi front %s back %s left %s right %s top %s; "
+	    "sensor reads %llu\n", n ? line : " nothing yet", __atomic_load_n(&pt_ios_sets, __ATOMIC_RELAXED),
+	    pt_fmt(f[0], 12, vs[0]), pt_fmt(f[1], 12, vs[1]), pt_fmt(f[2], 12, vs[2]), pt_fmt(f[3], 12, vs[3]),
+	    pt_fmt(f[4], 12, vs[4]), __atomic_load_n(&pt_hid_reads, __ATOMIC_RELAXED));
+}
+
 static int pt_level, pt_gpio_level;
 
 static void
@@ -396,6 +573,7 @@ pt_thread(void *arg, wait_result_t result)
 		}
 		/* limits only from a whole reading: all six PMIC inputs and the gauge */
 		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(body);
+		pt_hid_update(in, vs, measured && gauge);
 		if (moved) {
 			char b[12];
 			printf("PANDORA THERM: body %s: limits cpu0 %u kHz, cpu6 %u kHz, gpu kgsl level %d (pandora_gpu level %u); "
@@ -414,6 +592,9 @@ pt_thread(void *arg, wait_result_t result)
 			printf("PANDORA THERM: others xoagg %s qtm %s display %s wireless %s xo %s flash %s batt %s conn %s\n",
 			    pt_fmt(o[0], 12, t[0]), pt_fmt(o[1], 12, t[1]), pt_fmt(o[2], 12, t[3]), pt_fmt(o[3], 12, t[5]),
 			    pt_fmt(o[4], 12, t[7]), pt_fmt(o[5], 12, t[11]), pt_fmt(o[6], 12, t[12]), pt_fmt(o[7], 12, t[13]));
+			if (pt_level >= 2) {
+				pt_ios_log(vs);
+			}
 			if (n == 1) {
 				printf("PANDORA THERM: codes SDAM0 %u %u %u %u %u %u %u %u SDAM1 %u %u %u %u %u %u %u %u\n", s0[0], s0[1],
 				    s0[2], s0[3], s0[4], s0[5], s0[6], s0[7], s1[0], s1[1], s1[2], s1[3], s1[4], s1[5], s1[6], s1[7]);

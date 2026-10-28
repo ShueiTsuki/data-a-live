@@ -551,6 +551,30 @@ cpu_temp_of(uint32_t g, uint32_t first, uint32_t count)
 	return best;
 }
 
+/* 0259: for iOS's die sensors (pandora_therm.c): the highest, or with MEAN the average, valid reading of sensors
+ * FIRST .. FIRST + COUNT - 1 of group G (0: cores 0-5, 1: cores 6-7, 2: GPU), in tenths of a degree; INT32_MIN
+ * when none is valid. */
+int32_t pandora_cpu_tsens(uint32_t g, uint32_t first, uint32_t count, int mean);
+int32_t
+pandora_cpu_tsens(uint32_t g, uint32_t first, uint32_t count, int mean)
+{
+	if (g > 2 || !cpu_tsens_va[g]) {
+		return INT32_MIN;
+	}
+	if (!mean) {
+		return cpu_temp_of(g, first, count);
+	}
+	int32_t sum = 0, n = 0;
+	for (uint32_t s = first; s < first + count; s++) {
+		const uint32_t v = rd32(cpu_tsens_va[g], 0xa0 + s * 4);
+		if (v & (1u << 21)) {
+			sum += (int32_t)(v << 20) >> 20;
+			n++;
+		}
+	}
+	return n ? sum / n : INT32_MIN;
+}
+
 static void
 cpu_thermal(void)
 {
