@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  VirtualAudio's own verbosity, one preference per logger in domain com.apple.coreaudio (each va_* logger reads its
+  trace* key: "error" .. "spew", or a number; FUN_002ecfdc / FUN_002ec664 in VirtualAudio 20H392). Messages such as
+  "Attempting to build concrete route ..." need more than the default. Installed as
+  /Library/Preferences/com.apple.coreaudio.plist (any user; mediaserverd runs as mobile) with the put option of
+  tools/gpu_test.sh: "tools/logging/coreaudio_trace.plist 644 /Library/Preferences/com.apple.coreaudio.plist".
+  The per-buffer loggers (io, dsp, stream, sample rate/format) stay at "details".
+-->
+<plist version="1.0">
+<dict>
+	<key>traceaggregatedevice</key><string>spew</string>
+	<key>traceairplay</key><string>details</string>
+	<key>traceanc</key><string>details</string>
+	<key>tracebluetooth</key><string>details</string>
+	<key>tracecapture</key><string>details</string>
+	<key>tracecarplay</key><string>details</string>
+	<key>tracecontrol</key><string>spew</string>
+	<key>tracecoretelephonyinterface</key><string>details</string>
+	<key>tracedevice</key><string>spew</string>
+	<key>tracedevicemanager</key><string>spew</string>
+	<key>tracedsp</key><string>details</string>
+	<key>tracehaptics</key><string>details</string>
+	<key>traceheadphones</key><string>details</string>
+	<key>tracehplayer</key><string>details</string>
+	<key>traceiapmanager</key><string>details</string>
+	<key>traceio</key><string>details</string>
+	<key>tracembus</key><string>details</string>
+	<key>tracemultiroute</key><string>spew</string>
+	<key>traceobject</key><string>details</string>
+	<key>traceport</key><string>spew</string>
+	<key>traceportmanager</key><string>spew</string>
+	<key>traceportutilities</key><string>spew</string>
+	<key>tracerouting</key><string>spew</string>
+	<key>traceroutinghandler</key><string>spew</string>
+	<key>traceroutingmanager</key><string>spew</string>
+	<key>traceroutingutilities</key><string>spew</string>
+	<key>traceserialization</key><string>details</string>
+	<key>tracesampleformat</key><string>details</string>
+	<key>tracesamplerate</key><string>details</string>
+	<key>tracesingleton</key><string>details</string>
+	<key>tracestream</key><string>details</string>
+	<key>tracesystemsettingsmanager</key><string>spew</string>
+	<key>tracetelephonysamplerate</key><string>details</string>
+	<key>traceusbiap</key><string>details</string>
+	<key>traceutilities</key><string>spew</string>
+	<key>tracevirtualaudiocontrol</key><string>spew</string>
+	<key>tracevirtualaudiodevice</key><string>spew</string>
+	<key>tracevirtualaudioplugin</key><string>spew</string>
+	<key>tracevirtualaudioport</key><string>spew</string>
+	<key>tracevirtualaudiostream</key><string>details</string>
+	<key>tracevolume</key><string>spew</string>
+</dict>
+</plist>

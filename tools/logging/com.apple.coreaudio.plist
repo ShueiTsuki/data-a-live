@@ -41,6 +41,18 @@
 			<string>Debug</string>
 		</dict>
 	</dict>
+	<key>va_anc   </key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
 	<key>va_blutoo</key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
@@ -174,6 +186,18 @@
 		</dict>
 	</dict>
 	<key>va_iapmgr</key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
+	<key>va_io    </key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
 		<true/>
@@ -341,6 +365,18 @@
 			<string>Debug</string>
 		</dict>
 	</dict>
+	<key>va_smprt </key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
 	<key>va_sngltn</key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
@@ -366,6 +402,18 @@
 		</dict>
 	</dict>
 	<key>va_sysmgr</key>
+	<dict>
+		<key>Enable-Oversize-Messages</key>
+		<true/>
+		<key>Level</key>
+		<dict>
+			<key>Enable</key>
+			<string>Debug</string>
+			<key>Persist</key>
+			<string>Debug</string>
+		</dict>
+	</dict>
+	<key>va_telsr </key>
 	<dict>
 		<key>Enable-Oversize-Messages</key>
 		<true/>

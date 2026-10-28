@@ -28,7 +28,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
-LOG_CFG=() RENAMES=()
+LOG_CFG=() RENAMES=() PUTS=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -45,6 +45,7 @@ while [ $# -gt 0 ]; do
 	--amp-fw) AMP_FW=$2; shift 2 ;;        # the amplifiers' firmware files (Windows-side directory)
 	--log-cfg) LOG_CFG+=("$2"); shift 2 ;; # a unified-log subsystem config (tools/logging/SUBSYSTEM.plist), repeatable
 	--rename) RENAMES+=("$2"); shift 2 ;;  # "FROM TO": the installer renames FROM to TO in iOS (patch 0286), repeatable
+	--put) PUTS+=("$2"); shift 2 ;;        # "LOCAL MODE DEST": install LOCAL at DEST in iOS, repeatable
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -163,6 +164,16 @@ for c in "${LOG_CFG[@]}"; do
 done
 for r in "${RENAMES[@]}"; do
 	printf '> %s\n' "$r" >> "$T/files.txt"
+done
+# --put: the pack names files by basename, so each goes in under its own name (put<N>.<basename>)
+n=0
+for p in "${PUTS[@]}"; do
+	read -r src mode dest <<< "$p"
+	[ -f "$src" ] || { echo "no $src"; exit 1; }
+	n=$((n + 1))
+	cp "$src" "$T/put$n.$(basename "$src")"
+	printf '%s %s %s\n' "put$n.$(basename "$src")" "$mode" "$dest" >> "$T/files.txt"
+	PARTS+=("$(winp "$T/put$n.$(basename "$src")")")
 done
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"
