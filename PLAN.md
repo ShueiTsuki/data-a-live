@@ -36,6 +36,12 @@
 1. 扬声器不再一轮猜一个。安卓（已 root）下有 "B/T DSP1 Preload Switch" 开关，关再开会让驱动重新加载、启动 DSP；开 regmap 的写入跟踪（ftrace regmap 事件）抓下这一次从停核到起核的每一笔寄存器读写，照着逐条对。要切到安卓开机一次，上手机前问。spk13（配 MPU 前先强制开 PLL）可以同时编好备用。
 2. 上游 UniXNU 的 GPU 拆成 AdrenoMetal（原 NativeMetal，我们的插件基于 c6d29ca，之后 24 个提交：两平面 IOSurface 纹理、系统内存渲染、着色器预热整套）和 Adreno740（原 NativeAdreno，提交路径优化）。三个 Metal 问题和着色器预热合成一项：升级到 AdrenoMetal 最新，再照 Adreno740 补我们的内核驱动。
 3. 小件随时插：UniXNU 477e530（开机读 dyld 缓存不塞满内存）。
+4. **上游 GPU 比对结论（2026-10-28，6 个只读代理的报告，核查只跑完 Turnip 一份；报告 scratchpad/gpuup_reports.json，草稿在 scratchpad/gpuup/）。用户：「应该是不能直接照搬的」。** 不整体升级 AdrenoMetal：
+   - 三个 Metal 问题上游都没修（AdrenoMetal 0008-0016、ios-fuxi 都不碰 metal2vulkan 720ef1c 里拒绝的那三处：render_pass.rs:921-928、render.rs check_pipeline、blend.rs:770 SrgbForm）；我们 439 份日志里没出现过（来自同 SoC 另一位移植者）。问题 3 有候选：上游未合并分支 feat/ipados27-gpu-parity 的补丁 0018（sRGB 扩展范围混合的舍入模型）。问题 1、2 要自己改 metal2vulkan（ycbcr_renders 判断条件；先把格式对打进日志）。
+   - AdrenoMetal c6d29ca 之后 24 个提交：0009-0015 和"答案缓存"就是我们的 m2v 0001/0002/0004-0008 和 adapt 第 2 轮；0008+0016 和我们 0003+0009 同一件事不同写法，冲突，保留我们的；着色器预热、管线缓存导出只在上游 publish 模式下跑，我们的 adapt 绕开了。要拿的只有 ce5e19e（被拒时返回会拒绝调用的编码器，不返回 nil）：在 adapt_ios16.py 加一处替换。
+   - 内核 GPU 驱动（Adreno740）：每次提交不清 TLB、128 IB 一帧等我们已有。要补：cedcaa2 导入加 kIOMemoryPersistent（只读重试也要接 withAddressRange 返回 NULL）、c285ae8 提交方换了就重置 BR/BV 上下文、按句柄查 BO 并把 4096 上限提到 16384（峰值实测 2576）。自己的：ring_kick 每次提交打一行（日志里 22 万行），改成计数。ABI 线格式和 Adreno740 v2 相同，只差版本号；不动。
+   - Turnip：和上游逐字节一样，不动。
+   - xnu：477e530 我们已有 1 MiB 分块读，新的只有 >32 MiB 文件 IO_NOCACHE + 计数，草稿 fix_cs4k_nocache.py（树副本上能打），要真机开两次对比（关预读可能变慢）。8b6a0f5 草稿 fix_wi_instance.py 照 20H392 原版内核做法（6 个文件），接 iOS 音频时做。
 
 ## 一、双系统怎么做
 
@@ -576,7 +582,9 @@
   - 重载后不放音时 HALO_HEARTBEAT 读出 0 且不动，所以空闲时心跳不动不代表核没跑；看邮箱、越界状态和锁存器 0xbeef。
 - 0270（k0270）：起核写 0x281 / 0x81；起核后照安卓做邮箱握手；开机两颗都只写固件和系数（场景等 DSP 跑起来后再叠，这次先不写）；TDM 那一步不再复位重载：配置、PLL、路由、使能、上电，固件醒着就发 PLAY（看 AUDIO_STATE 1/2/6/7），3 s 后 PAUSE（0/2/6），再下电。还没写校准值（CAL_R_SEL、ALLOW_ACT_BOOT），DSP 送静音。测试 spk13 参数同 spk12。
 - **spk13（k0270，2026-10-28）：功放 DSP 跑起来了。** 两颗都是：起核后邮箱 0x10010 bit 31 置位，mailbox[1] = 0x2000002（AWAKE，和安卓一样）；核控制 0x81、锁存器 0xbeef、越界全 0。PLAY 后 AUDIO_STATE 2；3 s 时 0x2C14 = 3、0x2038 = 1（和安卓放音转储一样），心跳 100 ms 走 0x9a；PAUSE 后 AUDIO_STATE 0；下电正常。无死机，VKTEST 过。
-  - 下一步（问用户）：①第一次放音前照安卓写校准：清 0x10110 bit 31、CAL_R_SEL（这台手机的校准值，从安卓读，不进仓库、不打印）、ALLOW_ACT_BOOT=1；②DSP 跑起来后叠 music 场景（cs35l43_main_amp_event 的 delta）；③往喇叭播放图的共享内存送一段小音量的正弦波（pandora_adsp.c 现在只送静音），真正出声；④之后接 iOS 的音频设备。
+  - **用户（2026-10-28）：「都可以，你自己来」**（同意从安卓读校准值、测试音音量我定；GPU 比对流程 6 个阅读代理读完就停，结论我自己看）。校准文件 /mnt/vendor/persist/audio/crus_calr.bin（8 字节）拷到 ref/ampfw（git 忽略），gpu_test.sh 有就放进测试包。
+  - 0271（k0271）：功放第一次 PLAY 前清 0x10110 bit 31、CAL_R_SEL = 本颗校准值（文件第 0 个字给 T/0x42，第 1 个给 B/0x40，原值写入，不打印）、ALLOW_ACT_BOOT = 1；上电时先叠 music 场景（cs35l43_apply_delta_tuning = cs_dsp_load_coeff）。pandora_adsp.c：图跑起来后往共享内存端点（0x4001）送 1 kHz、-30 dBFS 的正弦，20 ms 一块、4 块在路上（DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER 0x04001000，DONE 0x05001000），功放 PLAY 到 PAUSE 之间约 2 s 能听到。测试 spk14。
+  - 原计划（已在做）：①第一次放音前照安卓写校准：清 0x10110 bit 31、CAL_R_SEL（这台手机的校准值，从安卓读，不进仓库、不打印）、ALLOW_ACT_BOOT=1；②DSP 跑起来后叠 music 场景（cs35l43_main_amp_event 的 delta）；③往喇叭播放图的共享内存送一段小音量的正弦波（pandora_adsp.c 现在只送静音），真正出声；④之后接 iOS 的音频设备。
 - 用户（2026-10-28）：「本地的几个东西你先看看，感觉unixnu的可能比较大」→ UniXNU 主仓库（unixnu_review/src，origin/main 40d21cc）自 dec4c7b 起 277 个提交，116 个是文档/设备目录。GPU 拆成单独仓库：NativeMetal → AdrenoMetal（我们插件基于的 c6d29ca 之后 24 个提交）、NativeAdreno → Adreno740（29 个）。已克隆到 unixnu_review/AdrenoMetal、Adreno740。和我们相关的：477e530（签名文件 1 MiB 一块读、dyld 缓存不进页缓存，我们开了同一个 hash cache）、8b6a0f5（work interval 操作 6/7/8，音频服务用）、1640f6f/AdrenoMetal（两平面 IOSurface 纹理，对应暂停的 RGB8_444_2P）、系统内存渲染和关并发 binning、着色器预热整套、Adreno740 的提交路径优化。列给用户选。
 - **用户插入（2026-10-28）：** 「记得今天同步一下上游」→ 今天内做：拉 UniXNU-sheng（本地 ../unixnu_review/UniXNU-sheng，上次 d76556b 2026-10-25；wsl/qcom/SOURCE.txt 记了我们拷的提交）、ios-sweet（425b251）、ios-fuxi（ba239fc）的新提交，列出和我们相关的改动，拷过来的库照新提交更新，再问用户要不要合。不打断扬声器 spk11。
 - 0267（k0267）：pa_halo 加读越界地址（HALO_MPU_XM/YM/PM_VIO_ADDR 0x2BC3100/08/10）和 AHB 主口错误（0x2B82040/44），加载完未起核时也记一次；去掉不起作用的强制开 PLL；TDM 那一步改成 0x40 在有位时钟时从头重新加载（停核、写固件/系数/场景并核对、MPU、起核），0x42 不动作对照；喇叭图跑 16 s。测试 spk10 参数同 spk9。

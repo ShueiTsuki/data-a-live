@@ -145,6 +145,11 @@ if [ -n "${AMP_FW:-}" ]; then
 	if [ -f "$AMP_FW/spkgraph.bin" ]; then
 		PARTS+=("$(winp "$AMP_FW/spkgraph.bin")")
 	fi
+	# this phone's speaker calibration (Android /mnt/vendor/persist/audio/crus_calr.bin), when copied there;
+	# goes only into the pack on the phone, never into the repo
+	if [ -f "$AMP_FW/crus_calr.bin" ]; then
+		PARTS+=("$(winp "$AMP_FW/crus_calr.bin")")
+	fi
 fi
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"

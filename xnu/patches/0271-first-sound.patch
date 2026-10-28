@@ -1,0 +1,269 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 9d8ad11..afcc60d 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1424,8 +1424,8 @@ gpr_step(void)
+  *     unpacked), the SPR's path end and session-time reset (configure_spr); GRAPH_PREPARE and GRAPH_START
+  *     with the four subgraphs. The stream side is our choice (iOS hands its own format): 48 kHz, 32 bits,
+  *     2 channels. Then pandora_amp_tdm looks at the amps on the running clock; after SPK_RUN_MS the graph is
+- *     stopped and closed, the clock released and the buffer unmapped. Nothing is written to the stream:
+- *     the DSP plays silence.
++ *     stopped and closed, the clock released and the buffer unmapped. 0271: the stream gets a quiet 1 kHz
++ *     test tone (spk_tone_pump); before, nothing was written to it and the DSP played silence.
+  * Nothing plays: the amplifiers are not configured (level 3: not told to play).
+  */
+ #define SPK_APM_PORT          GPR_PORT_APM
+@@ -1486,6 +1486,39 @@ static struct {
+ 	uint32_t cursor, nsg, sg[8];
+ } spk;
+ 
++/*
++ * 0271: a test tone into the running speaker graph, through its shared-memory endpoint (instance 0x4001,
++ * MODULE_ID_WR_SHARED_MEM_EP; spf wr_sh_mem_ep_api.h): DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER {buffer address lsw,
++ * msw (the stream index in the upper word, as for the command payloads), mem map handle, size, timestamp lsw,
++ * msw, flags 0} per 20 ms buffer in the stream area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE
++ * {address lsw, msw, handle, status} hands it back and the next 20 ms go into it. 1 kHz at -30 dBFS on both
++ * channels, interleaved q31 as the endpoint's media format says, faded in over the first 20 ms. Four in flight.
++ * Audible only while the amplifiers play (pandora_amp_tdm: PLAY ... PAUSE).
++ */
++#define SPK_TONE_MIID         0x4001u
++#define SPK_DATA_WRITE        0x04001000u
++#define SPK_DATA_WRITE_DONE   0x05001000u
++#define SPK_TONE_FRAMES       960u                       /* 20 ms at 48 kHz */
++#define SPK_TONE_BYTES        (SPK_TONE_FRAMES * 2u * 4u)
++#define SPK_TONE_SLOT         0x2000u
++#define SPK_TONE_SLOTS        8u
++#define SPK_TONE_INFLIGHT     4u
++static const int32_t spk_sine[48] = {         /* one period of 1 kHz at 48 kHz, -30 dBFS q31 */
++	0, 8863955, 17576245, 25987801, 33954698, 41340621,
++	48019194, 53876146, 58811262, 62740101, 65595439, 67328421,
++	67909396, 67328421, 65595439, 62740101, 58811262, 53876146,
++	48019194, 41340621, 33954698, 25987801, 17576245, 8863955,
++	0, -8863955, -17576245, -25987801, -33954698, -41340621,
++	-48019194, -53876146, -58811262, -62740101, -65595439, -67328421,
++	-67909396, -67328421, -65595439, -62740101, -58811262, -53876146,
++	-48019194, -41340621, -33954698, -25987801, -17576245, -8863955,
++};
++static struct {
++	bool on;
++	uint32_t sent, done, bad, inflight, busy;
++	uint64_t frames;
++} spk_tone;
++
+ static void
+ spk_put32(uint8_t *p, uint32_t v)
+ {
+@@ -1808,6 +1841,8 @@ spk_graph_done(bool aborted)
+ 		    ad_ms(spk.t0), spk.failed);
+ 		spk.state = SpkRunning;
+ 		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
++		bzero(&spk_tone, sizeof(spk_tone));
++		spk_tone.on = true;                   /* 0271: the test tone, from now until the graph stops */
+ 		pandora_amp_tdm();
+ 	} else if (spk.opened) {
+ 		spk_graph_end(false);
+@@ -1854,6 +1889,18 @@ spk_receive(const uint8_t *data, uint32_t len)
+ 	}
+ 	const uint32_t w0 = p.payload_bytes >= 4 ? spk_le32(p.payload) : 0;
+ 	const uint32_t w1 = p.payload_bytes >= 8 ? spk_le32(p.payload + 4) : 0;
++	if (p.opcode == SPK_DATA_WRITE_DONE) {         /* a tone buffer back (0271): its status is the fourth word */
++		const uint32_t status = p.payload_bytes >= 16 ? spk_le32(p.payload + 12) : ~0u;
++		spk_tone.done++;
++		spk_tone.bad += status != 0;
++		if (spk_tone.inflight) {
++			spk_tone.inflight--;
++		}
++		if (status != 0 && spk_tone.bad <= 3) {
++			printf("PANDORA SPK: tone buffer %#x returned with status %#x\n", w0, status);
++		}
++		return;
++	}
+ 	if (spk.state == SpkOff || spk.state == SpkDone || p.token != 0x5300u + spk.token) {
+ 		if (spk.others++ < 8) {
+ 			printf("PANDORA SPK: GPR in: opcode %#x token %#x from port %#x, %u bytes, words %#x %#x\n", p.opcode,
+@@ -1919,6 +1966,53 @@ spk_receive(const uint8_t *data, uint32_t len)
+ 	}
+ }
+ 
++/* Tone buffers into the endpoint while the graph runs and no graph command is waiting to go out (0271). */
++static void
++spk_tone_pump(void)
++{
++	while (spk_tone.on && spk.state == SpkRunning && !spk.tx_len && spk_tone.inflight < SPK_TONE_INFLIGHT) {
++		const uint32_t off = SPK_SHM_CMDS + (spk_tone.sent % SPK_TONE_SLOTS) * SPK_TONE_SLOT;
++		if ((uint64_t)off + SPK_TONE_BYTES > ad_shm_size) {
++			spk_tone.on = false;
++			break;
++		}
++		int32_t *s = (int32_t *)(ad_shm_va + off);
++		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
++			const uint64_t n = spk_tone.frames + f;
++			int64_t v = spk_sine[n % 48u];
++			if (n < SPK_TONE_FRAMES) {
++				v = v * (int64_t)n / (int64_t)SPK_TONE_FRAMES;
++			}
++			s[2 * f] = (int32_t)v;
++			s[2 * f + 1] = (int32_t)v;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		const uint64_t a = ad_shm_pa + off;
++		uint8_t pl[28], tx[64];
++		bzero(pl, sizeof(pl));
++		spk_put32(pl, (uint32_t)a);
++		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
++		spk_put32(pl + 8, spk.handle);
++		spk_put32(pl + 12, SPK_TONE_BYTES);
++		GprPacket p;
++		bzero(&p, sizeof(p));
++		p.dst_domain = GPR_DOMAIN_ADSP;
++		p.src_domain = GPR_DOMAIN_APPS;
++		p.src_port = SPK_APM_PORT;
++		p.dst_port = SPK_TONE_MIID;
++		p.token = 0x5400u + (spk_tone.sent & 0xffu);
++		p.opcode = SPK_DATA_WRITE;
++		const uint32_t n = gpr_encode(tx, sizeof(tx), &p, pl, sizeof(pl));
++		if (!n || qcom_glink_send(&ed_adsp.gl, ad_gpr, tx, n) != QcomGlinkOk) {
++			spk_tone.busy++;
++			break;
++		}
++		spk_tone.frames += SPK_TONE_FRAMES;
++		spk_tone.sent++;
++		spk_tone.inflight++;
++	}
++}
++
+ static void
+ spk_step(void)
+ {
+@@ -1954,9 +2048,13 @@ spk_step(void)
+ 		spk_clock(0);
+ 	}
+ 	if (spk.state == SpkRunning && now >= spk.run_until) {
+-		printf("PANDORA SPK: %u ms up: stopping the speaker graph\n", SPK_RUN_MS);
++		spk_tone.on = false;
++		printf("PANDORA SPK: %u ms up: stopping the speaker graph; tone: %u buffers sent, %u back (%u with an error), "
++		    "%u in flight, sends refused %u\n", SPK_RUN_MS, spk_tone.sent, spk_tone.done, spk_tone.bad, spk_tone.inflight,
++		    spk_tone.busy);
+ 		spk_graph_end(true);
+ 	}
++	spk_tone_pump();
+ 	if (spk.answer_by && now >= spk.answer_by) {
+ 		spk.answer_by = 0;
+ 		spk.tx_len = 0;
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index e1ba171..c934612 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -436,6 +436,10 @@ static uint32_t pa_r_state, pa_r_beat, pa_r_audio;    /* the firmware's controls
+ static bool pa_ready;                                /* both amps loaded and started (0262) */
+ static volatile bool pa_done;                        /* pa_thread finished, ready or not (0268) */
+ static bool pa_awake[2];                             /* 0x40, 0x42: the firmware answered on the mailbox (0270) */
++static uint32_t pa_r_calsel, pa_r_actboot;           /* CAL_R_SEL (alg 0x5F210), ALLOW_ACT_BOOT (0x5F224) (0271) */
++static uint32_t pa_calr[2];                          /* 0x40, 0x42: this phone's calibration, never printed (0271) */
++static bool pa_calr_ok;
++static const CsfwInfo *pa_infop;                     /* the firmware's algorithm list, for the scene at power-up */
+ 
+ static uint32_t
+ pa_ctl(const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info, uint32_t alg, const char *name)
+@@ -529,6 +533,8 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
+ 	pa_r_state = r_state;
+ 	pa_r_beat = r_beat;
+ 	pa_r_audio = r_audio;
++	pa_r_calsel = pa_ctl(fw, fw_size, info, 0x5f210, "CAL_R_SEL");
++	pa_r_actboot = pa_ctl(fw, fw_size, info, 0x5f224, "ALLOW_ACT_BOOT");
+ 	uint32_t lock = 0, mem = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
+ 	err = pa_reg(addr, PA_HALO_CORE, &core);
+ 	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+@@ -732,6 +738,25 @@ pa_key(uint8_t addr, uint32_t test)
+ 
+ static void pa_dump(uint8_t addr);
+ static void pa_load(uint8_t addr, char side, unsigned what);
++
++/* 0271: the music scene laid on the running DSP when the main amp powers up, as cs35l43_main_amp_event does
++ * (cs35l43_apply_delta_tuning: request_firmware of the delta file, then cs_dsp_load_coeff). */
++static int
++pa_scene(uint8_t addr, char side)
++{
++	char name[48];
++	uint32_t size = 0;
++	snprintf(name, sizeof(name), "%c-cs35l43-delta-music-spk-prot.bin", side);
++	uint8_t *d = pa_fw_file(name, &size);
++	int err = ENOENT;
++	if (d && pa_infop) {
++		err = pa_write_file(addr, "music scene", d, size, true, pa_infop, true);
++	}
++	if (d) {
++		kfree_data(d, (vm_size_t)size);
++	}
++	return err;
++}
+ static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
+ 
+ static void
+@@ -776,10 +801,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		pa_halo(amps[i], "PLL set");
+ 	}
+ 	for (unsigned i = 0; i < 2; i++) {
++		/* 0271: the scene first, with the DSP running, as cs35l43_main_amp_event */
++		const int serr = pa_awake[i] ? pa_scene(amps[i], i ? 'T' : 'B') : -1;
+ 		int err = pa_key(amps[i], 0x000f1aa0);
+ 		err = err ? err : pa_write1(amps[i], 0x2014, 1);
+ 		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
+-		printf("PANDORA AMP: %#x powered up, err %d\n", amps[i], err);
++		printf("PANDORA AMP: %#x powered up (music scene err %d), err %d\n", amps[i], serr, err);
+ 	}
+ 	pa_sleep(500);
+ 	for (unsigned i = 0; i < 2; i++) {
+@@ -790,8 +817,20 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		if (!pa_awake[i] || !pa_r_audio) {
+ 			continue;
+ 		}
++		/* 0271: the first play after the DSP started (cs35l43_dsp_audio_ev): 0x10110 bit 31 cleared, CAL_R_SEL =
++		 * this amp's calibration, ALLOW_ACT_BOOT = 1; then PLAY */
++		int err = pa_bits(amps[i], 0x10110, 0x80000000u, 0);
++		const bool cal = pa_calr_ok && pa_r_calsel;
++		if (cal) {
++			err = err ? err : pa_write1(amps[i], pa_r_calsel, pa_calr[i]);
++		}
++		if (pa_r_actboot) {
++			err = err ? err : pa_write1(amps[i], pa_r_actboot, 1);
++		}
++		printf("PANDORA AMP: %#x first play: calibration %s, ALLOW_ACT_BOOT %s, err %d\n", amps[i],
++		    cal ? "written" : "missing", pa_r_actboot ? "1" : "not found", err);
+ 		uint32_t a = 0;
+-		int err = pa_write1(amps[i], 0x13020, 0x0b000001u);
++		err = err ? err : pa_write1(amps[i], 0x13020, 0x0b000001u);
+ 		pa_sleep(3);
+ 		err = err ? err : pa_reg(amps[i], pa_r_audio, &a);
+ 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
+@@ -950,6 +989,7 @@ pa_load(uint8_t addr, char side, unsigned what)
+ 	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
+ 	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
+ 	pa_xm0 = info.core_id;
++	pa_infop = &info;
+ 	uint32_t core = 0;
+ 	int err = pa_reg(addr, PA_HALO_CORE, &core);
+ 	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
+@@ -1321,6 +1361,22 @@ pa_thread(void *arg, wait_result_t result)
+ 		pa_sleep(5);
+ 	}
+ 	static const uint8_t amps[2] = {0x40, 0x42};
++	if (pa_level >= 3) {
++		/* 0271: this phone's calibration, crus_calr.bin from Android's persist partition: two 32-bit little-endian
++		 * words, the first for the top amp (0x42, "T"), the second for the bottom one (0x40, "B"); the registers take
++		 * them as they are (cs35l43_apply_calibration only swaps bytes back). Values not printed. */
++		uint32_t csz = 0;
++		uint8_t *cal = pa_fw_file("crus_calr.bin", &csz);
++		if (cal && csz == 8) {
++			pa_calr[1] = (uint32_t)cal[0] | (uint32_t)cal[1] << 8 | (uint32_t)cal[2] << 16 | (uint32_t)cal[3] << 24;
++			pa_calr[0] = (uint32_t)cal[4] | (uint32_t)cal[5] << 8 | (uint32_t)cal[6] << 16 | (uint32_t)cal[7] << 24;
++			pa_calr_ok = true;
++		}
++		printf("PANDORA AMP: calibration file %s (%u bytes)\n", cal ? "in the pack" : "not in the pack", csz);
++		if (cal) {
++			kfree_data(cal, (vm_size_t)csz);
++		}
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		uint32_t devid = 0, revid = 0;
+ 		int e1 = pa_reg(amps[i], 0x0, &devid);

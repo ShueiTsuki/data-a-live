@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index afcc60d..d50aaa8 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1488,16 +1488,18 @@ static struct {
+ 
+ /*
+  * 0271: a test tone into the running speaker graph, through its shared-memory endpoint (instance 0x4001,
+- * MODULE_ID_WR_SHARED_MEM_EP; spf wr_sh_mem_ep_api.h): DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER {buffer address lsw,
+- * msw (the stream index in the upper word, as for the command payloads), mem map handle, size, timestamp lsw,
+- * msw, flags 0} per 20 ms buffer in the stream area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE
+- * {address lsw, msw, handle, status} hands it back and the next 20 ms go into it. 1 kHz at -30 dBFS on both
+- * channels, interleaved q31 as the endpoint's media format says, faded in over the first 20 ms. Four in flight.
+- * Audible only while the amplifiers play (pandora_amp_tdm: PLAY ... PAUSE).
++ * MODULE_ID_WR_SHARED_MEM_EP; spf wr_sh_mem_ep_api.h). 0272: DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, as gsl writes
++ * (gsl_datapath.c); spk14's version-1 command came back with AR_EUNSUPPORTED (3) for every buffer. Payload
++ * {data address lsw, msw (the stream index in the upper word, as for the command payloads), mem map handle, size,
++ * timestamp lsw, msw, flags 0, metadata address lsw, msw, handle, size: all 0}, one per 20 ms buffer in the stream
++ * area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 {data address lsw, msw, handle, status,
++ * ...} hands it back and the next 20 ms go into it. 1 kHz at -30 dBFS on both channels, interleaved q31 as the
++ * endpoint's media format says, faded in over the first 20 ms. Four in flight. Audible only while the amplifiers
++ * play (pandora_amp_tdm: PLAY ... PAUSE).
+  */
+ #define SPK_TONE_MIID         0x4001u
+-#define SPK_DATA_WRITE        0x04001000u
+-#define SPK_DATA_WRITE_DONE   0x05001000u
++#define SPK_DATA_WRITE        0x0400100Au
++#define SPK_DATA_WRITE_DONE   0x05001004u
+ #define SPK_TONE_FRAMES       960u                       /* 20 ms at 48 kHz */
+ #define SPK_TONE_BYTES        (SPK_TONE_FRAMES * 2u * 4u)
+ #define SPK_TONE_SLOT         0x2000u
+@@ -1889,6 +1891,16 @@ spk_receive(const uint8_t *data, uint32_t len)
+ 	}
+ 	const uint32_t w0 = p.payload_bytes >= 4 ? spk_le32(p.payload) : 0;
+ 	const uint32_t w1 = p.payload_bytes >= 8 ? spk_le32(p.payload + 4) : 0;
++	if (p.opcode == GPR_RSP_BASIC && w0 == SPK_DATA_WRITE) {     /* a tone buffer refused (0272) */
++		spk_tone.bad++;
++		if (spk_tone.inflight) {
++			spk_tone.inflight--;
++		}
++		if (spk_tone.bad <= 3) {
++			printf("PANDORA SPK: tone buffer refused by port %#x: status %#x\n", p.src_port, w1);
++		}
++		return;
++	}
+ 	if (p.opcode == SPK_DATA_WRITE_DONE) {         /* a tone buffer back (0271): its status is the fourth word */
+ 		const uint32_t status = p.payload_bytes >= 16 ? spk_le32(p.payload + 12) : ~0u;
+ 		spk_tone.done++;
+@@ -1988,7 +2000,7 @@ spk_tone_pump(void)
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		const uint64_t a = ad_shm_pa + off;
+-		uint8_t pl[28], tx[64];
++		uint8_t pl[44], tx[64];
+ 		bzero(pl, sizeof(pl));
+ 		spk_put32(pl, (uint32_t)a);
+ 		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));

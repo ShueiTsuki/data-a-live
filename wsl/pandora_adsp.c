@@ -1424,8 +1424,8 @@ gpr_step(void)
  *     unpacked), the SPR's path end and session-time reset (configure_spr); GRAPH_PREPARE and GRAPH_START
  *     with the four subgraphs. The stream side is our choice (iOS hands its own format): 48 kHz, 32 bits,
  *     2 channels. Then pandora_amp_tdm looks at the amps on the running clock; after SPK_RUN_MS the graph is
- *     stopped and closed, the clock released and the buffer unmapped. Nothing is written to the stream:
- *     the DSP plays silence.
+ *     stopped and closed, the clock released and the buffer unmapped. 0271: the stream gets a quiet 1 kHz
+ *     test tone (spk_tone_pump); before, nothing was written to it and the DSP played silence.
  * Nothing plays: the amplifiers are not configured (level 3: not told to play).
  */
 #define SPK_APM_PORT          GPR_PORT_APM
@@ -1485,6 +1485,41 @@ static struct {
 	bool opened, closing;
 	uint32_t cursor, nsg, sg[8];
 } spk;
+
+/*
+ * 0271: a test tone into the running speaker graph, through its shared-memory endpoint (instance 0x4001,
+ * MODULE_ID_WR_SHARED_MEM_EP; spf wr_sh_mem_ep_api.h). 0272: DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, as gsl writes
+ * (gsl_datapath.c); spk14's version-1 command came back with AR_EUNSUPPORTED (3) for every buffer. Payload
+ * {data address lsw, msw (the stream index in the upper word, as for the command payloads), mem map handle, size,
+ * timestamp lsw, msw, flags 0, metadata address lsw, msw, handle, size: all 0}, one per 20 ms buffer in the stream
+ * area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 {data address lsw, msw, handle, status,
+ * ...} hands it back and the next 20 ms go into it. 1 kHz at -30 dBFS on both channels, interleaved q31 as the
+ * endpoint's media format says, faded in over the first 20 ms. Four in flight. Audible only while the amplifiers
+ * play (pandora_amp_tdm: PLAY ... PAUSE).
+ */
+#define SPK_TONE_MIID         0x4001u
+#define SPK_DATA_WRITE        0x0400100Au
+#define SPK_DATA_WRITE_DONE   0x05001004u
+#define SPK_TONE_FRAMES       960u                       /* 20 ms at 48 kHz */
+#define SPK_TONE_BYTES        (SPK_TONE_FRAMES * 2u * 4u)
+#define SPK_TONE_SLOT         0x2000u
+#define SPK_TONE_SLOTS        8u
+#define SPK_TONE_INFLIGHT     4u
+static const int32_t spk_sine[48] = {         /* one period of 1 kHz at 48 kHz, -30 dBFS q31 */
+	0, 8863955, 17576245, 25987801, 33954698, 41340621,
+	48019194, 53876146, 58811262, 62740101, 65595439, 67328421,
+	67909396, 67328421, 65595439, 62740101, 58811262, 53876146,
+	48019194, 41340621, 33954698, 25987801, 17576245, 8863955,
+	0, -8863955, -17576245, -25987801, -33954698, -41340621,
+	-48019194, -53876146, -58811262, -62740101, -65595439, -67328421,
+	-67909396, -67328421, -65595439, -62740101, -58811262, -53876146,
+	-48019194, -41340621, -33954698, -25987801, -17576245, -8863955,
+};
+static struct {
+	bool on;
+	uint32_t sent, done, bad, inflight, busy;
+	uint64_t frames;
+} spk_tone;
 
 static void
 spk_put32(uint8_t *p, uint32_t v)
@@ -1808,6 +1843,8 @@ spk_graph_done(bool aborted)
 		    ad_ms(spk.t0), spk.failed);
 		spk.state = SpkRunning;
 		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
+		bzero(&spk_tone, sizeof(spk_tone));
+		spk_tone.on = true;                   /* 0271: the test tone, from now until the graph stops */
 		pandora_amp_tdm();
 	} else if (spk.opened) {
 		spk_graph_end(false);
@@ -1854,6 +1891,28 @@ spk_receive(const uint8_t *data, uint32_t len)
 	}
 	const uint32_t w0 = p.payload_bytes >= 4 ? spk_le32(p.payload) : 0;
 	const uint32_t w1 = p.payload_bytes >= 8 ? spk_le32(p.payload + 4) : 0;
+	if (p.opcode == GPR_RSP_BASIC && w0 == SPK_DATA_WRITE) {     /* a tone buffer refused (0272) */
+		spk_tone.bad++;
+		if (spk_tone.inflight) {
+			spk_tone.inflight--;
+		}
+		if (spk_tone.bad <= 3) {
+			printf("PANDORA SPK: tone buffer refused by port %#x: status %#x\n", p.src_port, w1);
+		}
+		return;
+	}
+	if (p.opcode == SPK_DATA_WRITE_DONE) {         /* a tone buffer back (0271): its status is the fourth word */
+		const uint32_t status = p.payload_bytes >= 16 ? spk_le32(p.payload + 12) : ~0u;
+		spk_tone.done++;
+		spk_tone.bad += status != 0;
+		if (spk_tone.inflight) {
+			spk_tone.inflight--;
+		}
+		if (status != 0 && spk_tone.bad <= 3) {
+			printf("PANDORA SPK: tone buffer %#x returned with status %#x\n", w0, status);
+		}
+		return;
+	}
 	if (spk.state == SpkOff || spk.state == SpkDone || p.token != 0x5300u + spk.token) {
 		if (spk.others++ < 8) {
 			printf("PANDORA SPK: GPR in: opcode %#x token %#x from port %#x, %u bytes, words %#x %#x\n", p.opcode,
@@ -1919,6 +1978,58 @@ spk_receive(const uint8_t *data, uint32_t len)
 	}
 }
 
+/* Tone buffers into the endpoint while the graph runs and no graph command is waiting to go out (0271). */
+static void
+spk_tone_pump(void)
+{
+	while (spk_tone.on && spk.state == SpkRunning && !spk.tx_len && spk_tone.inflight < SPK_TONE_INFLIGHT) {
+		const uint32_t off = SPK_SHM_CMDS + (spk_tone.sent % SPK_TONE_SLOTS) * SPK_TONE_SLOT;
+		if ((uint64_t)off + SPK_TONE_BYTES > ad_shm_size) {
+			spk_tone.on = false;
+			break;
+		}
+		int32_t *s = (int32_t *)(ad_shm_va + off);
+		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
+			const uint64_t n = spk_tone.frames + f;
+			int64_t v = spk_sine[n % 48u];
+			if (n < SPK_TONE_FRAMES) {
+				v = v * (int64_t)n / (int64_t)SPK_TONE_FRAMES;
+			}
+			s[2 * f] = (int32_t)v;
+			s[2 * f + 1] = (int32_t)v;
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		const uint64_t a = ad_shm_pa + off;
+		uint8_t pl[44], tx[GPR_HEADER_BYTES + 44];      /* 0273: the GPR header is 24 bytes (spk15: 64 was short) */
+		bzero(pl, sizeof(pl));
+		spk_put32(pl, (uint32_t)a);
+		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
+		spk_put32(pl + 8, spk.handle);
+		spk_put32(pl + 12, SPK_TONE_BYTES);
+		GprPacket p;
+		bzero(&p, sizeof(p));
+		p.dst_domain = GPR_DOMAIN_ADSP;
+		p.src_domain = GPR_DOMAIN_APPS;
+		p.src_port = SPK_APM_PORT;
+		p.dst_port = SPK_TONE_MIID;
+		p.token = 0x5400u + (spk_tone.sent & 0xffu);
+		p.opcode = SPK_DATA_WRITE;
+		const uint32_t n = gpr_encode(tx, sizeof(tx), &p, pl, sizeof(pl));
+		if (!n) {
+			printf("PANDORA SPK: tone: the data command does not encode; tone off\n");
+			spk_tone.on = false;
+			break;
+		}
+		if (qcom_glink_send(&ed_adsp.gl, ad_gpr, tx, n) != QcomGlinkOk) {
+			spk_tone.busy++;
+			break;
+		}
+		spk_tone.frames += SPK_TONE_FRAMES;
+		spk_tone.sent++;
+		spk_tone.inflight++;
+	}
+}
+
 static void
 spk_step(void)
 {
@@ -1954,9 +2065,13 @@ spk_step(void)
 		spk_clock(0);
 	}
 	if (spk.state == SpkRunning && now >= spk.run_until) {
-		printf("PANDORA SPK: %u ms up: stopping the speaker graph\n", SPK_RUN_MS);
+		spk_tone.on = false;
+		printf("PANDORA SPK: %u ms up: stopping the speaker graph; tone: %u buffers sent, %u back (%u with an error), "
+		    "%u in flight, sends refused %u\n", SPK_RUN_MS, spk_tone.sent, spk_tone.done, spk_tone.bad, spk_tone.inflight,
+		    spk_tone.busy);
 		spk_graph_end(true);
 	}
+	spk_tone_pump();
 	if (spk.answer_by && now >= spk.answer_by) {
 		spk.answer_by = 0;
 		spk.tx_len = 0;

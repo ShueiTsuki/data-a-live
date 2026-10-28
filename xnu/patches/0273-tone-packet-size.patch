@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index d50aaa8..53b1c05 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -2000,7 +2000,7 @@ spk_tone_pump(void)
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		const uint64_t a = ad_shm_pa + off;
+-		uint8_t pl[44], tx[64];
++		uint8_t pl[44], tx[GPR_HEADER_BYTES + 44];      /* 0273: the GPR header is 24 bytes (spk15: 64 was short) */
+ 		bzero(pl, sizeof(pl));
+ 		spk_put32(pl, (uint32_t)a);
+ 		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
+@@ -2015,7 +2015,12 @@ spk_tone_pump(void)
+ 		p.token = 0x5400u + (spk_tone.sent & 0xffu);
+ 		p.opcode = SPK_DATA_WRITE;
+ 		const uint32_t n = gpr_encode(tx, sizeof(tx), &p, pl, sizeof(pl));
+-		if (!n || qcom_glink_send(&ed_adsp.gl, ad_gpr, tx, n) != QcomGlinkOk) {
++		if (!n) {
++			printf("PANDORA SPK: tone: the data command does not encode; tone off\n");
++			spk_tone.on = false;
++			break;
++		}
++		if (qcom_glink_send(&ed_adsp.gl, ad_gpr, tx, n) != QcomGlinkOk) {
+ 			spk_tone.busy++;
+ 			break;
+ 		}

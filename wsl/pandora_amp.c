@@ -436,6 +436,10 @@ static uint32_t pa_r_state, pa_r_beat, pa_r_audio;    /* the firmware's controls
 static bool pa_ready;                                /* both amps loaded and started (0262) */
 static volatile bool pa_done;                        /* pa_thread finished, ready or not (0268) */
 static bool pa_awake[2];                             /* 0x40, 0x42: the firmware answered on the mailbox (0270) */
+static uint32_t pa_r_calsel, pa_r_actboot;           /* CAL_R_SEL (alg 0x5F210), ALLOW_ACT_BOOT (0x5F224) (0271) */
+static uint32_t pa_calr[2];                          /* 0x40, 0x42: this phone's calibration, never printed (0271) */
+static bool pa_calr_ok;
+static const CsfwInfo *pa_infop;                     /* the firmware's algorithm list, for the scene at power-up */
 
 static uint32_t
 pa_ctl(const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info, uint32_t alg, const char *name)
@@ -529,6 +533,8 @@ pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info
 	pa_r_state = r_state;
 	pa_r_beat = r_beat;
 	pa_r_audio = r_audio;
+	pa_r_calsel = pa_ctl(fw, fw_size, info, 0x5f210, "CAL_R_SEL");
+	pa_r_actboot = pa_ctl(fw, fw_size, info, 0x5f224, "ALLOW_ACT_BOOT");
 	uint32_t lock = 0, mem = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
 	err = pa_reg(addr, PA_HALO_CORE, &core);
 	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
@@ -732,6 +738,25 @@ pa_key(uint8_t addr, uint32_t test)
 
 static void pa_dump(uint8_t addr);
 static void pa_load(uint8_t addr, char side, unsigned what);
+
+/* 0271: the music scene laid on the running DSP when the main amp powers up, as cs35l43_main_amp_event does
+ * (cs35l43_apply_delta_tuning: request_firmware of the delta file, then cs_dsp_load_coeff). */
+static int
+pa_scene(uint8_t addr, char side)
+{
+	char name[48];
+	uint32_t size = 0;
+	snprintf(name, sizeof(name), "%c-cs35l43-delta-music-spk-prot.bin", side);
+	uint8_t *d = pa_fw_file(name, &size);
+	int err = ENOENT;
+	if (d && pa_infop) {
+		err = pa_write_file(addr, "music scene", d, size, true, pa_infop, true);
+	}
+	if (d) {
+		kfree_data(d, (vm_size_t)size);
+	}
+	return err;
+}
 static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
 
 static void
@@ -776,10 +801,12 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		pa_halo(amps[i], "PLL set");
 	}
 	for (unsigned i = 0; i < 2; i++) {
+		/* 0271: the scene first, with the DSP running, as cs35l43_main_amp_event */
+		const int serr = pa_awake[i] ? pa_scene(amps[i], i ? 'T' : 'B') : -1;
 		int err = pa_key(amps[i], 0x000f1aa0);
 		err = err ? err : pa_write1(amps[i], 0x2014, 1);
 		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
-		printf("PANDORA AMP: %#x powered up, err %d\n", amps[i], err);
+		printf("PANDORA AMP: %#x powered up (music scene err %d), err %d\n", amps[i], serr, err);
 	}
 	pa_sleep(500);
 	for (unsigned i = 0; i < 2; i++) {
@@ -790,8 +817,20 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		if (!pa_awake[i] || !pa_r_audio) {
 			continue;
 		}
+		/* 0271: the first play after the DSP started (cs35l43_dsp_audio_ev): 0x10110 bit 31 cleared, CAL_R_SEL =
+		 * this amp's calibration, ALLOW_ACT_BOOT = 1; then PLAY */
+		int err = pa_bits(amps[i], 0x10110, 0x80000000u, 0);
+		const bool cal = pa_calr_ok && pa_r_calsel;
+		if (cal) {
+			err = err ? err : pa_write1(amps[i], pa_r_calsel, pa_calr[i]);
+		}
+		if (pa_r_actboot) {
+			err = err ? err : pa_write1(amps[i], pa_r_actboot, 1);
+		}
+		printf("PANDORA AMP: %#x first play: calibration %s, ALLOW_ACT_BOOT %s, err %d\n", amps[i],
+		    cal ? "written" : "missing", pa_r_actboot ? "1" : "not found", err);
 		uint32_t a = 0;
-		int err = pa_write1(amps[i], 0x13020, 0x0b000001u);
+		err = err ? err : pa_write1(amps[i], 0x13020, 0x0b000001u);
 		pa_sleep(3);
 		err = err ? err : pa_reg(amps[i], pa_r_audio, &a);
 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
@@ -950,6 +989,7 @@ pa_load(uint8_t addr, char side, unsigned what)
 	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
 	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
 	pa_xm0 = info.core_id;
+	pa_infop = &info;
 	uint32_t core = 0;
 	int err = pa_reg(addr, PA_HALO_CORE, &core);
 	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
@@ -1321,6 +1361,22 @@ pa_thread(void *arg, wait_result_t result)
 		pa_sleep(5);
 	}
 	static const uint8_t amps[2] = {0x40, 0x42};
+	if (pa_level >= 3) {
+		/* 0271: this phone's calibration, crus_calr.bin from Android's persist partition: two 32-bit little-endian
+		 * words, the first for the top amp (0x42, "T"), the second for the bottom one (0x40, "B"); the registers take
+		 * them as they are (cs35l43_apply_calibration only swaps bytes back). Values not printed. */
+		uint32_t csz = 0;
+		uint8_t *cal = pa_fw_file("crus_calr.bin", &csz);
+		if (cal && csz == 8) {
+			pa_calr[1] = (uint32_t)cal[0] | (uint32_t)cal[1] << 8 | (uint32_t)cal[2] << 16 | (uint32_t)cal[3] << 24;
+			pa_calr[0] = (uint32_t)cal[4] | (uint32_t)cal[5] << 8 | (uint32_t)cal[6] << 16 | (uint32_t)cal[7] << 24;
+			pa_calr_ok = true;
+		}
+		printf("PANDORA AMP: calibration file %s (%u bytes)\n", cal ? "in the pack" : "not in the pack", csz);
+		if (cal) {
+			kfree_data(cal, (vm_size_t)csz);
+		}
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		uint32_t devid = 0, revid = 0;
 		int e1 = pa_reg(amps[i], 0x0, &devid);
