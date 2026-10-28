@@ -7,7 +7,8 @@
  * starts the module, then every PU_PERIOD_MS hands it the console ring's new bytes
  * (sweet_log_copy, from the start of the ring, so the boot is included) and polls the
  * controller, which completes enumeration and moves data. Bytes the module cannot take yet are
- * offered again; a reader that falls a whole ring behind skips ahead (sweet_log_copy).
+ * offered again; a reader that falls a whole ring behind skips ahead (sweet_log_copy). Before any
+ * reset the rest goes out from the resetting CPU (pandora_usb_final).
  * pandora_usb=1, read only: the state the bootloader leaves the primary USB controller in when
  * it hands over, which decides what the serial console has to bring up itself.
  * - GCC (gcc-kaanapali.c): the five clocks of the live DT's ssusb@a600000 (core = usb30_prim_master
@@ -115,8 +116,18 @@ pu_probe(void)
 #define PU_PERIOD_MS 5u
 #define PU_CHUNK     4096u
 
+/* Who works on the console ring's bytes: the serial thread during a pass, pandora_usb_final once the
+ * reset is coming (the thread then stops). */
+#define PU_IDLE   0u
+#define PU_THREAD 1u
+#define PU_FINAL  2u
+
 static int pu_level;
 static int pu_wait;
+static uint32_t pu_state, pu_up;
+static char pu_chunk[PU_CHUNK];
+static uint64_t pu_pos;
+static uint32_t pu_held, pu_sent;    /* chunk bytes not yet taken by the module; of them already taken */
 
 static void
 pu_sleep(unsigned ms)
@@ -160,23 +171,70 @@ pu_serial(void)
 	if (!up) {
 		return;
 	}
-	static char chunk[PU_CHUNK];
-	uint64_t pos = 0;
-	uint32_t held = 0, sent = 0;    /* chunk bytes not yet taken; of them already taken */
+	__atomic_store_n(&pu_up, 1u, __ATOMIC_RELEASE);
 	for (unsigned n = 1;; n++) {
-		if (held == sent) {
-			held = sweet_log_copy(&pos, chunk, PU_CHUNK);
-			sent = 0;
+		uint32_t idle = PU_IDLE;
+		if (!__atomic_compare_exchange_n(&pu_state, &idle, PU_THREAD, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+			for (;;) {    /* pandora_usb_final took over; the reset follows */
+				pu_sleep(1000);
+			}
 		}
-		if (held > sent) {
-			sent += (uint32_t)qcom_usb_debug_write(chunk + sent, held - sent);
+		if (pu_held == pu_sent) {
+			pu_held = sweet_log_copy(&pu_pos, pu_chunk, PU_CHUNK);
+			pu_sent = 0;
+		}
+		if (pu_held > pu_sent) {
+			pu_sent += (uint32_t)qcom_usb_debug_write(pu_chunk + pu_sent, pu_held - pu_sent);
 		}
 		qcom_usb_debug_poll();
+		__atomic_store_n(&pu_state, PU_IDLE, __ATOMIC_RELEASE);
 		if (n == 2000 || n % 60000 == 0) {    /* 10 s after the start, then every 5 min */
 			pu_status("running");
 		}
 		pu_sleep(PU_PERIOD_MS);
 	}
+}
+
+/*
+ * Right before the phone resets (sweet_ufs.c pl_psci_reset: a panic, a restart, pandora_reboot_after),
+ * the bytes the serial thread has not handed over yet: usb4 lost the last two lines, written 1 ms before
+ * the reset. The thread is stopped once its current pass ends (up to 20 ms; a panic can have stopped it
+ * inside one, and then only what the module already holds goes out), the rest of the console ring goes
+ * into the module, and the module sends it from this CPU (qcom_usb_debug_final_drain), for at most 2 s:
+ * as long as a reset waits when nothing on the PC reads the port.
+ */
+void pandora_usb_final(void);
+void
+pandora_usb_final(void)
+{
+	if (!__atomic_load_n(&pu_up, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	bool owned = false;
+	for (unsigned i = 0; i < 200 && !owned; i++) {
+		uint32_t idle = PU_IDLE;
+		owned = __atomic_compare_exchange_n(&pu_state, &idle, PU_FINAL, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+		if (!owned) {
+			delay(100);
+		}
+	}
+	if (owned) {
+		for (unsigned k = 0; k < 2048; k++) {    /* 8 MiB at most, twice the ring */
+			if (pu_held == pu_sent) {
+				pu_held = sweet_log_copy(&pu_pos, pu_chunk, PU_CHUNK);
+				pu_sent = 0;
+				if (!pu_held) {
+					break;
+				}
+			}
+			const size_t took = qcom_usb_debug_write(pu_chunk + pu_sent, pu_held - pu_sent);
+			if (!took) {
+				break;
+			}
+			pu_sent += (uint32_t)took;
+		}
+	}
+	(void)qcom_usb_debug_final_drain(2000);
 }
 
 static void

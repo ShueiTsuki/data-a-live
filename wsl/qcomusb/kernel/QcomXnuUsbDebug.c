@@ -160,9 +160,11 @@ static int deadline_expired(void)
     }
     return 0;
 }
+/* Data A Live: set by qcom_usb_debug_final_drain, which runs on whatever CPU resets the phone. */
+static volatile int final_any_cpu;
 static int acquire(uint64_t *saved_daif)
 {
-    if (cpu_number() != master_cpu) return 0;
+    if (!final_any_cpu && cpu_number() != master_cpu) return 0;
     __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(*saved_daif) :: "memory");
     if (__atomic_exchange_n(&usb_busy, 1u, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("msr daif, %0" :: "r"(*saved_daif) : "memory");
@@ -1395,6 +1397,13 @@ int qcom_usb_debug_wait_drained(unsigned int timeout_ms)
         if (counter() - start >= ticks) return 0;
         delay_us(0, 1000);
     }
+}
+/* Data A Live: wait_drained from any CPU, right before the reset. The caller (pandora_usb_final) has
+ * stopped the only other user, the serial thread; usb_busy still keeps out a pass a panic interrupted. */
+int qcom_usb_debug_final_drain(unsigned int timeout_ms)
+{
+    final_any_cpu = 1;
+    return qcom_usb_debug_wait_drained(timeout_ms);
 }
 size_t qcom_usb_debug_write(const void *bytes, size_t count)
 {

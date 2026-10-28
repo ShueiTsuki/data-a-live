@@ -125,6 +125,8 @@ int qcom_usb_debug_control_arm_reboot(void);
 void qcom_usb_debug_control_reboot_failed(int result);
 /* Bounded normal-thread drain wait used before reboot_kernel(0, NULL). */
 int qcom_usb_debug_wait_drained(unsigned int timeout_ms);
+/* Data A Live: the same from any CPU, right before the reset, once the serial thread has stopped. */
+int qcom_usb_debug_final_drain(unsigned int timeout_ms);
 /* Early PREPARING diagnosis only; inactive/ACTIVE calls return promptly. */
 void qcom_usb_debug_panic_prepare(void);
 /* Tries to drain messages and an end marker for at most two seconds using
