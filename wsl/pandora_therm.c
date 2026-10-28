@@ -23,8 +23,15 @@
  * them), then CONV_REQ 1. Only these request registers are written; nothing about voltages or power.
  * Decimation 1 is what Android writes (its regmap of vadc@9000: DIG_PARAM 0x14 on both SDAMs, thermadc
  * regmap_0-00_9000_t1); upstream Linux's default, 2, gave SDAM0 slots 1-6 readings 20-26 degrees above
- * Android's while the other eight read like Android (usb5). pandora_therm=3 compares the two in one
- * boot: decimation 2 first, its codes after 5 s, then decimation 1.
+ * Android's while the other eight read like Android (usb5). Within one boot (usb6, k0254) the two
+ * decimations gave readings under a degree apart: decimation is not the cause.
+ * Those six channels, and cpu_therm, reach the ADC through PMIC GPIOs that Android's pinctrl puts in
+ * high impedance (bias-high-impedance: the pin's EN_CTL 0x46 bit 7 cleared, Linux pinctrl-spmi-gpio
+ * pmic_gpio_config_set): vadc@9000's own pinctrl-0 (xoagg, pa2, qtm) and the default states of the GPIO
+ * controllers of pmh0101 (wireless, cpu) and pmih010x (display, charger). Nobody sets them under iOS.
+ * pandora_therm=2 logs the seven GPIOs' registers (subtype 0x05, 0x40-0x47) before the setup; with
+ * pandora_therm_gpio=1 it then logs every channel's code after 5 s, clears the seven EN_CTLs (nothing
+ * else of the GPIOs is written), and logs the codes again 3 s later.
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -63,6 +70,20 @@ static const struct {
 	{"batt", 1, 5, 0x2744}, {"conn", 1, 6, 0x2747},
 };
 #define PT_CHANS (sizeof(pt_chan) / sizeof(pt_chan[0]))
+
+/* The thermistors' PMIC GPIOs (gpio N at peripheral 0x88 + N - 1, pmk8850's at 0xb8 + N - 1: pinctrl@b800),
+ * PPID as pandora_spmi_read takes it: the SID byte (pmih010x 0x27, bus 1) << 8 | peripheral. Under Android
+ * all seven read MODE_CTL 00, DIG_PULL 04, DIG_OUT 01, EN_CTL 00 (its regmaps 0-00, 0-01, 1-07, after usb6). */
+static const struct {
+	const char *name;
+	uint16_t ppid;
+} pt_gpio[] = {
+	{"xoagg pmk8850 gpio7", 0x00be}, {"qtm pmh0101 gpio2", 0x0189}, {"pa2 pmh0101 gpio3", 0x018a},
+	{"wireless pmh0101 gpio9", 0x0190}, {"cpu pmh0101 gpio12", 0x0193}, {"display pmih010x gpio18", 0x2799},
+	{"charger pmih010x gpio12", 0x2793},
+};
+#define PT_GPIOS   (sizeof(pt_gpio) / sizeof(pt_gpio[0]))
+#define PT_GPIO_EN 0x46u
 
 /* mi_thermald's sensors, in its order: pa_therm1 charger_therm pa_therm2 quiet_therm wifi_therm battery
  * cpu_therm (-1: battery, from the gauge) */
@@ -191,7 +212,7 @@ pt_tm_setup(unsigned dec)
 	    err[3], err[4], err[5], err[6], err[7], err[8], err[9], err[10], err[11], err[12], err[13], en0, en1);
 }
 
-/* pandora_therm=3: each channel's code and temperature, one line, tagged when */
+/* pandora_therm_gpio=1: each channel's code and temperature, one line, tagged when */
 static void
 pt_log_codes(const char *when)
 {
@@ -212,7 +233,34 @@ pt_log_codes(const char *when)
 	printf("PANDORA THERM: %s:%s\n", when, line);
 }
 
-static int pt_level;
+/* Each thermistor GPIO's subtype and registers 0x40-0x47 (MODE_CTL DIG_VIN DIG_PULL DIG_IN DIG_OUT_SRC
+ * DIG_OUT EN_CTL -), tagged when. */
+static void
+pt_gpio_dump(const char *when)
+{
+	for (unsigned i = 0; i < PT_GPIOS; i++) {
+		uint8_t sub = 0, b[8] = {0};
+		int e = pandora_spmi_read(pt_gpio[i].ppid, 0x05, &sub, 1);
+		e = e ? e : pandora_spmi_read(pt_gpio[i].ppid, 0x40, b, 8);
+		printf("PANDORA THERM: GPIO %s %s: err %d subtype %02x 0x40-0x47 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    pt_gpio[i].name, when, e, sub, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+	}
+}
+
+/* EN_CTL cleared on each thermistor GPIO, as Linux does for bias-high-impedance */
+static void
+pt_gpio_high_z(void)
+{
+	int err[PT_GPIOS];
+	for (unsigned i = 0; i < PT_GPIOS; i++) {
+		const uint8_t off = 0;
+		err[i] = pandora_spmi_write(pt_gpio[i].ppid, PT_GPIO_EN, &off, 1);
+	}
+	printf("PANDORA THERM: thermistor GPIOs to high impedance: errors %d %d %d %d %d %d %d\n", err[0], err[1], err[2],
+	    err[3], err[4], err[5], err[6]);
+}
+
+static int pt_level, pt_gpio_level;
 
 static void
 pt_thread(void *arg, wait_result_t result)
@@ -222,17 +270,18 @@ pt_thread(void *arg, wait_result_t result)
 	pt_sleep(10000);
 	pt_dump_config(PT_SDAM0);
 	pt_dump_config(PT_SDAM1);
-	if (pt_level >= 3) {
-		pt_tm_setup(2);
-		pt_sleep(5000);
-		pt_log_codes("decimation 2");
-		pt_tm_setup(1);
-		pt_sleep(3000);
-		pt_log_codes("decimation 1");
-	} else if (pt_level >= 2) {
-		pt_tm_setup(1);
-	}
 	if (pt_level >= 2) {
+		pt_gpio_dump("as found");
+		pt_tm_setup(1);
+		if (pt_gpio_level) {
+			/* one boot, the same temperatures: the codes before and after */
+			pt_sleep(5000);
+			pt_log_codes("GPIOs as found");
+			pt_gpio_high_z();
+			pt_gpio_dump("after");
+			pt_sleep(3000);
+			pt_log_codes("GPIOs high impedance");
+		}
 		pt_sleep(2000);
 		pt_dump_config(PT_SDAM0);
 		pt_dump_config(PT_SDAM1);
@@ -296,6 +345,7 @@ void
 pandora_therm_init(void)
 {
 	(void)PE_parse_boot_argn("pandora_therm", &pt_level, sizeof(pt_level));
+	(void)PE_parse_boot_argn("pandora_therm_gpio", &pt_gpio_level, sizeof(pt_gpio_level));
 	if (!pt_level) {
 		return;
 	}
