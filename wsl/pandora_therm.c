@@ -29,9 +29,11 @@
  * high impedance (bias-high-impedance: the pin's EN_CTL 0x46 bit 7 cleared, Linux pinctrl-spmi-gpio
  * pmic_gpio_config_set): vadc@9000's own pinctrl-0 (xoagg, pa2, qtm) and the default states of the GPIO
  * controllers of pmh0101 (wireless, cpu) and pmih010x (display, charger). Nobody sets them under iOS.
- * pandora_therm=2 logs the seven GPIOs' registers (subtype 0x05, 0x40-0x47) before the setup; with
- * pandora_therm_gpio=1 it then logs every channel's code after 5 s, clears the seven EN_CTLs (nothing
- * else of the GPIOs is written), and logs the codes again 3 s later.
+ * As found under iOS six of them have EN_CTL 0x80 (on), cpu_therm's 0x00; with xoagg's cleared its reading
+ * went from 71.9 to 48.2 degrees, next to xo's 47.7, in the same boot (usb7). pandora_therm=2 logs the
+ * seven GPIOs' registers (subtype 0x05, 0x40-0x47), clears their EN_CTLs (nothing else of the GPIOs is
+ * written), then sets the channels up. pandora_therm_gpio=1 instead sets the channels up first, logs
+ * every channel's code after 5 s, clears the EN_CTLs, and logs the codes again 3 s later.
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -272,15 +274,19 @@ pt_thread(void *arg, wait_result_t result)
 	pt_dump_config(PT_SDAM1);
 	if (pt_level >= 2) {
 		pt_gpio_dump("as found");
-		pt_tm_setup(1);
 		if (pt_gpio_level) {
 			/* one boot, the same temperatures: the codes before and after */
+			pt_tm_setup(1);
 			pt_sleep(5000);
 			pt_log_codes("GPIOs as found");
 			pt_gpio_high_z();
 			pt_gpio_dump("after");
 			pt_sleep(3000);
 			pt_log_codes("GPIOs high impedance");
+		} else {
+			/* Android's order: the pins (pinctrl at probe), then the channels */
+			pt_gpio_high_z();
+			pt_tm_setup(1);
 		}
 		pt_sleep(2000);
 		pt_dump_config(PT_SDAM0);
