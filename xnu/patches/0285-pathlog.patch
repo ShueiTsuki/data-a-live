@@ -1,0 +1,70 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index b9870bd..860de55 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -5030,10 +5030,45 @@ open_dprotected_np(__unused proc_t p, struct open_dprotected_np_args *uap, int32
+ 	           uap->class, uap->dpflags, AT_FDCWD, AUTH_OPEN_NOAUTHFD, UIO_USERSPACE, retval);
+ }
+ 
++#if defined(PANDORA)
++/*
++ * PANDORA (0285): boot-arg pandora_pathlog=NAME logs each open, access or stat by a process of that name of a path
++ * containing "Plug-Ins" or "VirtualAudio" (which audio plug-ins mediaserverd looks at).
++ */
++static void
++pandora_pathlog(const char *op, user_addr_t path, enum uio_seg segflg)
++{
++	static int state;                       /* 0 not read yet, 1 off, 2 on */
++	static char want[32];
++	if (state == 0) {
++		state = PE_parse_boot_arg_str("pandora_pathlog", want, sizeof(want)) && want[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (strncmp(name, want, sizeof(name)) != 0) {
++		return;
++	}
++	char p[256];
++	size_t len = 0;
++	int e = segflg == UIO_SYSSPACE ? copystr(CAST_DOWN(void *, path), p, sizeof(p), &len) :
++	    copyinstr(path, p, sizeof(p), &len);
++	if (e != 0 || (strnstr(p, "Plug-Ins", sizeof(p)) == NULL && strnstr(p, "VirtualAudio", sizeof(p)) == NULL)) {
++		return;
++	}
++	printf("PANDORA PATH: %s %s %s\n", name, op, p);
++}
++#endif /* PANDORA */
++
+ static int
+ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+     int fd, enum uio_seg segflg, int *retval)
+ {
++#if defined(PANDORA)
++	pandora_pathlog("open", path, segflg);
++#endif
+ 	struct filedesc *fdp = &vfs_context_proc(ctx)->p_fd;
+ 	struct {
+ 		struct vnode_attr va;
+@@ -6776,6 +6811,9 @@ static int
+ faccessat_internal(vfs_context_t ctx, int fd, user_addr_t path, int amode,
+     int flag, enum uio_seg segflg)
+ {
++#if defined(PANDORA)
++	pandora_pathlog("access", path, segflg);
++#endif
+ 	int error;
+ 	struct nameidata nd;
+ 	int niopts;
+@@ -6885,6 +6923,9 @@ fstatat_internal(vfs_context_t ctx, user_addr_t path, user_addr_t ub,
+     user_addr_t xsecurity, user_addr_t xsecurity_size, int isstat64,
+     enum uio_seg segflg, int fd, int flag)
+ {
++#if defined(PANDORA)
++	pandora_pathlog("stat", path, segflg);
++#endif
+ 	struct nameidata nd;
+ 	int follow;
+ 	union {

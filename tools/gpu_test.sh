@@ -28,7 +28,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
-LOG_CFG=()
+LOG_CFG=() RENAMES=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -44,6 +44,7 @@ while [ $# -gt 0 ]; do
 	--metal-from) METAL_FROM=$2; shift 2 ;;  # a local plugin build (tools/metal/build_plugin_linux.sh OUT, WSL path)
 	--amp-fw) AMP_FW=$2; shift 2 ;;        # the amplifiers' firmware files (Windows-side directory)
 	--log-cfg) LOG_CFG+=("$2"); shift 2 ;; # a unified-log subsystem config (tools/logging/SUBSYSTEM.plist), repeatable
+	--rename) RENAMES+=("$2"); shift 2 ;;  # "FROM TO": the installer renames FROM to TO in iOS (patch 0286), repeatable
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -159,6 +160,9 @@ for c in "${LOG_CFG[@]}"; do
 	[ -f "$c" ] || { echo "no $c"; exit 1; }
 	printf '%s 644 /Library/Preferences/Logging/Subsystems/%s\n' "$(basename "$c")" "$(basename "$c")" >> "$T/files.txt"
 	PARTS+=("$(winp "$c")")
+done
+for r in "${RENAMES[@]}"; do
+	printf '> %s\n' "$r" >> "$T/files.txt"
 done
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"

@@ -8,6 +8,7 @@
  * Boot-arg pandora_files=0 turns it off.
  * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
+ * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -28,6 +29,7 @@ extern kern_return_t thread_terminate(thread_t);
 extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vnode_t rootvnode;
 extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
+extern int pandora_rename(const char *from, const char *to);   /* bsd/vfs/vfs_syscalls.c (patch 0286) */
 void pandora_files_init(void);
 
 #define PF_MAX_FILE   (64u << 20)
@@ -181,6 +183,23 @@ pf_thread(void *arg, wait_result_t result)
 			} else {
 				failed++;
 				printf("PANDORA FILES: mkdir %s: error %d\n", path, error);
+			}
+			continue;
+		}
+		/* "> FROM TO" (patch 0286): rename FROM to TO, both absolute paths without spaces; once FROM is gone
+		 * there is nothing to do. First user: ios-sweet's root image (v12) moved VirtualAudio.plugin to
+		 * /Library/Audio/Plug-Ins/HAL.disabled while the phone had no audio device; it goes back now. */
+		if (!strcmp(name, ">") && sp1[1] == '/' && path[0] == '/') {
+			const char *from = sp1 + 1;
+			int error = pandora_rename(from, path);
+			if (!error) {
+				written++;
+				printf("PANDORA FILES: rename %s -> %s\n", from, path);
+			} else if (error == ENOENT) {
+				same++;
+			} else {
+				failed++;
+				printf("PANDORA FILES: rename %s -> %s: error %d\n", from, path, error);
 			}
 			continue;
 		}

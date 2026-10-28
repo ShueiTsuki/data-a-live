@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index b042fe2..7baa759 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -25,6 +25,8 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSString.h>
+@@ -122,6 +124,7 @@ public:
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+ 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ 	IOReturn startIO(void);
+@@ -140,6 +143,7 @@ public:
+ 	bool started_ = false;
+ 
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+@@ -221,6 +225,36 @@ IOAudio2Device::free(void)
+ 	IOService::free();
+ }
+ 
++/*
++ * 0287 (aud7: VirtualAudio loaded, but "HALB_UCObject::SetProperty: got an error from the IORegistry, Error:
++ * 0xE00002C7", "Unable to take hog mode.", "Could not add PhysicalDevice ID: 33"): clients set registry properties
++ * on the device, first "exclusive access owner" (hog mode; HALS_IOA2Device::_ReadHogModeOwnerStore reads it back).
++ * Every key is kept as given and logged.
++ */
++IOReturn
++IOAudio2Device::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *it = d == nullptr ? nullptr : OSCollectionIterator::withCollection(d);
++	if (it == nullptr) {
++		IOLog("PANDORA AUDIO: setProperties without a dictionary\n");
++		return kIOReturnBadArgument;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	while (const OSSymbol *k = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		OSString *s = OSDynamicCast(OSString, v);
++		IOLog("PANDORA AUDIO: %s sets \"%s\" = %s%llu%s\n", name, k->getCStringNoCopy(),
++		    n != nullptr ? "" : s != nullptr ? s->getCStringNoCopy() : v->getMetaClass()->getClassName(),
++		    n != nullptr ? n->unsigned64BitValue() : 0ull, n != nullptr ? "" : " (not a number)");
++		setProperty(k, v);
++	}
++	it->release();
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOAudio2Device::newUserClient(task_t owningTask, void *securityID, UInt32 type, __unused OSDictionary *properties,
+     IOUserClient **handler)
+@@ -348,6 +382,12 @@ IOAudio2DeviceUserClient::clientClose(void)
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++IOAudio2DeviceUserClient::setProperties(OSObject *properties)
++{
++	return device_ != nullptr ? device_->setProperties(properties) : kIOReturnNotReady;
++}
++
+ IOReturn
+ IOAudio2DeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
+ {
