@@ -15,9 +15,10 @@
  *                          also dispatch an event every ReportInterval
  *   AppleVTempDispatcher   where thermalmonitord sends the temperatures it computes (generalProductConfig
  *                          shouldDispatchVirtualTemp; HidSensors sendVirtualTemp:temperature: sets one
- *                          property, the sensor's 4CC = hundredths of a degree, with
- *                          IORegistryEntrySetCFProperty); they go to pandora_therm_ios_temp. Apple's
- *                          class of that name (AppleEmbeddedTempSensor.kext) is not in this kernel.
+ *                          property, the sensor's 4CC = an int, degrees in 16.16 fixed point rounded from
+ *                          its hundredths, with IORegistryEntrySetCFProperty); they go to
+ *                          pandora_therm_ios_temp in hundredths. Apple's class of that name
+ *                          (AppleEmbeddedTempSensor.kext) is not in this kernel.
  */
 #if defined(PANDORA)
 #include <IOKit/IOLib.h>
@@ -216,7 +217,8 @@ AppleVTempDispatcher::setProperties(OSObject *properties)
 	while (OSSymbol *key = OSDynamicCast(OSSymbol, keys->getNextObject())) {
 		OSNumber *value = OSDynamicCast(OSNumber, dict->getObject(key));
 		if (value) {
-			pandora_therm_ios_temp(key->getCStringNoCopy(), (int32_t)value->unsigned32BitValue());
+			const int64_t fixed = (int32_t)value->unsigned32BitValue();    /* 16.16 */
+			pandora_therm_ios_temp(key->getCStringNoCopy(), (int32_t)(fixed * 100 / 65536));
 		}
 	}
 	keys->release();
