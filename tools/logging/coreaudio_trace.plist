@@ -6,20 +6,22 @@
   "Attempting to build concrete route ..." need more than the default. Installed as
   /Library/Preferences/com.apple.coreaudio.plist (any user; mediaserverd runs as mobile) with the put option of
   tools/gpu_test.sh: "tools/logging/coreaudio_trace.plist 644 /Library/Preferences/com.apple.coreaudio.plist".
-  The per-buffer loggers (io, dsp, stream, sample rate/format) stay at "details".
+  Only the routing, port and volume loggers are at spew; aud16: with tracedevicemanager at spew the device
+  listener queries a property even the Null device lacks ('who?' caught by ExceptionBarrier), the device list stays
+  empty and VirtualAudio never finishes initializing. The rest stay at "details".
 -->
 <plist version="1.0">
 <dict>
-	<key>traceaggregatedevice</key><string>spew</string>
+	<key>traceaggregatedevice</key><string>details</string>
 	<key>traceairplay</key><string>details</string>
 	<key>traceanc</key><string>details</string>
 	<key>tracebluetooth</key><string>details</string>
 	<key>tracecapture</key><string>details</string>
 	<key>tracecarplay</key><string>details</string>
-	<key>tracecontrol</key><string>spew</string>
+	<key>tracecontrol</key><string>details</string>
 	<key>tracecoretelephonyinterface</key><string>details</string>
-	<key>tracedevice</key><string>spew</string>
-	<key>tracedevicemanager</key><string>spew</string>
+	<key>tracedevice</key><string>details</string>
+	<key>tracedevicemanager</key><string>details</string>
 	<key>tracedsp</key><string>details</string>
 	<key>tracehaptics</key><string>details</string>
 	<key>traceheadphones</key><string>details</string>
@@ -44,10 +46,10 @@
 	<key>tracesystemsettingsmanager</key><string>spew</string>
 	<key>tracetelephonysamplerate</key><string>details</string>
 	<key>traceusbiap</key><string>details</string>
-	<key>traceutilities</key><string>spew</string>
-	<key>tracevirtualaudiocontrol</key><string>spew</string>
-	<key>tracevirtualaudiodevice</key><string>spew</string>
-	<key>tracevirtualaudioplugin</key><string>spew</string>
+	<key>traceutilities</key><string>details</string>
+	<key>tracevirtualaudiocontrol</key><string>details</string>
+	<key>tracevirtualaudiodevice</key><string>details</string>
+	<key>tracevirtualaudioplugin</key><string>details</string>
 	<key>tracevirtualaudioport</key><string>spew</string>
 	<key>tracevirtualaudiostream</key><string>details</string>
 	<key>tracevolume</key><string>spew</string>

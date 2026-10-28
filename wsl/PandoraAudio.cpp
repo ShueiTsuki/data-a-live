@@ -89,7 +89,7 @@ pa_format(bool range)
 }
 
 static OSDictionary *
-pa_stream(void)
+pa_stream(bool input)
 {
 	OSDictionary *s = OSDictionary::withCapacity(6);
 	OSDictionary *cur = pa_format(false), *avail = pa_format(true);
@@ -99,7 +99,8 @@ pa_stream(void)
 	} else {
 		pa_num(s, "stream ID", PA_STREAM_ID, 32);
 		pa_num(s, "starting channel", 1, 32);
-		pa_num(s, "terminal type", PA_4CC('s', 'p', 'k', 'r'), 32);   /* kAudioStreamTerminalTypeSpeaker */
+		/* kAudioStreamTerminalTypeMicrophone / kAudioStreamTerminalTypeSpeaker */
+		pa_num(s, "terminal type", input ? PA_4CC('m', 'i', 'c', 'r') : PA_4CC('s', 'p', 'k', 'r'), 32);
 		s->setObject("current format", cur);
 		s->setObject("available formats", list);
 	}
@@ -121,7 +122,9 @@ public:
 	uint64_t seed_ = 0;
 	uint64_t t0_ = 0;
 	volatile uint32_t traps_ = 0;
+	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
 
+	const char *tag(void) const { return hawking_ ? "Hawking" : "Speaker"; }
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void free(void) APPLE_KEXT_OVERRIDE;
 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
@@ -223,7 +226,7 @@ IOAudio2Device::start(IOService *provider)
 	    page_size);
 	ring_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PA_RING_BYTES,
 	    page_size);
-	OSDictionary *stream = pa_stream();
+	OSDictionary *stream = pa_stream(false);
 	OSArray *outs = stream == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&stream, 1);
 	OSArray *ins = OSArray::withCapacity(1), *controls = OSArray::withCapacity(1);
 	if (lock_ == nullptr || status_ == nullptr || ring_ == nullptr || outs == nullptr || ins == nullptr ||
@@ -237,6 +240,55 @@ IOAudio2Device::start(IOService *provider)
 	}
 	bzero(status_->getBytesNoCopy(), PA_STATUS_BYTES);
 	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);
+	/*
+	 * 0292: a second instance (personality PandoraAudioRole = Hawking) is the iPhone's "Hawking" device, one input
+	 * stream. aud18 (VirtualAudio at trace level, speaker published after the ringer was on): the route to the speaker
+	 * is built ("Successfully Built concrete route { pap -> pspk }"), then dropped: the default device needs 8
+	 * alternate devices, Hawking (vhaw, category chaw) among them "Mandatory", and its route [ phki / pap ] has no
+	 * connected 'phki' port ("Recursion failed after skipping optional alternate VAD"), so the null device stays.
+	 * VirtualAudio's Device_Hawking_Aspen makes 'phki' ("Hawking Input") and an input volume control from the device
+	 * with UID "Hawking" (iPhone X: AppleSecondaryAudio "Hawking", /arm-io/mca4/mca4b/audio-codec-hawking). It is not
+	 * tied to the ringer and is published at once. Its input stays silent.
+	 */
+	OSString *role = OSDynamicCast(OSString, getProperty("PandoraAudioRole"));
+	hawking_ = role != nullptr && role->isEqualTo("Hawking");
+	if (hawking_) {
+		OSArray *t = outs;
+		outs = ins;
+		ins = t;
+		OSSafeReleaseNULL(stream);
+		stream = pa_stream(true);
+		if (stream == nullptr) {
+			IOLog("PANDORA AUDIO Hawking: no memory for the input stream\n");
+			OSSafeReleaseNULL(outs);
+			OSSafeReleaseNULL(ins);
+			OSSafeReleaseNULL(controls);
+			return false;
+		}
+		ins->replaceObject(0, stream);
+		setProperty("device UID", "Hawking");
+		setProperty("device name", "Hawking");
+		setProperty("device manufacturer", "Pandora");
+		setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);
+		setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
+		setProperty("io buffer frame size", PA_RING_FRAMES, 32);
+		setProperty("output latency", 0ull, 32);
+		setProperty("output safety offset", 0ull, 32);
+		setProperty("input latency", PA_OUT_LATENCY, 32);
+		setProperty("input safety offset", PA_OUT_SAFETY, 32);
+		setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
+		setProperty("output streams", outs);
+		setProperty("input streams", ins);
+		setProperty("controls", controls);
+		OSSafeReleaseNULL(stream);
+		OSSafeReleaseNULL(outs);
+		OSSafeReleaseNULL(ins);
+		OSSafeReleaseNULL(controls);
+		registerService();
+		IOLog("PANDORA AUDIO Hawking: registered: 1 input stream, %u Hz, %u channels, s32, ring %u frames\n", PA_RATE,
+		    PA_CHANNELS, PA_RING_FRAMES);
+		return true;
+	}
 	/* 0282: the UID VirtualAudio looks the speaker up by (aud1: HAL activated "PandoraBuiltInSpeaker" as device 33,
 	 * but VirtualAudio built no route to it). Its table of physical devices takes the iPhone's UIDs: "Codec"
 	 * (CS42L75: receiver, headphones, mics), "Speaker" (CS35L26), "Voice", "Reference", "Baseband Voice". */
@@ -319,7 +371,7 @@ IOAudio2Device::setProperties(OSObject *properties)
 		OSObject *v = d->getObject(k);
 		OSNumber *n = OSDynamicCast(OSNumber, v);
 		OSString *s = OSDynamicCast(OSString, v);
-		IOLog("PANDORA AUDIO: %s sets \"%s\" = %s%llu%s\n", name, k->getCStringNoCopy(),
+		IOLog("PANDORA AUDIO %s: %s sets \"%s\" = %s%llu%s\n", tag(), name, k->getCStringNoCopy(),
 		    n != nullptr ? "" : s != nullptr ? s->getCStringNoCopy() : v->getMetaClass()->getClassName(),
 		    n != nullptr ? n->unsigned64BitValue() : 0ull, n != nullptr ? "" : " (not a number)");
 		setProperty(k, v);
@@ -344,7 +396,7 @@ IOAudio2Device::newUserClient(task_t owningTask, void *securityID, UInt32 type, 
 		uc->release();
 		return kIOReturnError;
 	}
-	IOLog("PANDORA AUDIO: opened by %s (type %u)\n", uc->name_, (unsigned)type);
+	IOLog("PANDORA AUDIO %s: opened by %s (type %u)\n", tag(), uc->name_, (unsigned)type);
 	*handler = uc;
 	return kIOReturnSuccess;
 }
@@ -388,7 +440,7 @@ IOAudio2Device::clockThread(void)
 				peak = a > peak ? a : peak;
 				nonzero += s[i] != 0;
 			}
-			IOLog("PANDORA AUDIO: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u\n", n,
+			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u\n", tag(), n,
 			    peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_);
 		}
 	}
@@ -427,7 +479,7 @@ IOAudio2Device::startIO(void)
 		thread_on_ = false;
 	}
 	IOLockUnlock(lock_);
-	IOLog("PANDORA AUDIO: IO started (seed %llu)\n", seed_);
+	IOLog("PANDORA AUDIO %s: IO started (seed %llu)\n", tag(), seed_);
 	return running_ ? kIOReturnSuccess : kIOReturnNoResources;
 }
 
@@ -439,7 +491,7 @@ IOAudio2Device::stopIO(void)
 	running_ = false;
 	IOLockUnlock(lock_);
 	if (was) {
-		IOLog("PANDORA AUDIO: IO stopped\n");
+		IOLog("PANDORA AUDIO %s: IO stopped\n", tag());
 	}
 }
 
@@ -450,7 +502,7 @@ IOAudio2DeviceUserClient::clientClose(void)
 		device_->stopIO();
 		started_ = false;
 	}
-	IOLog("PANDORA AUDIO: closed by %s\n", name_);
+	IOLog("PANDORA AUDIO %s: closed by %s\n", device_ != nullptr ? device_->tag() : "?", name_);
 	terminate();
 	return kIOReturnSuccess;
 }
@@ -464,8 +516,9 @@ IOAudio2DeviceUserClient::setProperties(OSObject *properties)
 IOReturn
 IOAudio2DeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
 {
-	IOLog("PANDORA AUDIO: %s: notification port %s, type %u, ref %#llx\n", name_, port ? "set" : "cleared",
-	    (unsigned)type, (unsigned long long)refCon);
+	IOLog("PANDORA AUDIO %s: %s: notification port %s, type %u, ref %#llx\n",
+	    device_ != nullptr ? device_->tag() : "?", name_, port ? "set" : "cleared", (unsigned)type,
+	    (unsigned long long)refCon);
 	return kIOReturnSuccess;
 }
 
@@ -478,9 +531,9 @@ IOAudio2DeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options
 	} else if (device_ != nullptr && (type >> 28) == 1 && (type & 0x0fffffffu) == PA_STREAM_ID) {
 		md = device_->ring_;
 	}
-	IOLog("PANDORA AUDIO: %s maps type %#x (options %#x): %s\n", name_, (unsigned)type,
-	    options != nullptr ? (unsigned)*options : 0u, md == nullptr ? "refused" : (type >> 28) == 0 ?
-	    "engine status" : "IO buffer");
+	IOLog("PANDORA AUDIO %s: %s maps type %#x (options %#x): %s\n", device_ != nullptr ? device_->tag() : "?",
+	    name_, (unsigned)type, options != nullptr ? (unsigned)*options : 0u, md == nullptr ? "refused" :
+	    (type >> 28) == 0 ? "engine status" : "IO buffer");
 	if (md == nullptr) {
 		return kIOReturnBadArgument;
 	}
@@ -520,16 +573,17 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 {
 	if (device_ == nullptr || selector >= 13) {
-		IOLog("PANDORA AUDIO: %s: method %u refused\n", name_, selector);
+		IOLog("PANDORA AUDIO %s: %s: method %u refused\n", device_ != nullptr ? device_->tag() : "?", name_,
+		    selector);
 		return kIOReturnUnsupported;
 	}
 	uint64_t s[4] = {};
 	for (uint32_t i = 0; i < a->scalarInputCount && i < 4; i++) {
 		s[i] = a->scalarInput[i];
 	}
-	IOLog("PANDORA AUDIO: %s: method %u (%s): %u scalars %#llx %#llx %#llx, struct in %u, out %u scalars %u struct\n",
-	    name_, selector, pa_method_names[selector], a->scalarInputCount, s[0], s[1], s[2], a->structureInputSize,
-	    a->scalarOutputCount, a->structureOutputSize);
+	IOLog("PANDORA AUDIO %s: %s: method %u (%s): %u scalars %#llx %#llx %#llx, struct in %u, out %u scalars %u "
+	    "struct\n", device_->tag(), name_, selector, pa_method_names[selector], a->scalarInputCount, s[0], s[1], s[2],
+	    a->structureInputSize, a->scalarOutputCount, a->structureOutputSize);
 	IOReturn ret = kIOReturnSuccess;
 	switch (selector) {
 	case 2:                                                  /* set control value: echo the value */
@@ -544,9 +598,9 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 			uint32_t f[8];
 			memcpy(&rate_bits, b, 8);
 			memcpy(f, b + 8, 32);
-			IOLog("PANDORA AUDIO: %s: format of stream %llu: rate bits %#llx (48000.0 = 0x40e7700000000000) id %#x "
-			    "flags %#x %u B/packet %u frames/packet %u B/frame %u ch %u bits\n", name_, s[0], rate_bits, f[0],
-			    f[1], f[2], f[3], f[4], f[5], f[6]);
+			IOLog("PANDORA AUDIO %s: %s: format of stream %llu: rate bits %#llx (48000.0 = 0x40e7700000000000) "
+			    "id %#x flags %#x %u B/packet %u frames/packet %u B/frame %u ch %u bits\n", device_->tag(), name_, s[0],
+			    rate_bits, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
 		}
 		break;
 	case 8:
