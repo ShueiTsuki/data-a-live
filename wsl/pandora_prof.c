@@ -447,10 +447,158 @@ pprof_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
+/*
+ * 0313: where every thread of a process stands, the user call stack of each, for a process that hangs. Boot-arg
+ * pandora_stacks=NAME[,NAME...] (up to 4 processes), pandora_stacks_at (seconds after boot, default 60),
+ * pandora_stacks_every (seconds between snapshots, default 0: one). The sampler above takes only threads on a CPU, so
+ * a queue stuck in a wait never shows there; a thread blocked in the kernel keeps its user registers (get_user_regs),
+ * and its frame records are read from the task's map. Per snapshot: the task's images (pprof_images, for the
+ * addresses), then per thread "PANDORA STACKS NAME[pid] tid T st S hint H pc P lr L | returns..." (T as the unified
+ * log's thread_id; S the thread's state bits, H its block_hint: what it last blocked on). On user code that runs on a
+ * CPU at that moment the registers are its last kernel entry's.
+ */
+#define PSTACKS_NAMES   4
+#define PSTACKS_THREADS 256
+#define PSTACKS_DEPTH   24
+
+static char pstacks_names[PSTACKS_NAMES][PPROF_NAME + 1];
+static unsigned pstacks_count;
+static thread_t pstacks_threads[PSTACKS_THREADS];       /* the snapshot thread's only */
+
+static task_t
+pstacks_find(const char *name)
+{
+	task_t found = TASK_NULL, task;
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&tasks, task, task_t, tasks) {
+		void *p = get_bsdtask_info(task);
+		if (p != NULL && task->active && strncmp(proc_name_address(p), name, PPROF_NAME) == 0) {
+			task_reference(task);
+			found = task;
+			break;
+		}
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+	return found;
+}
+
+static void
+pstacks_dump(task_t task, const char *name)
+{
+	unsigned count = 0;
+	thread_t th;
+	task_lock(task);
+	queue_iterate(&task->threads, th, thread_t, task_threads) {
+		if (count == PSTACKS_THREADS) {
+			break;
+		}
+		thread_reference(th);
+		pstacks_threads[count++] = th;
+	}
+	task_unlock(task);
+	vm_map_t map = get_task_map_reference(task);
+	const int pid = task_pid(task);
+	printf("PANDORA STACKS %s[%d]: %u threads, main binary at %#llx\n", name, pid, count,
+	    (unsigned long long)task->mach_header_vm_address);
+	pprof_images(task);
+	for (unsigned i = 0; i < count; i++) {
+		th = pstacks_threads[i];
+		const arm_saved_state_t *u = get_user_regs(th);
+		uint64_t pc = 0, lr = 0, fp = 0;
+		if (u != NULL && is_saved_state64(u)) {
+			pc = get_saved_state_pc(u);
+			lr = get_saved_state_lr(u);
+			fp = get_saved_state_fp(u);
+		}
+		char line[480];
+		int n = snprintf(line, sizeof(line), "PANDORA STACKS %s[%d] tid %llu st %x hint %u pc %#llx lr %#llx |", name, pid,
+		    thread_tid(th), th->state, (unsigned)th->block_hint, pc, lr);
+		for (unsigned d = 0; map != VM_MAP_NULL && d < PSTACKS_DEPTH && fp != 0 && (fp & 7) == 0 &&
+		    n < (int)sizeof(line) - 20; d++) {
+			uint64_t rec[2];
+			if (vm_map_read_user(map, fp, rec, sizeof(rec)) != KERN_SUCCESS || rec[1] == 0) {
+				break;
+			}
+			n += snprintf(line + n, sizeof(line) - n, " %llx", rec[1]);
+			if (rec[0] <= fp) {
+				break;
+			}
+			fp = rec[0];
+		}
+		printf("%s\n", line);
+		thread_deallocate(th);
+	}
+	if (map != VM_MAP_NULL) {
+		vm_map_deallocate(map);
+	}
+}
+
+static void
+pstacks_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint32_t at = 60, every = 0;
+	PE_parse_boot_argn("pandora_stacks_at", &at, sizeof(at));
+	PE_parse_boot_argn("pandora_stacks_every", &every, sizeof(every));
+	for (;;) {
+		uint64_t now, ns;
+		clock_get_uptime(&now);
+		absolutetime_to_nanoseconds(now, &ns);
+		if (ns / NSEC_PER_SEC >= at) {
+			break;
+		}
+		delay(500000);
+	}
+	for (;;) {
+		for (unsigned i = 0; i < pstacks_count; i++) {
+			task_t task = pstacks_find(pstacks_names[i]);
+			if (task == TASK_NULL) {
+				printf("PANDORA STACKS %s: not running\n", pstacks_names[i]);
+				continue;
+			}
+			pstacks_dump(task, pstacks_names[i]);
+			task_deallocate(task);
+		}
+		if (every == 0) {
+			return;
+		}
+		for (uint32_t s = 0; s < every; s++) {
+			delay(1000000);
+		}
+	}
+}
+
+static void
+pstacks_start(void)
+{
+	char list[PSTACKS_NAMES * (PPROF_NAME + 1)];
+	if (!PE_parse_boot_arg_str("pandora_stacks", list, sizeof(list)) || list[0] == 0) {
+		return;
+	}
+	for (char *at = list; *at != 0 && pstacks_count < PSTACKS_NAMES;) {
+		size_t len = 0;
+		while (at[len] != 0 && at[len] != ',') {
+			len++;
+		}
+		strlcpy(pstacks_names[pstacks_count], at, (len < PPROF_NAME ? len : PPROF_NAME) + 1);
+		if (pstacks_names[pstacks_count][0] != 0) {
+			pstacks_count++;
+		}
+		at += len;
+		if (*at == ',') {
+			at++;
+		}
+	}
+	thread_t thread;
+	if (pstacks_count != 0 && kernel_thread_start_priority(pstacks_thread, NULL, BASEPRI_KERNEL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 void pandora_prof_start(void);
 void
 pandora_prof_start(void)
 {
+	pstacks_start();
 	if (!PE_parse_boot_arg_str("pandora_prof", pprof_name, sizeof(pprof_name)) || pprof_name[0] == 0) {
 		return;
 	}
