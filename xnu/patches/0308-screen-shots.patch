@@ -1,0 +1,283 @@
+diff --git a/bsd/dev/fuxi_keys.c b/bsd/dev/fuxi_keys.c
+index f77bf88..6746688 100644
+--- a/bsd/dev/fuxi_keys.c
++++ b/bsd/dev/fuxi_keys.c
+@@ -31,6 +31,9 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_key(int key, int down);
++#if defined(PANDORA)
++extern void pandora_shot_request(void);         /* bsd/dev/pandora_files.c (0308) */
++#endif
+ extern void fuxi_perf_input(void);
+ void fuxi_keys_init(void);
+ 
+@@ -603,6 +606,9 @@ fk_thread(void *arg, wait_result_t result)
+ 	static const char *names[3] = {"power", "volume-up", "volume-down"};
+ 	int state[3] = {0, 0, 0}, last[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++#if defined(PANDORA)
++	bool shot_chord = false;
++#endif
+ 	(void)arg;
+ 	(void)result;
+ #if defined(PANDORA)
+@@ -654,6 +660,15 @@ fk_thread(void *arg, wait_result_t result)
+ 				last[k] = now[k];
+ 			}
+ 		}
++#if defined(PANDORA)
++		/* 0308: volume up and volume down held together: one screen shot. The keys still go to iOS. */
++		const bool chord = state[1] && state[2];
++		if (chord && !shot_chord) {
++			printf("PANDORA KEYS: volume up + volume down: screen shot\n");
++			pandora_shot_request();
++		}
++		shot_chord = chord;
++#endif
+ 		fk_sleep(20);
+ 	}
+ out:
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+index 8a719e1..b94eedf 100644
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -10,6 +10,7 @@
+  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
+  * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
+  * Patch 0297: a "! - PATH" line removes the file PATH (a missing one counts as done).
++ * Patch 0308: screen shots on volume up and volume down held together (pandora_shot_request, below).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -250,6 +251,110 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Patch 0308: screen shots. Volume up and volume down held together (bsd/dev/fuxi_keys.c) save what is on screen
++ * (iokit/Kernel/arm/SweetFramebuffer.cpp pandora_shot_take: the frame the display pipes were last given, whole, or
++ * the panel memory when they read that) as /private/var/tmp/pandora_shot_N.bgra, N counting from 1 each boot: a
++ * 64-byte header ("PANDSHOT", version 1, width, height, N, uptime in ms), then the pixels, BGRA, tightly packed.
++ * A thread of its own writes them, so the key thread keeps polling. tools/shot_fetch.py makes PNGs of them.
++ */
++extern void *pandora_shot_take(uint32_t *len, uint32_t *w, uint32_t *h);
++extern void pandora_shot_free(void *p, uint32_t len);
++void pandora_shot_request(void);
++
++struct ps_head {
++	char magic[8];
++	uint32_t version, width, height, seq;
++	uint64_t uptime_ms;
++	uint8_t pad[32];
++};
++static uint32_t ps_req;
++static bool ps_started;
++
++static int
++ps_save(const char *path, const struct ps_head *hd, const void *px, uint32_t len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, 0644, 0, &vp, ctx), resid = 0;
++	if (error) {
++		return error;
++	}
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)hd, sizeof(*hd), 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (!error && !resid) {
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)px, (int)len, (off_t)sizeof(*hd), UIO_SYSSPACE, IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	if (!error && resid) {
++		error = EIO;
++	}
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return error ? error : cerr;
++}
++
++static void
++ps_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	uint32_t seen = 0, seq = 0;
++	for (;;) {
++		(void)assert_wait(&ps_req, THREAD_UNINT);
++		const uint32_t req = __atomic_load_n(&ps_req, __ATOMIC_ACQUIRE);
++		if (req == seen) {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++			continue;
++		}
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		seen = req;
++		const uint64_t t0 = mach_absolute_time();
++		uint32_t len = 0, w = 0, h = 0;
++		void *px = pandora_shot_take(&len, &w, &h);
++		if (px == NULL || rootvnode == NULLVP) {
++			printf("PANDORA SHOT: nothing to save (%s)\n", px == NULL ? "no frame" : "no root");
++			if (px != NULL) {
++				pandora_shot_free(px, len);
++			}
++			continue;
++		}
++		struct ps_head hd;
++		bzero(&hd, sizeof(hd));
++		memcpy(hd.magic, "PANDSHOT", 8);
++		hd.version = 1;
++		hd.width = w;
++		hd.height = h;
++		hd.seq = ++seq;
++		uint64_t ns, took;
++		absolutetime_to_nanoseconds(t0, &ns);
++		hd.uptime_ms = ns / NSEC_PER_MSEC;
++		char path[64];
++		snprintf(path, sizeof(path), "/private/var/tmp/pandora_shot_%u.bgra", seq);
++		const int error = ps_save(path, &hd, px, len);
++		pandora_shot_free(px, len);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &took);
++		printf("PANDORA SHOT: %u at %llu ms: %s, %ux%u, error %d, %llu ms\n", seq, hd.uptime_ms, path, w, h, error,
++		    took / NSEC_PER_MSEC);
++	}
++}
++
++/* From the key thread: one more shot; the thread starts with the first. */
++void
++pandora_shot_request(void)
++{
++	if (!ps_started) {
++		thread_t thread;
++		if (kernel_thread_start(ps_thread, NULL, &thread) != KERN_SUCCESS) {
++			printf("PANDORA SHOT: no thread\n");
++			return;
++		}
++		thread_deallocate(thread);
++		ps_started = true;
++	}
++	__atomic_add_fetch(&ps_req, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&ps_req);
++}
++
+ void
+ pandora_files_init(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index af3cfa4..51f4481 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,81 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #if defined(PANDORA)
+ extern "C" uint8_t *pandora_fbdump_begin(uint32_t *cap);       /* bsd/dev/sweet_ufs.c */
+ extern "C" void pandora_fbdump_commit(uint32_t len);
++
++/*
++ * 0308: screen shots (bsd/dev/pandora_files.c, on volume up + volume down). The frame the pipes were last given
++ * (scanPresent; held here until the next one), or the panel memory while the pipes read that, copied whole.
++ */
++static IOLock *pandora_shot_lock;
++static SweetSurface *pandora_shot_surface;      /* retained; NULL: the panel memory is on screen */
++static uintptr_t pandora_shot_panel;
++static uint32_t pandora_shot_panel_w, pandora_shot_panel_h, pandora_shot_panel_rb;
++
++static void
++pandora_shot_note(SweetSurface *s)
++{
++	if (pandora_shot_lock == NULL) {
++		return;
++	}
++	if (s != NULL) {
++		s->retain();
++	}
++	IOLockLock(pandora_shot_lock);
++	SweetSurface *old = pandora_shot_surface;
++	pandora_shot_surface = s;
++	IOLockUnlock(pandora_shot_lock);
++	if (old != NULL) {
++		old->release();
++	}
++}
++
++extern "C" void *pandora_shot_take(uint32_t *len, uint32_t *w, uint32_t *h);
++extern "C" void pandora_shot_free(void *p, uint32_t len);
++
++/* What is on screen as tightly packed BGRA (free it with pandora_shot_free), or NULL. */
++void *
++pandora_shot_take(uint32_t *len, uint32_t *w, uint32_t *h)
++{
++	if (pandora_shot_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(pandora_shot_lock);
++	SweetSurface *s = pandora_shot_surface;
++	if (s != NULL) {
++		s->retain();
++	}
++	IOLockUnlock(pandora_shot_lock);
++	uintptr_t base = pandora_shot_panel;
++	uint32_t width = pandora_shot_panel_w, height = pandora_shot_panel_h, rowBytes = pandora_shot_panel_rb;
++	if (s != NULL) {
++		base = s->kernelAddress();
++		base = base != 0 ? base + s->offset : 0;
++		width = s->width;
++		height = s->height;
++		rowBytes = s->bytesPerRow;
++	}
++	const uint64_t n = (uint64_t)width * height * 4;
++	uint8_t *out = NULL;
++	if (base != 0 && width != 0 && height != 0 && rowBytes >= width * 4 && n <= (64u << 20)) {
++		out = (uint8_t *)IOMallocData((vm_size_t)n);
++	}
++	for (uint32_t y = 0; out != NULL && y < height; y++) {
++		memcpy(out + (uint64_t)y * width * 4, (const void *)(base + (uint64_t)y * rowBytes), (size_t)width * 4);
++	}
++	OSSafeReleaseNULL(s);
++	if (out != NULL) {
++		*len = (uint32_t)n;
++		*w = width;
++		*h = height;
++	}
++	return out;
++}
++
++void
++pandora_shot_free(void *p, uint32_t len)
++{
++	IOFreeData(p, len);
++}
+ extern "C" void pandora_dpu_probe(uint64_t fb);                 /* bsd/dev/pandora_dpu.c (0215) */
+ /* bsd/dev/pandora_dpu.c (0217): the pipes scan out a surface themselves. */
+ extern "C" int pandora_scanout_init(void);
+@@ -937,6 +1012,13 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++#if defined(PANDORA)
++	pandora_shot_lock = IOLockAlloc();
++	pandora_shot_panel = fPixels;
++	pandora_shot_panel_w = fWidth;
++	pandora_shot_panel_h = fHeight;
++	pandora_shot_panel_rb = fRowBytes;
++#endif
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -1389,6 +1471,9 @@ AppleCLCD::scanPresent(const uint8_t *rec, uint32_t mask)
+ 	sweet_scan_hold(s);
+ 	fScanQueued = s;
+ 	fScanQueuedAddr = iova + s->offset;
++#if defined(PANDORA)
++	pandora_shot_note(s);
++#endif
+ 	fScanToPanel = false;
+ 	s->release();
+ 	return true;
+@@ -1415,6 +1500,9 @@ AppleCLCD::scanTick(void)
+ 			sweet_scan_drop(&fScanShown);
+ 			sweet_scan_drop(&fScanQueued);
+ 			fScanToPanel = false;
++#if defined(PANDORA)
++			pandora_shot_note(NULL);
++#endif
+ 		}
+ 		return;
+ 	}

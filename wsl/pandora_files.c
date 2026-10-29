@@ -10,6 +10,7 @@
  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
  * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
  * Patch 0297: a "! - PATH" line removes the file PATH (a missing one counts as done).
+ * Patch 0308: screen shots on two keys held together (pandora_shot_request, below).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -248,6 +249,111 @@ out:
 	}
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
+ * Patch 0308: screen shots. Two of the three keys held together (bsd/dev/fuxi_keys.c; 0309: any two, the iPhone's
+ * and Android's screen shot keys included) save what is on screen
+ * (iokit/Kernel/arm/SweetFramebuffer.cpp pandora_shot_take: the frame the display pipes were last given, whole, or
+ * the panel memory when they read that) as /private/var/tmp/pandora_shot_N.bgra, N counting from 1 each boot: a
+ * 64-byte header ("PANDSHOT", version 1, width, height, N, uptime in ms), then the pixels, BGRA, tightly packed.
+ * A thread of its own writes them, so the key thread keeps polling. tools/shot_fetch.py makes PNGs of them.
+ */
+extern void *pandora_shot_take(uint32_t *len, uint32_t *w, uint32_t *h);
+extern void pandora_shot_free(void *p, uint32_t len);
+void pandora_shot_request(void);
+
+struct ps_head {
+	char magic[8];
+	uint32_t version, width, height, seq;
+	uint64_t uptime_ms;
+	uint8_t pad[32];
+};
+static uint32_t ps_req;
+static bool ps_started;
+
+static int
+ps_save(const char *path, const struct ps_head *hd, const void *px, uint32_t len)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int error = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, 0644, 0, &vp, ctx), resid = 0;
+	if (error) {
+		return error;
+	}
+	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)hd, sizeof(*hd), 0, UIO_SYSSPACE, 0,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	if (!error && !resid) {
+		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)px, (int)len, (off_t)sizeof(*hd), UIO_SYSSPACE, IO_SYNC,
+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	}
+	if (!error && resid) {
+		error = EIO;
+	}
+	int cerr = vnode_close(vp, FWRITE, ctx);
+	return error ? error : cerr;
+}
+
+static void
+ps_thread(void *arg, wait_result_t result)
+{
+	(void)arg;
+	(void)result;
+	uint32_t seen = 0, seq = 0;
+	for (;;) {
+		(void)assert_wait(&ps_req, THREAD_UNINT);
+		const uint32_t req = __atomic_load_n(&ps_req, __ATOMIC_ACQUIRE);
+		if (req == seen) {
+			(void)thread_block(THREAD_CONTINUE_NULL);
+			continue;
+		}
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		seen = req;
+		const uint64_t t0 = mach_absolute_time();
+		uint32_t len = 0, w = 0, h = 0;
+		void *px = pandora_shot_take(&len, &w, &h);
+		if (px == NULL || rootvnode == NULLVP) {
+			printf("PANDORA SHOT: nothing to save (%s)\n", px == NULL ? "no frame" : "no root");
+			if (px != NULL) {
+				pandora_shot_free(px, len);
+			}
+			continue;
+		}
+		struct ps_head hd;
+		bzero(&hd, sizeof(hd));
+		memcpy(hd.magic, "PANDSHOT", 8);
+		hd.version = 1;
+		hd.width = w;
+		hd.height = h;
+		hd.seq = ++seq;
+		uint64_t ns, took;
+		absolutetime_to_nanoseconds(t0, &ns);
+		hd.uptime_ms = ns / NSEC_PER_MSEC;
+		char path[64];
+		snprintf(path, sizeof(path), "/private/var/tmp/pandora_shot_%u.bgra", seq);
+		const int error = ps_save(path, &hd, px, len);
+		pandora_shot_free(px, len);
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &took);
+		printf("PANDORA SHOT: %u at %llu ms: %s, %ux%u, error %d, %llu ms\n", seq, hd.uptime_ms, path, w, h, error,
+		    took / NSEC_PER_MSEC);
+	}
+}
+
+/* From the key thread: one more shot; the thread starts with the first. */
+void
+pandora_shot_request(void)
+{
+	if (!ps_started) {
+		thread_t thread;
+		if (kernel_thread_start(ps_thread, NULL, &thread) != KERN_SUCCESS) {
+			printf("PANDORA SHOT: no thread\n");
+			return;
+		}
+		thread_deallocate(thread);
+		ps_started = true;
+	}
+	__atomic_add_fetch(&ps_req, 1, __ATOMIC_RELEASE);
+	thread_wakeup(&ps_req);
 }
 
 void

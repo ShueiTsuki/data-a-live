@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/fuxi_keys.c b/bsd/dev/fuxi_keys.c
+index 6746688..d981da4 100644
+--- a/bsd/dev/fuxi_keys.c
++++ b/bsd/dev/fuxi_keys.c
+@@ -661,10 +661,12 @@ fk_thread(void *arg, wait_result_t result)
+ 			}
+ 		}
+ #if defined(PANDORA)
+-		/* 0308: volume up and volume down held together: one screen shot. The keys still go to iOS. */
+-		const bool chord = state[1] && state[2];
++		/* 0308: two keys held together: one screen shot (0309: any two; power + volume up is the iPhone's, power +
++		 * volume down Android's). The keys still go to iOS. */
++		const bool chord = state[0] + state[1] + state[2] >= 2;
+ 		if (chord && !shot_chord) {
+-			printf("PANDORA KEYS: volume up + volume down: screen shot\n");
++			printf("PANDORA KEYS: %s%s%s: screen shot\n", state[0] ? "power " : "", state[1] ? "volume-up " : "",
++			    state[2] ? "volume-down" : "");
+ 			pandora_shot_request();
+ 		}
+ 		shot_chord = chord;
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+index b94eedf..49d3383 100644
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -10,7 +10,7 @@
+  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
+  * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
+  * Patch 0297: a "! - PATH" line removes the file PATH (a missing one counts as done).
+- * Patch 0308: screen shots on volume up and volume down held together (pandora_shot_request, below).
++ * Patch 0308: screen shots on two keys held together (pandora_shot_request, below).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -252,7 +252,8 @@ out:
+ }
+ 
+ /*
+- * Patch 0308: screen shots. Volume up and volume down held together (bsd/dev/fuxi_keys.c) save what is on screen
++ * Patch 0308: screen shots. Two of the three keys held together (bsd/dev/fuxi_keys.c; 0309: any two, the iPhone's
++ * and Android's screen shot keys included) save what is on screen
+  * (iokit/Kernel/arm/SweetFramebuffer.cpp pandora_shot_take: the frame the display pipes were last given, whole, or
+  * the panel memory when they read that) as /private/var/tmp/pandora_shot_N.bgra, N counting from 1 each boot: a
+  * 64-byte header ("PANDSHOT", version 1, width, height, N, uptime in ms), then the pixels, BGRA, tightly packed.

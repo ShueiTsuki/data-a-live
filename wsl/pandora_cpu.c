@@ -69,6 +69,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void IOSleep(unsigned int milliseconds);
 extern processor_t thread_bind(processor_t processor);   /* kern/sched_prim.h, not exported to BSD */
 extern uint64_t pandora_cpu_idle_mach(int cpu);            /* osfmk/arm/pandora_cpu_idle.c */
+extern bool pandora_cpu_started(int cpu);                   /* osfmk/arm/pandora_cpu_idle.c (0312) */
 extern void pandora_perfctl_start(void);                    /* osfmk/arm/pandora_perfctl.c */
 extern void pandora_perfctl_log(void);
 extern void pandora_idle_start(void);                       /* osfmk/arm/pandora_cpu_idle.c (0215) */
@@ -261,6 +262,9 @@ cpu_clock_mhz(void)
 static uint32_t
 cpu_clock_on(int cpu)
 {
+	if (!pandora_cpu_started(cpu)) {
+		return 0;
+	}
 	processor_t p = cpu_to_processor(cpu);
 	if (p == PROCESSOR_NULL) {
 		return 0;

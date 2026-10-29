@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 69102d8..b65b518 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1016,6 +1016,48 @@ IOSurfaceRootUserClient::trapUnuseCount(void *id, __unused void *category, void
+ 	return useCount((uint32_t)(uintptr_t)id, -1);
+ }
+ 
++/* 0310: who calls traps 0/1. HOW: 0 not this client's surface, 1 counted, 2 a decrement with nothing to drop. */
++static void
++sweet_use_note(uint32_t id, int delta, int how, uint32_t uses)
++{
++	static struct {
++		char name[20];
++		uint32_t inc, dec, missed;
++	} who[8];
++	static uint32_t calls;
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	IOLockLock(sweet_surface_lock);
++	const uint32_t n = ++calls;
++	unsigned i = 0;
++	while (i < 8 && who[i].name[0] != 0 && strncmp(who[i].name, name, sizeof(name)) != 0) {
++		i++;
++	}
++	if (i == 8) {
++		i = 7;                          /* the last row takes everyone else */
++	} else if (who[i].name[0] == 0) {
++		strlcpy(who[i].name, name, sizeof(who[i].name));
++	}
++	if (how != 1) {
++		who[i].missed++;
++	} else if (delta > 0) {
++		who[i].inc++;
++	} else {
++		who[i].dec++;
++	}
++	if (n <= 40) {
++		IOLog("SWEET SURF: use %u: %s surface %u %+d -> %s, its uses %u\n", n, name, id, delta,
++		    how == 0 ? "not its surface" : how == 1 ? "counted" : "nothing to drop", uses);
++	}
++	if (n % 1000 == 0) {
++		for (unsigned k = 0; k < 8 && who[k].name[0] != 0; k++) {
++			IOLog("SWEET SURF: uses after %u calls: %s +%u -%u missed %u\n", n, who[k].name, who[k].inc, who[k].dec,
++			    who[k].missed);
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::useCount(uint32_t id, int delta)
+ {
+@@ -1023,15 +1065,19 @@ IOSurfaceRootUserClient::useCount(uint32_t id, int delta)
+ 	SweetSurfaceRef *ref = findRef(id, NULL);
+ 	if (ref == NULL) {
+ 		IOLockUnlock(fLock);
++		sweet_use_note(id, delta, 0, 0);
+ 		return kIOReturnNotFound;
+ 	}
+ 	if (delta < 0 && ref->uses == 0) {
+ 		IOLockUnlock(fLock);
++		sweet_use_note(id, delta, 2, 0);
+ 		return kIOReturnSuccess;   /* more decrements than increments: nothing of ours to drop */
+ 	}
+ 	ref->uses += delta;
+ 	sweet_surface_use(ref->surface, delta);
++	const uint32_t uses = ref->uses;
+ 	IOLockUnlock(fLock);
++	sweet_use_note(id, delta, 1, uses);
+ 	return kIOReturnSuccess;
+ }
+ 

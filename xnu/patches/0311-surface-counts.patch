@@ -1,0 +1,155 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b65b518..dffadb4 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -73,6 +73,46 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++
++/* 0311: per-process counts of what is done with surfaces; a summary every 300 calls. */
++enum { SN_CREATE, SN_LOCK, SN_UNLOCK, SN_UNLOCK_RO, SN_USE_INC, SN_USE_DEC, SN_USE_MISSED, SN_KINDS };
++static IOLock *sweet_note_lock;
++
++/* Counts KIND for the calling process; true when the caller is Settings (Preferences). */
++static bool
++sweet_note(unsigned kind)
++{
++	static struct {
++		char name[20];
++		uint32_t n[SN_KINDS];
++	} who[10];
++	static uint32_t calls;
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	if (sweet_note_lock == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_note_lock);
++	unsigned i = 0;
++	while (i < 10 && who[i].name[0] != 0 && strncmp(who[i].name, name, sizeof(name)) != 0) {
++		i++;
++	}
++	if (i == 10) {
++		i = 9;                          /* the last row takes everyone else */
++	} else if (who[i].name[0] == 0) {
++		strlcpy(who[i].name, name, sizeof(who[i].name));
++	}
++	who[i].n[kind]++;
++	if (++calls % 300 == 0) {
++		for (unsigned k = 0; k < 10 && who[k].name[0] != 0; k++) {
++			IOLog("SWEET SURF: after %u: %s create %u lock %u unlock %u (read-only %u) use +%u -%u missed %u\n", calls,
++			    who[k].name, who[k].n[SN_CREATE], who[k].n[SN_LOCK], who[k].n[SN_UNLOCK], who[k].n[SN_UNLOCK_RO],
++			    who[k].n[SN_USE_INC], who[k].n[SN_USE_DEC], who[k].n[SN_USE_MISSED]);
++		}
++	}
++	IOLockUnlock(sweet_note_lock);
++	return strcmp(name, "Preferences") == 0;
++}
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+@@ -380,6 +420,12 @@ sweet_surface_init_lock(void)
+ 			IOLockFree(lock);
+ 		}
+ 	}
++	if (sweet_note_lock == NULL) {
++		IOLock *lock = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, lock, &sweet_note_lock)) {
++			IOLockFree(lock);
++		}
++	}
+ }
+ 
+ static SweetSurface *
+@@ -921,10 +967,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
++	static uint32_t prefsCreates;
++	const bool prefs = sweet_note(SN_CREATE) && prefsCreates < 40;
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64 || prefs) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		sweet_surface_creates_logged++;
++		if (prefs) {
++			prefsCreates++;
++		} else {
++			sweet_surface_creates_logged++;
++		}
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+@@ -1020,42 +1072,9 @@ IOSurfaceRootUserClient::trapUnuseCount(void *id, __unused void *category, void
+ static void
+ sweet_use_note(uint32_t id, int delta, int how, uint32_t uses)
+ {
+-	static struct {
+-		char name[20];
+-		uint32_t inc, dec, missed;
+-	} who[8];
+-	static uint32_t calls;
+-	char name[20];
+-	proc_selfname(name, sizeof(name));
+-	IOLockLock(sweet_surface_lock);
+-	const uint32_t n = ++calls;
+-	unsigned i = 0;
+-	while (i < 8 && who[i].name[0] != 0 && strncmp(who[i].name, name, sizeof(name)) != 0) {
+-		i++;
+-	}
+-	if (i == 8) {
+-		i = 7;                          /* the last row takes everyone else */
+-	} else if (who[i].name[0] == 0) {
+-		strlcpy(who[i].name, name, sizeof(who[i].name));
+-	}
+-	if (how != 1) {
+-		who[i].missed++;
+-	} else if (delta > 0) {
+-		who[i].inc++;
+-	} else {
+-		who[i].dec++;
+-	}
+-	if (n <= 40) {
+-		IOLog("SWEET SURF: use %u: %s surface %u %+d -> %s, its uses %u\n", n, name, id, delta,
+-		    how == 0 ? "not its surface" : how == 1 ? "counted" : "nothing to drop", uses);
+-	}
+-	if (n % 1000 == 0) {
+-		for (unsigned k = 0; k < 8 && who[k].name[0] != 0; k++) {
+-			IOLog("SWEET SURF: uses after %u calls: %s +%u -%u missed %u\n", n, who[k].name, who[k].inc, who[k].dec,
+-			    who[k].missed);
+-		}
+-	}
+-	IOLockUnlock(sweet_surface_lock);
++	(void)id;
++	(void)uses;
++	(void)sweet_note(how != 1 ? SN_USE_MISSED : delta > 0 ? SN_USE_INC : SN_USE_DEC);
+ }
+ 
+ IOReturn
+@@ -1124,6 +1143,12 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+  }
+ #endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	static uint32_t prefsLocks;
++	if (sweet_note(SN_LOCK) && prefsLocks < 60) {
++		prefsLocks++;
++		IOLog("SWEET SURF: Preferences lock %u options %#lx seed %u\n", s->id, (unsigned long)(uintptr_t)options,
++		    *sweet_surface_seed(s));
++	}
+ 	s->release();
+ 	return ret;
+ }
+@@ -1141,6 +1166,12 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ #endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	static uint32_t prefsUnlocks;
++	if (sweet_note((uintptr_t)options & kIOSurfaceLockReadOnly ? SN_UNLOCK_RO : SN_UNLOCK) && prefsUnlocks < 60) {
++		prefsUnlocks++;
++		IOLog("SWEET SURF: Preferences unlock %u options %#lx seed %u\n", s->id, (unsigned long)(uintptr_t)options,
++		    *sweet_surface_seed(s));
++	}
+ 	s->release();
+ 	return ret;
+ }

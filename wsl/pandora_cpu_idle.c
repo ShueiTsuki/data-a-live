@@ -6,12 +6,24 @@
 #include <kern/recount.h>
 #include <kern/clock.h>
 #include <kern/misc_protos.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+
+/* Patch 0312: whether CPU was started (boot-arg cpus may start fewer than the phone's 8; cpu_to_processor asserts). */
+bool pandora_cpu_started(int cpu);
+bool
+pandora_cpu_started(int cpu)
+{
+	return cpu >= 0 && cpu <= ml_get_max_cpu_number();
+}
 
 uint64_t pandora_cpu_idle_mach(int cpu);
 uint64_t
 pandora_cpu_idle_mach(int cpu)
 {
+	if (!pandora_cpu_started(cpu)) {
+		return 0;
+	}
 	processor_t p = cpu_to_processor(cpu);
 	if (p == PROCESSOR_NULL) {
 		return 0;
