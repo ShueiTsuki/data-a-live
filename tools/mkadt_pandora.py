@@ -15,6 +15,8 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            /chosen pandora-log-extents + pandora-log-blocks, same layout.
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
+  --amp                cores 0-5 as the E cluster and 6-7 as the P cluster (kernels with patch 0320
+           only; others assert on a second cluster).
   --gpu-pool MIB       carve MIB MiB below the panic log off the RAM given to XNU for the GPU
            buffer pool (pandora_gpu.c): /chosen pandora-gpu-pool = <u64 base, u64 size>.
            XNU never manages those pages, so mapping them by physical address is plain.
@@ -173,7 +175,7 @@ def empty_nvram_proxy():
             ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
 
 
-def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
+def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0, amp=False):
     """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     fb, fb_size, fb_w, fb_h, fb_stride = ((QEMU_FB, QEMU_FB_SIZE, QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE)
@@ -260,17 +262,21 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
 
     # Eight Oryon cores in DT order with their real MPIDRs, described as one homogeneous
     # cluster like ios-sweet (no AMP code paths). cpus=N selects a prefix.
+    # amp (--amp, kernels with patch 0320 only): the six performance cores as the E cluster and the
+    # two prime cores as the P cluster ("cluster-type" 'E'/'P', which ml_parse_cpu_topology reads
+    # and turns into clusters 0 and 1). A kernel built for one cluster asserts on cluster 1.
     # QEMU keeps a single CPU (MPIDR 0).
     cpu_nodes = []
     for core in range(1 if qemu or qemu_gic else len(MPIDRS)):
+        prime = core >= 6
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,sm8850-cpu') + cstr('ARM,v8')),
             ('reg', u32(MPIDRS[core])),  # actual MPIDR, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-id', u32(int(prime) if amp else 0)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-type', u32(ord('P' if prime else 'E') if amp else 0)),  # 0: CLUSTER_TYPE_SMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
@@ -422,7 +428,8 @@ if __name__ == '__main__':
     pool = int(opt('--gpu-pool'), 0) << 20 if opt('--gpu-pool') else 0
     if pool:
         print(f'gpu pool: {pool >> 20} MiB', file=sys.stderr)
-    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props, gpu_pool=pool)
+    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props, gpu_pool=pool,
+                 amp='--amp' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

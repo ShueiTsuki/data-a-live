@@ -1,6 +1,6 @@
 /*
- * PANDORA performance-controller signals (patch 0205), boot-arg pandora_perfctl (default 1; 0 = off). Read only:
- * it counts and logs, nothing is changed.
+ * PANDORA performance-controller signals (patch 0205), boot-arg pandora_perfctl (default 1; 0 = off). It counts and
+ * logs; since 0320 it also places thread groups on the two clusters (P-spill, below).
  *
  * On an iPhone, Apple's performance controller (CLPC) sets the clocks and which cores each thread group may use.
  * xnu tells it what runs through sched_perfcontrol_register_callbacks (osfmk/arm/machine_routines_common.c):
@@ -177,8 +177,32 @@ pctl_work_interval_ctl(__unused perfcontrol_state_t state, perfcontrol_work_inte
 	}
 }
 
+/*
+ * 0320: P-spill. With two clusters (patch 0320's board config, a device tree from mkadt_pandora.py --amp: the six
+ * Oryon performance cores as the E cluster, the two prime cores as the P cluster) the scheduler is Apple's Edge
+ * scheduler, and its defaults leave placement to the performance controller: every thread group prefers the boot
+ * cluster (E) and E-to-P migration is off, so nothing would run on the prime cores. Without dynamic control
+ * Apple's CLPC recommends "P-spill" (osfmk/kern/thread_group.c, sched_perfcontrol_thread_group_recommend): each
+ * thread group prefers P for its fixed-priority, UI, user-initiated and default work and spills to E when P is busy
+ * and E has a CPU free (the P-to-E edge allows it); utility and background work stays on E
+ * (sched_edge_restrict_ut / _bg). This is that recommendation, made as each thread group is created; registering
+ * makes it for the groups that already exist (thread_group_resync). Boot-arg pandora_pspill=0 leaves the defaults.
+ */
+static bool pctl_pspill;
+static uint64_t pctl_recommended;
+
+static void
+pctl_tg_init(thread_group_data_t data)
+{
+	if (pctl_pspill && data->thread_group_data != NULL) {
+		sched_perfcontrol_thread_group_recommend(data->thread_group_data, CLUSTER_TYPE_P);
+		os_atomic_inc(&pctl_recommended, relaxed);
+	}
+}
+
 static struct sched_perfcontrol_callbacks pctl_callbacks = {
 	.version = SCHED_PERFCONTROL_CALLBACKS_VERSION_8,   /* up to work_interval_ctl; 9 would hand us shared-resource flags */
+	.thread_group_init = pctl_tg_init,
 	.work_interval_notify = pctl_work_interval_notify,
 	.csw = pctl_csw,
 	.work_interval_ctl = pctl_work_interval_ctl,
@@ -193,8 +217,18 @@ pandora_perfctl_start(void)
 	if (!on) {
 		return;
 	}
+	const ml_topology_info_t *t = ml_get_topology_info();
+	int pspill = 1;
+	(void)PE_parse_boot_argn("pandora_pspill", &pspill, sizeof(pspill));
+	pctl_pspill = pspill && t != NULL && t->num_clusters == 2 &&
+	    t->cluster_types == ((1u << CLUSTER_TYPE_E) | (1u << CLUSTER_TYPE_P));
 	sched_perfcontrol_register_callbacks(&pctl_callbacks, 0);
-	printf("PANDORA PCTL: registered as the performance controller (counting only)\n");
+	printf("PANDORA PCTL: registered as the performance controller (%s)\n",
+	    pctl_pspill ? "P-spill thread group placement" : "counting only");
+	if (pctl_pspill) {
+		printf("PANDORA PCTL: P-spill: %llu thread groups so far prefer the P cluster\n",
+		    (unsigned long long)os_atomic_load(&pctl_recommended, relaxed));
+	}
 }
 
 static const char *const pctl_class_names[PERFCONTROL_CLASS_MAX] = {

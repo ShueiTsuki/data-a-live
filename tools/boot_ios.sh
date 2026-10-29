@@ -87,6 +87,11 @@ fi
 if [ -n "${GPUPOOL:-}" ]; then
 	ADTFLAGS="$ADTFLAGS --gpu-pool $GPUPOOL"
 fi
+# AMP=1 (environment): the cores as two clusters, E (0-5) and P (6-7) (mkadt_pandora.py --amp). Only with a kernel
+# that has patch 0320; an older one asserts on the second cluster.
+if [ "${AMP:-0}" = 1 ]; then
+	ADTFLAGS="$ADTFLAGS --amp"
+fi
 # Wall clock (patch 0214): the PMK8850 RTC only counts and Android keeps wall time as that count plus an
 # offset of its own, in encrypted storage. Measure the offset here; the kernel adds it to the RTC.
 read -r rtc_count android_now <<< "$(su "cat /sys/class/rtc/rtc0/since_epoch; date +%s" | tr '\n' ' ')"
