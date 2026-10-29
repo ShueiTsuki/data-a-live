@@ -671,6 +671,10 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 	case 8:
 		ret = kIOReturnUnsupported;
 		break;
+	case 0:
+	/* 0294: aud20: the default device routed to us, the plug-in sound 1106 starts IO with method 0 (engine start)
+	 * and no method 10; HAL waits for the first zero time stamp, gives up after 5 s ("the IO thread failed to start,
+	 * Error: 'nope'") and sends method 1. The clock starts with either. */
 	case 10:
 		ret = device_->startIO();
 		started_ = ret == kIOReturnSuccess;
@@ -678,6 +682,7 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 			a->scalarOutput[0] = 0;
 		}
 		break;
+	case 1:
 	case 11:
 		device_->stopIO();
 		started_ = false;
