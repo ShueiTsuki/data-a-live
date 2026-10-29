@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index ca8cedf..1c5fcd5 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -700,7 +700,12 @@ smmu_ctx_up(const char *who, struct smmu_ctx *c, struct gmu_buf *bufs, unsigned
+ 	}
+ 	gpu_step("SMMU: ACTLR, then program and enable the context");
+ 	gpu_wr(smmu, (uint32_t)cb + 4, GMU_ACTLR);
+-	c->ctx = (ArmSmmu4KContextConfig){ &c->tcfg, NULL, &c->tables, NULL, id0, id2, asid, 0, 0, 0 };
++	/* 0316: faults terminate the faulting access only (SCTLR.HUPCF, continue_after_fault). With HUPCF 0 every
++	 * later access of the context was terminated too until the fault was cleared, which the watch thread does
++	 * every 5 s: the GPU could not even fetch commands and hung for good (post6, post9: a compute dispatch of the
++	 * Astronomy poster read address 0). Linux's arm-smmu-qcom sets HUPCF on the Adreno SMMU's contexts for the
++	 * same reason ("keep the GPU from hanging"). */
++	c->ctx = (ArmSmmu4KContextConfig){ &c->tcfg, NULL, &c->tables, NULL, id0, id2, asid, 0, 0, 1 };
+ 	st = ArmSmmu4KProgramDisabledContext(&smmu_io, bank, &c->ctx, 1000, &c->prog);
+ 	printf("PANDORA GPU: %s SMMU context: status %d phase %u writes %u enabled %u fsr %08x actlr %08x sctlr %08x "
+ 	    "tcr %08x ttbr0 %#llx mair0 %08x\n", who, st, c->prog.phase, c->prog.writes, c->prog.enabled,
