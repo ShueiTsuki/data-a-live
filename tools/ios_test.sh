@@ -15,7 +15,9 @@ export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 RUN=$2 SECS=$3 EXTRA=${4:-}
-BASE="ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=${SWEETFB_HZ:-30} sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2"
+# NOEXEC: the daemons the kernel refuses to start (patch 0095). With fairplayd.H2 refused, locationd's FairPlay signer
+# waits for it forever and its SPI service with it (post3); NOEXEC=bluetoothd lets it run.
+BASE="ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=${SWEETFB_HZ:-30} sweetfb_fill=1 sweetnoexec=${NOEXEC-bluetoothd,fairplayd.H2}"
 mkdir -p "$ROOT/device/logs"
 bash "$ROOT/tools/boot_ios.sh" --file /data/local/tmp/iosroot.img --run "$RUN" --rd ufsroot0 --check hfsx \
 	--log /data/local/tmp/ioslog.img --debug 0x8 ${FW:+--fw "$FW"} ${CPUS:+--cpus "$CPUS"} \
