@@ -1,0 +1,61 @@
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index b544bf3..03fd05f 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -37,9 +37,14 @@
+ #include <kern/work_interval.h>
+ 
+ #include <libkern/libkern.h>
+-
+-int
+-work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
++#if defined(PANDORA)
++#include <sys/proc.h>
++#include <sys/systm.h>
++#include <os/atomic_private.h>
++#endif
++
++static int
++work_interval_ctl_inner(__unused proc_t p, struct work_interval_ctl_args *uap,
+     __unused int32_t *retval)
+ {
+ 	uint32_t        operation = uap->operation;
+@@ -271,3 +276,38 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(PANDORA)
++/*
++ * 0321: which processes create work intervals, with what flags, and what they get: every create, the first 200;
++ * other operations only when they fail, the first 100. CoreAnimation's render server should create one per display
++ * (CA_RENDER_SERVER with a thread group, 0x20000002) and report each frame through it.
++ */
++static uint32_t pandora_wi_creates, pandora_wi_fails;
++#endif
++
++int
++work_interval_ctl(proc_t p, struct work_interval_ctl_args *uap, int32_t *retval)
++{
++	const int error = work_interval_ctl_inner(p, uap, retval);
++#if defined(PANDORA)
++	char name[32];
++	if (uap->operation == WORK_INTERVAL_OPERATION_CREATE2 || uap->operation == WORK_INTERVAL_OPERATION_CREATE) {
++		if (os_atomic_inc(&pandora_wi_creates, relaxed) <= 200) {
++			struct work_interval_create_params params = {};
++			if (uap->arg != USER_ADDR_NULL && uap->len >= sizeof(params)) {
++				(void)copyin(uap->arg, &params, sizeof(params));
++			}
++			proc_selfname(name, sizeof(name));
++			printf("PANDORA WI: %s[%d] tid %llu create op %u flags %#x -> %d (id %llu port %#x)\n", name,
++			    proc_selfpid(), thread_tid(current_thread()), uap->operation, params.wicp_create_flags, error,
++			    params.wicp_id, params.wicp_port);
++		}
++	} else if (error != 0 && os_atomic_inc(&pandora_wi_fails, relaxed) <= 100) {
++		proc_selfname(name, sizeof(name));
++		printf("PANDORA WI: %s[%d] op %u id %#llx -> %d\n", name, proc_selfpid(), uap->operation,
++		    uap->work_interval_id, error);
++	}
++#endif
++	return error;
++}
