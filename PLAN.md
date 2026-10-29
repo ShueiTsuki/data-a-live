@@ -421,7 +421,10 @@
   - 上电顺序（cap3 timeline_on.txt）：RPMh 打开 MMCX、MX 电压；带宽投票 chm_apps→qhs_venus_cfg（配置）、qnm_video_mvp→qns_llcc、llcc_mc→ebi（内存）；videocc（0x20f0000）GDSC iris-ctl 0x814c 清 bit0 后轮询 0x8150；gcc 0x3202c（video_axi1）置 bit0；PLL0 0x0；mvs0c RCG 0x8048/0x804c；分支 0x8174（mvs0c_freerun）、0x8164（mvs0c）；GDSC vcodec 0x80a8、vpp0 0x8120、vpp1 0x80f4（再切软件控制）；gcc 0x32018（video_axi0）；PLL1 0x1000、mvs0 RCG 0x8030/0x8034、分支 0x80e0、0x80d0；PLL2 0x2000、mvs0b RCG 0x8018、分支 0x80bc；0x8134（vpp0）、0x8108（vpp1）；apv、mvs0a。视频核时钟 240 MHz / 630 MHz。
   - 核内寄存器（基址 0x02000000）：首次上电写一组预设（0xb0088、0x13030-0x13848 等，reg_preset_table）；0xb0010 读 0xff 写 0xf3；0xa0064=0xff900000、0xa0068=0x300000（共享队列 3 MiB 的设备地址和大小）、0xa0054=0xff900000、0xa0050=1、0xa0060=0xffbfe000（固件出错原因）、0xa005c=0xffbff001、0xb0078=1、0xa0048=1（启动），轮询 0xa004c 到 0x40000001，不到 1 ms。
   - 断电（timeline_off.txt）大体倒序：vpp1/vpp0/vcodec 的 GDSC 置 bit0 和分支关，PLL2 关，iris-ctl，gcc 两个 AXI，mvs0c/mvs0 分支和 RCG。
-  - 下一步（第 2 步，iOS 内核里叫醒它）之前还要：HFI 包的顺序（dmesg 里 VIDC_PKT，cap2/cap3）整理成清单；确认我们内核的内存图没占 0x9a600000；SMMU 流 0x1940/0x1a20/0x1944 用哪个上下文、设备地址 0xff900000 一带怎么映射。
+  - HFI 会话顺序（cap3 dmesg_run）：开会话 0x1000003 → 输入端：安全模式 0x3000102、内部缓冲 0x1000009、订阅（输入格式变化/属性/元数据）0x100000b、投递方式 0x100000a、开始 0x1000005 → 固件回 0x3000103…0x3000155 和“端口设置变化” → 输出端：订阅、投递方式、重送内部缓冲、继续 0x1000008、开始 → 解码中每帧回 0x3000174/0x3000175/0x3000162（约 12 ms 一帧）→ 停流、关会话 0x1000004，空闲约 6 s 断电。系统初始化（SYS_INIT 等）只在开机第一次用时做，抓不到，照 venus_hfi_core_init 写。
+  - 内存：XNU 的内存是整个高位内存条（tools/mkadt_pandora.py --highmem），设备树里固定保留区（含 video_region@9a600000 8 MiB）都在低位，不冲突。
+  - SMMU：视频流挂在主 SMMU apps-smmu@15000000（qcom,qsmmu-v500）：non_secure_cb 0x1940/0x1a20/0x1944，non_secure_pixel_cb 0x1943；可用设备地址 0x100000-0xffc00000（iommu_region_partition 留出低 1 MiB、顶上 4 MiB）。我们已有主 SMMU 上借上下文的代码（qcomusb/soc/QcomUsbDmaDomain.c，8 页），页表用 GPU 的 ArmSmmu4K 那套。
+  - **第 2 步计划（用户「可以，等编完就开始写」，2026-10-29）**：新驱动源文件（要进一次云端整编，本地构建不能编新文件；跟在 0315 那次之后）：RPMh 开 MMCX/MX、带宽投票；照 timeline_on 开 GDSC/PLL/时钟；vpu40_2v.mbn 放进固件包，mdt 装进 0x9a600000 → PAS auth_and_reset(9)（同 ADSP）；主 SMMU 上借上下文映射队列 0xff900000（3 MiB）和出错记录 0xffbfe000；写 8 个启动寄存器、等 0xa004c=0x40000001；建 HFI 队列、发 SYS_INIT，日志出现固件版本号算成。
 
 ## GPU、显示、CPU 休眠：第 1 轮（2026-10-25，k0215，日志 r1c）
 用户要求：GPU 换掉 sysmem 模式；翻译层要做得好，不偷工减料；每帧 CPU 拷屏要解决；CPU 核要能深度休眠；"大核优先"不是官方做法（官方是苹果的 AMP 调度加性能控制器的核推荐），以后换掉。
