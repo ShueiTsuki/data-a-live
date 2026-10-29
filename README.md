@@ -30,7 +30,7 @@
 - 省电基本没做。GPU 开机后一直保持上电，熄屏也不断电。
 - Metal 翻译层还有没覆盖到的格式和用法，碰到的界面会少画一部分。
 
-详细进度在 [PLAN.md](PLAN.md)，GPU 部分在 [docs/GPU_PLAN.md](docs/GPU_PLAN.md)，喇叭的调查在 [docs/SPEAKER_RESEARCH.md](docs/SPEAKER_RESEARCH.md)。
+详细进度在 [PLAN.md](PLAN.md)，GPU 部分在 [docs/GPU_PLAN.md](docs/GPU_PLAN.md)，喇叭的调查在 [docs/SPEAKER_RESEARCH.md](docs/SPEAKER_RESEARCH.md)，扬声器做通以后的做法在 [docs/AUDIO_SPEAKER.md](docs/AUDIO_SPEAKER.md)。
 
 ## 怎么启动
 
@@ -60,7 +60,7 @@
 | `bootmgr/` | 开机菜单。写进 boot_b 一次，以后换 iOS 只换菜单里的 iOS 格子 |
 | `tools/` | 启动镜像、设备树、固件包、信任缓存的生成工具，真机测试脚本，GPU 测试程序（vktest、pgputest、mtltest），主机上跑的单元测试（`tools/hosttest/`） |
 | `tools/turnip/`、`tools/metal/` | 在 GitHub Actions 上为 iOS 16 交叉编译 Turnip 和 NativeMetal 插件 |
-| `docs/` | GPU 移植计划、对照笔记、喇叭调查 |
+| `docs/` | GPU 移植计划、对照笔记、喇叭调查、扬声器的做法 |
 | `device/` | 设备相关的说明文档（启动镜像格式、设备树里查到的东西） |
 | `.github/workflows/` | 内核（`xnu.yml`）和 GPU 用户态（`turnip.yml`）的自动编译 |
 

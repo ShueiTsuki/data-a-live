@@ -1,5 +1,7 @@
 # 喇叭：sheng 的做法和 pandora 的差别（2026-10-26 调查摘要）
 
+这是 2026-10-26 动手前的调查。做通以后实际用的做法见 [AUDIO_SPEAKER.md](AUDIO_SPEAKER.md)。
+
 ## 安卓上实际怎么做（DeepSeek 在手机上查的，`D:\DeepSeekHarness\speakercheck\RESULT.md`，我已抽查，见同目录 VERIFY.md）
 
 - 生效的配置在小米 odm 分区：`/odm/etc/audio/sku_canoe/resourcemanager_canoe_mtp.xml`、`mixer_paths_canoe_mtp.xml`、`/odm/etc/usecaseKvManager.xml`。
