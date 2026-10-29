@@ -113,6 +113,13 @@ wsl -d Ubuntu-24.04 -u root -- bash -c "KERNEL='${KERNEL:-}' TRUSTCACHE='${TRUST
 bash "$ROOT/shim/loader/build.sh" | tail -1
 strings_cmd=$(grep -a -o "debug=0x[0-9a-f]* serial=3 cpus=[0-9] [ -~]*" "$ROOT/shim/loader/out/payload.bin" | head -1)
 echo "cmdline: $strings_cmd"
+# The loader keeps 607 characters of boot-args (BOOT_LINE_LENGTH 608, shim/loader/loader.c); aud24 lost its last
+# ones (pandora_slot, so no ADSP and no sound) without a word. The payload's line must end with ours.
+last=${CMDLINE##* }
+case "$strings_cmd" in
+*" $last") ;;
+*) echo "boot-args too long (${#strings_cmd} characters kept): '$last' was cut; shorten --args"; exit 6 ;;
+esac
 [ $DRY = 1 ] && { echo "dry run: not booting"; exit 0; }
 
 echo "== 3. fastboot boot"

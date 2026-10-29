@@ -28,7 +28,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
-LOG_CFG=() RENAMES=() PUTS=()
+LOG_CFG=() RENAMES=() PUTS=() EXECS=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -46,6 +46,7 @@ while [ $# -gt 0 ]; do
 	--log-cfg) LOG_CFG+=("$2"); shift 2 ;; # a unified-log subsystem config (tools/logging/SUBSYSTEM.plist), repeatable
 	--rename) RENAMES+=("$2"); shift 2 ;;  # "FROM TO": the installer renames FROM to TO in iOS (patch 0286), repeatable
 	--put) PUTS+=("$2"); shift 2 ;;        # "LOCAL MODE DEST": install LOCAL at DEST in iOS, repeatable
+	--exec) EXECS+=("$2"); shift 2 ;;      # "LOCAL MODE DEST": as --put, and LOCAL (signed) goes into the trust cache
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -112,6 +113,12 @@ HAVE_METAL=0; [ -f "$T/NativeAdrenoMetal" ] && HAVE_METAL=1
 echo "== 2. trust cache"
 SIGNED=("$(winp "$T/vktest")" "$(winp "$T/libvulkan_freedreno.dylib")")
 [ $HAVE_METAL = 1 ] && SIGNED+=("$(winp "$T/NativeAdrenoMetal")" "$(winp "$T/mtltest")")
+for p in "${EXECS[@]}"; do
+	read -r src mode dest <<< "$p"
+	[ -f "$src" ] || { echo "no $src"; exit 1; }
+	cp "$src" "$T/$(basename "$src")"
+	SIGNED+=("$(winp "$T/$(basename "$src")")")
+done
 python -I "$(winp "$ROOT/tools/pgputest/mktc.py")" "$(winp "$T/gpu.tc")" "${SIGNED[@]}"
 wsl -d Ubuntu-24.04 -u root -- bash -c "mkdir -p /opt/work/gputest && cp '$(wslp "$T/gpu.tc")' /opt/work/gputest/$NAME.tc"
 
@@ -174,6 +181,11 @@ for p in "${PUTS[@]}"; do
 	cp "$src" "$T/put$n.$(basename "$src")"
 	printf '%s %s %s\n' "put$n.$(basename "$src")" "$mode" "$dest" >> "$T/files.txt"
 	PARTS+=("$(winp "$T/put$n.$(basename "$src")")")
+done
+for p in "${EXECS[@]}"; do
+	read -r src mode dest <<< "$p"
+	printf '%s %s %s\n' "$(basename "$src")" "$mode" "$dest" >> "$T/files.txt"
+	PARTS+=("$(winp "$T/$(basename "$src")")")
 done
 cat "$T/files.txt"
 python -I "$(winp "$ROOT/tools/mkfwpack.py")" "$(winp "$PACK")" "${PARTS[@]}" "$(winp "$T/files.txt")"
