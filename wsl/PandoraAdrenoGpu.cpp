@@ -42,6 +42,8 @@ int pandora_gpu_bo_lease(int client, uint64_t handle, int delta, uint32_t *token
 int pandora_gpu_token_phys(int client, uint32_t token, uint64_t *pa, uint64_t *bytes);
 int pandora_gpu_bo_meta(int client, uint64_t handle, bool set, char *text, uint32_t *len);
 int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
+void pandora_gpu_check_handles(int client, const uint64_t *handle, const uint64_t *iova, const uint64_t *bytes,
+    unsigned n);
 int pandora_gpu_wait(uint64_t fence, uint64_t timeout_ns);
 uint64_t pandora_gpu_timestamp(void);
 uint32_t pandora_gpu_chip_id(void);
@@ -223,15 +225,18 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 		}
 		const vm_size_t list = a.buffer_count * sizeof(uint64_t);
 		uint64_t *iova = (uint64_t *)IOMallocData(list), *bytes = (uint64_t *)IOMallocData(list);
+		uint64_t *handle = (uint64_t *)IOMallocData(list);     /* 0327 */
 		int err = ENOMEM;
 		NativeAdrenoAbiSubmitReply r = { 0 };
-		if (iova != nullptr && bytes != nullptr) {
+		if (iova != nullptr && bytes != nullptr && handle != nullptr) {
 			for (unsigned i = 0; i < a.buffer_count; i++) {
 				NativeAdrenoAbiSubmitBuffer b;
 				memcpy(&b, in + head + i * sizeof(b), sizeof(b));
 				iova[i] = b.iova;
 				bytes[i] = b.bytes;
+				handle[i] = b.handle;
 			}
+			pandora_gpu_check_handles(client_, handle, iova, bytes, a.buffer_count);
 			err = pandora_gpu_submit(client_, iova, bytes, a.buffer_count, &r.fence);
 		}
 		if (iova != nullptr) {
@@ -239,6 +244,9 @@ AGXDeviceUserClient::method(uint32_t m, const uint8_t *in, uint32_t in_len, uint
 		}
 		if (bytes != nullptr) {
 			IOFreeData(bytes, list);
+		}
+		if (handle != nullptr) {
+			IOFreeData(handle, list);
 		}
 		memcpy(out, &r, sizeof(r));
 		return pandora_gpu_ret(err);

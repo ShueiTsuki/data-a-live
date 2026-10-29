@@ -2309,6 +2309,7 @@ struct gpu_bo {
 	bool readonly;                  /* imported pages the caller may only read: the GPU maps them read-only */
 	uint32_t meta_len;
 	char meta[64];
+	uint32_t map_seq;               /* 0327: the last fence issued when it was mapped */
 };
 static struct gpu_bo gpu_bos[GPU_MAX_BOS];
 
@@ -2663,11 +2664,21 @@ pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
 	} else {
 		b->iova = iova;
 		b->perm = perm;
+		b->map_seq = gpu_seqno;
 		gpu_clients[client].maps++;
 	}
 	lck_mtx_unlock(&gpu_lock);
 	return err;
 }
+
+/* 0327: the last GPU_FREED buffers freed through pandora_gpu_bo_free, for pandora_gpu_check_handles. */
+#define GPU_FREED 256u
+static struct gpu_freed {
+	uint64_t handle, iova, bytes, abs;
+	int client;
+	uint32_t seq;
+} gpu_freed[GPU_FREED];
+static uint32_t gpu_freed_next;
 
 /* Refused while CPU views remain; waits for the client's own submissions so far, then unmaps and frees.
  * 0318: a buffer is the client's alone, so only its own work can still use it. Before, every client's submissions
@@ -2689,6 +2700,9 @@ pandora_gpu_bo_free(int client, uint64_t handle)
 	} else if (b->leases) {
 		err = EBUSY;
 	} else {
+		gpu_freed[gpu_freed_next++ % GPU_FREED] = (struct gpu_freed){ .handle = handle, .iova = b->iova,
+			                                                     .bytes = b->bytes, .client = client,
+			                                                     .seq = gpu_seqno, .abs = mach_absolute_time() };
 		gpu_bo_release(b);
 		gpu_clients[client].frees++;
 	}
@@ -2866,6 +2880,69 @@ gpu_reuse_check(int client, const uint64_t *ib, const uint32_t *dw, unsigned n)
 			}
 		}
 	}
+}
+
+/*
+ * 0327: post21: backboardd's submission was refused (an IB in no buffer of the client, kIOReturnBadArgument) and
+ * its Metal device was lost; the hangs before fit IBs in freed buffers whose addresses had been given to new
+ * ones, which the address check lets through. The user client hands over the handle Turnip has for each IB's
+ * buffer (NativeAdrenoAbiSubmitBuffer.handle): a handle no longer live, or whose buffer is not mapped where the
+ * IB is, is logged with what holds that address now and when the handle's buffer was freed. The first 24.
+ */
+static const struct gpu_bo *gpu_bo_at(uint64_t va, uint64_t len);
+static uint32_t gpu_stale_lines;
+static uint64_t gpu_stale_count;
+
+void pandora_gpu_check_handles(int client, const uint64_t *handle, const uint64_t *iova, const uint64_t *bytes,
+    unsigned n);
+void
+pandora_gpu_check_handles(int client, const uint64_t *handle, const uint64_t *iova, const uint64_t *bytes,
+    unsigned n)
+{
+	lck_mtx_lock(&gpu_lock);
+	for (unsigned i = 0; i < n; i++) {
+		const struct gpu_bo *b = gpu_bo_get(client, handle[i]);
+		if (b && b->iova && iova[i] >= b->iova && iova[i] + bytes[i] <= b->iova + b->bytes) {
+			continue;
+		}
+		gpu_stale_count++;
+		if (gpu_stale_lines >= 24) {
+			continue;
+		}
+		gpu_stale_lines++;
+		char what[96], now[96], freed[96];
+		if (b) {
+			snprintf(what, sizeof(what), "live, mapped at %llx+%llx", (unsigned long long)b->iova,
+			    (unsigned long long)b->bytes);
+		} else {
+			snprintf(what, sizeof(what), "not live");
+		}
+		const struct gpu_bo *at = gpu_bo_at(iova[i], bytes[i]);
+		if (at) {
+			snprintf(now, sizeof(now), "handle %llx (%s) %llx+%llx of client %d, mapped at fence %u",
+			    (unsigned long long)(((uint64_t)at->gen << 32) | (uint64_t)(at - gpu_bos + 1)),
+			    at->pages ? "import" : "pool", (unsigned long long)at->iova, (unsigned long long)at->bytes,
+			    at->client, at->map_seq);
+		} else {
+			snprintf(now, sizeof(now), "no buffer");
+		}
+		snprintf(freed, sizeof(freed), "not among the last %u frees", GPU_FREED);
+		for (uint32_t k = 1; k <= GPU_FREED && k <= gpu_freed_next; k++) {
+			const struct gpu_freed *f = &gpu_freed[(gpu_freed_next - k) % GPU_FREED];
+			if (f->handle == handle[i] && f->client == client) {
+				uint64_t ns;
+				absolutetime_to_nanoseconds(mach_absolute_time() - f->abs, &ns);
+				snprintf(freed, sizeof(freed), "freed %llu ms ago at fence %u (%llx+%llx)",
+				    ns / NSEC_PER_MSEC, f->seq, (unsigned long long)f->iova, (unsigned long long)f->bytes);
+				break;
+			}
+		}
+		printf("PANDORA GPU STALE: client %d (%s) next fence %u IB %u of %u %llx+%llu: its handle %llx is %s; "
+		    "the address is in %s; the handle was %s; %llu such IBs\n", client, gpu_clients[client].name,
+		    gpu_seqno + 1, i, n, (unsigned long long)iova[i], (unsigned long long)bytes[i],
+		    (unsigned long long)handle[i], what, now, freed, gpu_stale_count);
+	}
+	lck_mtx_unlock(&gpu_lock);
 }
 
 int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
@@ -3356,8 +3433,9 @@ gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2, b
 	}
 	const uint64_t off = b->off + (base - b->iova), len = (uint64_t)init * 4;
 	if (!quiet) {
-		printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u in buffer %llx+%llx of client %d; page table %llx, pool page %llx\n",
-		    name, (unsigned long long)base, init, (unsigned long long)b->iova, (unsigned long long)b->bytes, b->client,
+		printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u in buffer %llx+%llx of client %d mapped at fence %u; "
+		    "page table %llx, pool page %llx\n", name, (unsigned long long)base, init, (unsigned long long)b->iova,
+		    (unsigned long long)b->bytes, b->client, b->map_seq,
 		    (unsigned long long)(smmu_leaf(&gpu_smmu, base) & 0xfffffffff000ull),
 		    (unsigned long long)((gpu_pool_pa + off) & ~0xfffull));
 	}
