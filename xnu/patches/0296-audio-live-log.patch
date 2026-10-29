@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 0a84044..1e65141 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1363,9 +1363,11 @@ gpr_step(void)
+ 			gpr_ask();
+ 		}
+ 	}
++	static uint32_t logged;                  /* 0296: aud22, live play: one line per 20 ms buffer flooded the log */
+ 	for (unsigned i = 0; i < ad_gpr_in.n; i++) {
+ 		GprPacket p;
+-		if (!gpr_decode(ad_gpr_in.m[i].data, ad_gpr_in.m[i].len, &p) && ad_spf.answers + ad_spf.ignored < 8) {
++		if (!gpr_decode(ad_gpr_in.m[i].data, ad_gpr_in.m[i].len, &p) && ad_spf.answers + ad_spf.ignored < 8 &&
++		    logged++ < 64) {
+ 			printf("PANDORA ADSP: GPR in: opcode %#x token %u from domain %u port %#x, %u bytes\n", p.opcode, p.token,
+ 			    p.src_domain, p.src_port, p.size);
+ 		}
+@@ -2129,6 +2131,12 @@ spk_step(void)
+ 		spk_graph_end(true);
+ 	}
+ 	spk_tone_pump();
++	static uint64_t live_log;
++	if (spk_live && spk.state == SpkRunning && now >= live_log) {
++		clock_interval_to_deadline(10000, NSEC_PER_MSEC, &live_log);
++		printf("PANDORA SPK: live at %llu ms: %u buffers sent, %u back (%u with an error), %u in flight, sends refused "
++		    "%u\n", ad_ms(spk.t0), spk_tone.sent, spk_tone.done, spk_tone.bad, spk_tone.inflight, spk_tone.busy);
++	}
+ 	if (spk.answer_by && now >= spk.answer_by) {
+ 		spk.answer_by = 0;
+ 		spk.tx_len = 0;
