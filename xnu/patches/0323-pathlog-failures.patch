@@ -1,0 +1,158 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 135fca7..5fe5b8c 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4940,13 +4940,78 @@ open_extended(proc_t p, struct open_extended_args *uap, int32_t *retval)
+ 	return ciferror;
+ }
+ 
++#if defined(PANDORA)
++/*
++ * PANDORA (0323): boot-arg pandora_pathlog=NAME:TEXT logs each open (plain or data-protected) or mkdir of a
++ * process named NAME that fails on a path containing TEXT, or on a name relative to a directory whose path
++ * contains it, with the directory, the flags, the protection class and the error; the first 400. (Without
++ * ":TEXT" pandora_pathlog keeps 0285's meaning below.) A mkdir of something that exists is not logged.
++ */
++static void
++pandora_pathlog_failed(vfs_context_t ctx, const char *op, int fd, user_addr_t path, enum uio_seg segflg,
++    int flags, int class, int error)
++{
++	static int state;                       /* 0 not read yet, 1 off, 2 on */
++	static char want[32], text[32];
++	static uint32_t lines;
++	if (error == 0) {
++		return;
++	}
++	if (state == 0) {
++		char arg[64];
++		state = 1;
++		if (PE_parse_boot_arg_str("pandora_pathlog", arg, sizeof(arg))) {
++			for (size_t i = 0; arg[i] != 0 && i < sizeof(want) - 1; i++) {
++				if (arg[i] == ':') {
++					memcpy(want, arg, i);
++					strlcpy(text, arg + i + 1, sizeof(text));
++					state = want[0] && text[0] ? 2 : 1;
++					break;
++				}
++			}
++		}
++	}
++	if (state != 2 || lines >= 400) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (strncmp(name, want, sizeof(name)) != 0) {
++		return;
++	}
++	char p[256];
++	size_t len = 0;
++	if ((segflg == UIO_SYSSPACE ? copystr(CAST_DOWN(void *, path), p, sizeof(p), &len) :
++	    copyinstr(path, p, sizeof(p), &len)) != 0) {
++		return;
++	}
++	char dir[256] = "";
++	if (p[0] != '/' && fd != AT_FDCWD) {
++		vnode_t dvp = NULLVP;
++		if (vnode_getfromfd(ctx, fd, &dvp) == 0) {
++			int dlen = sizeof(dir);
++			if (vn_getpath(dvp, dir, &dlen) != 0) {
++				dir[0] = 0;
++			}
++			vnode_put(dvp);
++		}
++	}
++	if (strnstr(p, text, sizeof(p)) == NULL && strnstr(dir, text, sizeof(dir)) == NULL) {
++		return;
++	}
++	lines++;
++	printf("PANDORA PATH: %s %s %s%s%s flags %#x class %d -> %d\n", name, op, dir, dir[0] ? "/" : "", p,
++	    flags, class, error);
++}
++#endif /* PANDORA */
++
+ /*
+  * Go through the data-protected atomically controlled open (2)
+  *
+  * int open_dprotected_np(user_addr_t path, int flags, int class, int dpflags, int mode)
+  */
+ static int
+-openat_dprotected_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
++openat_dprotected_internal1(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+     int class, int dpflags, int fd, int authfd, enum uio_seg segflg, int *retval)
+ {
+ 	/*
+@@ -5008,6 +5073,17 @@ openat_dprotected_internal(vfs_context_t ctx, user_addr_t path, int flags, int m
+ 	return error;
+ }
+ 
++static int
++openat_dprotected_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
++    int class, int dpflags, int fd, int authfd, enum uio_seg segflg, int *retval)
++{
++	int error = openat_dprotected_internal1(ctx, path, flags, mode, class, dpflags, fd, authfd, segflg, retval);
++#if defined(PANDORA)
++	pandora_pathlog_failed(ctx, "open_dprotected", fd, path, segflg, flags, class, error);
++#endif
++	return error;
++}
++
+ int
+ openat_dprotected_np(__unused proc_t p, struct openat_dprotected_np_args *uap, int32_t *retval)
+ {
+@@ -5063,7 +5139,7 @@ pandora_pathlog(const char *op, user_addr_t path, enum uio_seg segflg)
+ #endif /* PANDORA */
+ 
+ static int
+-openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
++openat_internal1(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+     int fd, enum uio_seg segflg, int *retval)
+ {
+ #if defined(PANDORA)
+@@ -5098,6 +5174,17 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+ 	return error;
+ }
+ 
++static int
++openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
++    int fd, enum uio_seg segflg, int *retval)
++{
++	int error = openat_internal1(ctx, path, flags, mode, fd, segflg, retval);
++#if defined(PANDORA)
++	pandora_pathlog_failed(ctx, "open", fd, path, segflg, flags, -1, error);
++#endif
++	return error;
++}
++
+ int
+ open(proc_t p, struct open_args *uap, int32_t *retval)
+ {
+@@ -9757,7 +9844,7 @@ renameat(__unused proc_t p, struct renameat_args *uap, __unused int32_t *retval)
+  */
+ /* ARGSUSED */
+ static int
+-mkdir1at(vfs_context_t ctx, user_addr_t path, struct vnode_attr *vap, int fd,
++mkdir1at1(vfs_context_t ctx, user_addr_t path, struct vnode_attr *vap, int fd,
+     enum uio_seg segflg)
+ {
+ 	vnode_t vp, dvp;
+@@ -9872,6 +9959,19 @@ out:
+ 	return error;
+ }
+ 
++static int
++mkdir1at(vfs_context_t ctx, user_addr_t path, struct vnode_attr *vap, int fd,
++    enum uio_seg segflg)
++{
++	int error = mkdir1at1(ctx, path, vap, fd, segflg);
++#if defined(PANDORA)
++	if (error != EEXIST) {
++		pandora_pathlog_failed(ctx, "mkdir", fd, path, segflg, 0, -1, error);
++	}
++#endif
++	return error;
++}
++
+ /*
+  * mkdir_extended: Create a directory; with extended security (ACL).
+  *
