@@ -1,0 +1,264 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 7afb190..0108d5e 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,11 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -299,8 +304,234 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Patch 0329: extensions and containers. The policy allows everything, so an extension needs no meaning: issue
++ * writes a token in the form of Sandbox.kext's (hash; flags; three words; the class's length; the class; 01; the
++ * type; a serial; the name), consume gives a handle for any token. A container path is the process's
++ * CFFIXED_USER_HOME, which launchd and RunningBoard set for each containerized app and plugin, read from the
++ * strings exec left on its stack (ios-fuxi's fuxi_sandbox_container answers the same way). The argument layouts
++ * are libsystem_sandbox's (20H392): sandbox_extension_issue_* (op 5, a token buffer of 0x800 bytes),
++ * sandbox_extension_consume (op 6), sandbox_container_path_for_pid and _for_audit_token (op 4). Before, all three
++ * failed with ENOENT: tccd issued no extension (post22: 380 "Failed to issue sandbox extension"), assetsd stopped
++ * with "assetsd requires TCCPhotosService access" and Photos with it, plugins with "plugin has invalid sandbox or
++ * container: error 2 path ?". Boot-arg sweet_sb_ext=0 keeps the old answers. The first 24 answers are logged.
++ */
++struct sweet_sb_issue {
++	user_addr_t class_name;
++	uint64_t type;                  /* 3 = generic */
++	user_addr_t name;               /* a path or a service name, or 0 */
++	uint64_t flags;
++	user_addr_t token;              /* SWEET_SB_TOKEN bytes */
++	int64_t pid;
++	uint64_t extra;
++};
++struct sweet_sb_consume {
++	user_addr_t token;
++	uint64_t length;                /* with the NUL */
++	user_addr_t handle;             /* int64_t */
++};
++struct sweet_sb_container {
++	int64_t pid;
++	uint64_t pidversion;
++	user_addr_t path;
++	uint64_t capacity;
++	uint64_t by_token;              /* 1: the pid version must match */
++};
++#define SWEET_SB_TOKEN          0x800
++static uint64_t sweet_sb_serial;
++static uint32_t sweet_sb_logged;
++static int sweet_sb_on = -1;
++
++static bool
++sweet_sb_ext(void)
++{
++	if (sweet_sb_on < 0) {
++		int on = 1;
++		(void)PE_parse_boot_argn("sweet_sb_ext", &on, sizeof(on));
++		sweet_sb_on = on != 0;
++	}
++	return sweet_sb_on;
++}
++
++static void
++sweet_sb_log(struct proc *p, const char *what, const char *detail, int error)
++{
++	if (sweet_sb_logged >= 24) {
++		return;
++	}
++	sweet_sb_logged++;
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	printf("SWEET Sandbox: %s %s %s -> %d\n", name, what, detail, error);
++}
++
++static int
++sweet_sandbox_issue(struct proc *p, user_addr_t arg)
++{
++	struct sweet_sb_issue a;
++	char cls[128];
++	size_t len = 0;
++	int error = copyin(arg, &a, sizeof(a));
++	if (!error) {
++		error = copyinstr(a.class_name, cls, sizeof(cls), &len);
++	}
++	if (error) {
++		sweet_sb_log(p, "issue", "(unreadable)", error);
++		return error;
++	}
++	char *name = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	char *token = kalloc_data(SWEET_SB_TOKEN, Z_WAITOK | Z_ZERO);
++	if (name == NULL || token == NULL) {
++		error = ENOMEM;
++	} else if (a.name && copyinstr(a.name, name, MAXPATHLEN, &len) != 0) {
++		name[0] = 0;
++	}
++	if (!error) {
++		const uint64_t serial = __atomic_add_fetch(&sweet_sb_serial, 1, __ATOMIC_RELAXED);
++		uint64_t h = serial * 0x9e3779b97f4a7c15ull ^ (uint64_t)strlen(cls) << 48;
++		uint64_t w[4];
++		for (unsigned i = 0; i < 4; i++) {
++			h ^= h >> 31;
++			h *= 0xbf58476d1ce4e5b9ull;
++			w[i] = h ^ (h >> 29);
++		}
++		int n = snprintf(token, SWEET_SB_TOKEN,
++		    "%016llx%016llx%016llx%016llx;00;00000000;00000000;00000000;%016llx;%s;01;%08llx;%016llx;%s",
++		    w[0], w[1], w[2], w[3], (unsigned long long)strlen(cls), cls, (unsigned long long)a.type,
++		    (unsigned long long)serial, name);
++		error = n <= 0 || n >= SWEET_SB_TOKEN ? ENAMETOOLONG : copyout(token, a.token, (size_t)n + 1);
++	}
++	sweet_sb_log(p, "issues", cls, error);
++	if (name != NULL) {
++		kfree_data(name, MAXPATHLEN);
++	}
++	if (token != NULL) {
++		kfree_data(token, SWEET_SB_TOKEN);
++	}
++	return error;
++}
++
++static int
++sweet_sandbox_consume(struct proc *p, user_addr_t arg)
++{
++	struct sweet_sb_consume a;
++	int error = copyin(arg, &a, sizeof(a));
++	if (!error) {
++		const int64_t handle = (int64_t)__atomic_add_fetch(&sweet_sb_serial, 1, __ATOMIC_RELAXED);
++		error = copyout(&handle, a.handle, sizeof(handle));
++	}
++	sweet_sb_log(p, "consumes", "a token", error);
++	return error;
++}
++
++/* The value of CFFIXED_USER_HOME among the environment strings of exec's area (path, argv, environment). */
++static int
++sweet_sb_home(const char *s, size_t size, int argc, user_addr_t path, uint64_t capacity, char *found, size_t found_size)
++{
++	static const char key[] = "CFFIXED_USER_HOME=";
++	size_t at = 0;
++	if (argc < 0) {
++		return ENOENT;
++	}
++	for (int i = 0; i <= argc; i++) {             /* the executable path, then argv */
++		size_t len = at < size ? strnlen(s + at, size - at) : size;
++		if (at + len >= size) {
++			return ENOENT;
++		}
++		at += len + 1;
++		while (i == 0 && at < size && s[at] == 0) {   /* the path is padded */
++			at++;
++		}
++	}
++	while (at < size) {
++		size_t len = strnlen(s + at, size - at);
++		if (at + len >= size) {
++			break;
++		}
++		if (len > sizeof(key) - 1 && memcmp(s + at, key, sizeof(key) - 1) == 0) {
++			const char *home = s + at + sizeof(key) - 1;
++			const size_t bytes = len - (sizeof(key) - 1) + 1;
++			if (home[0] != '/' || bytes > MAXPATHLEN) {
++				return ENOENT;
++			}
++			strlcpy(found, home, found_size);
++			return bytes > capacity ? ENAMETOOLONG : copyout(home, path, bytes);
++		}
++		at += len + 1;
++	}
++	return ENOENT;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_container(struct proc *p, user_addr_t arg)
++{
++	struct sweet_sb_container a;
++	char found[96] = "";
++	int error = copyin(arg, &a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	if (a.pid <= 0 || a.pid > INT_MAX) {
++		return ESRCH;
++	}
++	proc_t target = proc_find((pid_t)a.pid);
++	if (target == PROC_NULL) {
++		return ESRCH;
++	}
++	if (a.by_token && (uint64_t)proc_pidversion(target) != a.pidversion) {
++		proc_rele(target);
++		return ESRCH;
++	}
++	char tname[32];
++	proc_name((int)a.pid, tname, sizeof(tname));
++	const user_addr_t top = target->user_stack;
++	const size_t length = target->p_argslen;
++	const int argc = target->p_argc;
++	task_t task = proc_task(target);
++	if (!top || !length || length > NCARGS + PAGE_SIZE || task == TASK_NULL) {
++		proc_rele(target);
++		sweet_sb_log(p, "container of", tname, ENOENT);
++		return ENOENT;
++	}
++	task_reference(task);
++	proc_rele(target);
++	vm_map_t map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return ENOENT;
++	}
++	const vm_size_t span = vm_map_round_page(length, vm_map_page_mask(map));
++	vm_offset_t buffer = 0;
++	vm_map_copy_t copy = VM_MAP_COPY_NULL;
++	if (top < span) {
++		error = EIO;
++	} else if (kmem_alloc(kernel_map, &buffer, span, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		buffer = 0;
++		error = ENOMEM;
++	} else if (vm_map_copyin(map, top - span, span, FALSE, &copy) != KERN_SUCCESS) {
++		error = EIO;
++	} else if (vm_map_copy_overwrite(kernel_map, buffer, copy, span, FALSE) != KERN_SUCCESS) {
++		error = EIO;
++	} else {
++		copy = VM_MAP_COPY_NULL;        /* the overwrite took it */
++		error = sweet_sb_home((const char *)(buffer + span - length), length, argc, a.path, a.capacity, found,
++		    sizeof(found));
++	}
++	if (copy != VM_MAP_COPY_NULL) {
++		vm_map_copy_discard(copy);
++	}
++	if (buffer) {
++		kmem_free(kernel_map, buffer, span);
++	}
++	vm_map_deallocate(map);
++	char detail[140];
++	snprintf(detail, sizeof(detail), "%s: %s", tname, found[0] ? found : "none");
++	sweet_sb_log(p, "container of", detail, error);
++	return error;
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -308,6 +539,11 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
++	if ((call == 4 || call == 5 || call == 6) && sweet_sb_ext()) {
++		/* 0329 */
++		return call == 4 ? sweet_sandbox_container(p, arg) : call == 5 ? sweet_sandbox_issue(p, arg) :
++		       sweet_sandbox_consume(p, arg);
++	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
