@@ -3018,7 +3018,19 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 	if (!err) {
 		gpu_reuse_check(client, ib, dw, n);   /* 0326 */
 		uint32_t thread = first == 0x70970001u ? 3 : 1;
-		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
+		/* 0328: a change of submitting client is a context switch: as a6xx_set_pagetable() does whenever the
+		 * context differs from the ring's last one, the submission starts with the context entry (BR/BV
+		 * counters, on-chip timestamps, context state). Before, only a client's first submission had it, and
+		 * backboardd and the posters took turns on the ring with each other's state (UniXNU Adreno740 8ef8b84
+		 * found hangs from the same gap). Off with pandora_gpu_ctxsw=0. */
+		static int ctxsw = -1, last = -1;
+		if (ctxsw < 0) {
+			ctxsw = 1;
+			(void)PE_parse_boot_argn("pandora_gpu_ctxsw", &ctxsw, sizeof(ctxsw));
+		}
+		const bool reset = gpu_clients[client].reset || (ctxsw && last >= 0 && client != last);
+		last = client;
+		*fence = gpu_submit(ib, dw, n, thread, reset);
 		struct gpu_hist *h = &gpu_hist[(uint32_t)*fence % GPU_HIST];
 		*h = (struct gpu_hist){ .seq = (uint32_t)*fence, .client = client, .thread = thread, .n = n,
 			                .first = first, .ib0 = ib[0], .dw0 = dw[0], .ibn = ib[n - 1], .dwn = dw[n - 1] };
