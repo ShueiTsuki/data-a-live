@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index 1c5fcd5..d231dba 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -2665,12 +2665,16 @@ pandora_gpu_bo_map(int client, uint64_t handle, uint64_t iova, uint32_t perm)
+ 	return err;
+ }
+ 
+-/* Refused while CPU views remain; waits for every submission so far, then unmaps and frees. */
++/* Refused while CPU views remain; waits for the client's own submissions so far, then unmaps and frees.
++ * 0318: a buffer is the client's alone, so only its own work can still use it. Before, every client's submissions
++ * were waited for: each of backboardd's frees (about 20 a second) waited for the posters' frames too, and Turnip
++ * makes the free while holding the lock its next allocation needs (post11). */
+ int pandora_gpu_bo_free(int client, uint64_t handle);
+ int
+ pandora_gpu_bo_free(int client, uint64_t handle)
+ {
+-	if (pandora_gpu_wait(gpu_seqno, 2000000000ull)) {
++	const uint32_t own = gpu_clients[client].fence;
++	if (own != 0 && pandora_gpu_wait(own, 2000000000ull)) {
+ 		return EBUSY;
+ 	}
+ 	int err = 0;

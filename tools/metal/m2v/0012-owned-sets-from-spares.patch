@@ -1,0 +1,227 @@
+From: root <root@MSI.localdomain>
+Date: Fri, 30 Oct 2026 01:00:00 +0800
+Subject: [PATCH] runtime: an owned command's descriptor pool is a spare
+
+OwnedSets (the runtime's own compute work: a pass's capture steps,
+mipmap filters, visibility resolves, two-plane copies) made a
+VkDescriptorPool per command and destroyed it as its command buffer
+completed. On Turnip each pool is a GPU buffer: allocated, mapped,
+unmapped and freed per command, about 60 a second for the Astronomy
+poster (post11). Its frees went through Turnip's retire lock, held
+across the kernel's BoFree, and the main thread waited on that lock in
+darwin_bo_init for its next pool in 116 of 127 thread snapshots.
+
+The pool now comes from the device's spares where one has room for the
+command's sets (Room::holds: at least as many sets, and the descriptors
+the sets take together, by type), reset, and goes back to them when the
+command buffer is done with it. The spares stay bounded as before
+(DESCRIPTOR_POOLS, DESCRIPTORS) and serve both kinds of pool.
+
+diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+@@ -103,6 +103,18 @@
+             })
+     }
+ 
++    /// Whether `sets` sets that take `totals` together fit (an owned command's sets,
++    /// `owned_kernel.rs`: one of each dispatch, of different layouts).
++    pub(super) fn holds(&self, totals: &SetNeeds, sets: u32) -> bool {
++        self.flags == totals.flags
++            && self.sets >= sets
++            && totals.counts.iter().all(|&(ty, count)| {
++                self.counts
++                    .iter()
++                    .any(|&(left_ty, left)| left_ty == ty && left >= count)
++            })
++    }
++
+     /// The descriptors left, of every type.
+     pub(super) fn descriptors(&self) -> u64 {
+         self.counts.iter().map(|&(_, count)| u64::from(count)).sum()
+diff --git a/crates/metal2vulkan-runtime/src/owned_kernel.rs b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+--- a/crates/metal2vulkan-runtime/src/owned_kernel.rs
++++ b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+@@ -12,12 +12,16 @@
+ //!   the index rewrite one per `RewriteProgram` and `RewritePhase` (closed enums of a few).
+ //! - **Descriptor sets** ([`OwnedSets`]): one pool per command, holding one set per dispatch, each
+ //!   written with the command's image views and buffer ranges; the command buffer retains it
+-//!   until it completes.
++//!   until it completes, then gives it to the device's spares (`spares.rs`). The pool is a spare
++//!   with room for the sets where there is one: made and destroyed per command, each pool was
++//!   device memory allocated, mapped and freed per command (a GPU buffer on Turnip).
+ 
++use super::descriptor_arena::{Room, SetNeeds};
+ use super::device::lock;
+ use super::error::{internal, vulkan, Error};
+ use super::exit_guard;
+ use super::release;
++use super::spares::DescriptorPool;
+ use super::Device;
+ use crate::shader_cache::driver::Making;
+ use ash::vk;
+@@ -597,19 +601,25 @@
+ /// The descriptor sets of one command's dispatches of one kernel, from a pool of their own.
+ pub(super) struct OwnedSets {
+     device: Device,
+-    pool: vk::DescriptorPool,
++    /// `None` only once dropped.
++    pool: Option<DescriptorPool>,
+     pub(super) sets: Vec<vk::DescriptorSet>,
+ }
+ 
+ impl Drop for OwnedSets {
+     fn drop(&mut self) {
+-        // Once the process is exiting, the pool is left to its end (`exit_guard`).
+-        let Some(_busy) = exit_guard::enter() else {
++        let Some(pool) = self.pool.take() else {
+             return;
+         };
+-        // SAFETY: no pending command uses the sets (a command buffer retains them until it
+-        // completes); the sets are freed with their pool.
+-        unsafe { release::object(self.device.shared().vk(), self.pool) };
++        // Once the process is exiting, the pool is left to its end (`exit_guard`).
++        if exit_guard::enter().is_none() {
++            return;
++        }
++        // No pending command uses the sets (a command buffer retains them until it completes):
++        // the pool goes to the device's spares, which reset it for its next taker or release it
++        // past their bounds.
++        let shared = self.device.shared();
++        shared.spares.give_descriptor_pool(shared, pool);
+     }
+ }
+ 
+@@ -662,30 +672,51 @@
+             total(|k| k.storage_images)?,
+             total(|k| k.buffers)?,
+         );
+-        // A pool size names at least one descriptor.
+-        let sizes: Vec<vk::DescriptorPoolSize> = [
+-            (vk::DescriptorType::SAMPLED_IMAGE, images),
+-            (vk::DescriptorType::STORAGE_IMAGE, storage_images),
+-            (vk::DescriptorType::STORAGE_BUFFER, buffers),
+-        ]
+-        .into_iter()
+-        .filter(|&(_, n)| n > 0)
+-        .map(|(ty, n)| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(n))
+-        .collect();
+-        let info = vk::DescriptorPoolCreateInfo::default()
+-            .max_sets(count)
+-            .pool_sizes(&sizes);
+-        // SAFETY: `info` and its array are live for the call.
+-        let pool = unsafe { raw.create_descriptor_pool(&info, None) }.map_err(vulkan)?;
++        // What the sets take together, by raw type, ascending (`SetNeeds`); a pool size names at
++        // least one descriptor.
++        let totals = SetNeeds {
++            counts: [
++                (vk::DescriptorType::SAMPLED_IMAGE, images),
++                (vk::DescriptorType::STORAGE_IMAGE, storage_images),
++                (vk::DescriptorType::STORAGE_BUFFER, buffers),
++            ]
++            .into_iter()
++            .filter(|&(_, n)| n > 0)
++            .map(|(ty, n)| (ty.as_raw(), n))
++            .collect(),
++            flags: vk::DescriptorPoolCreateFlags::empty(),
++        };
++        let shared = device.shared();
++        let pool = match shared.spares.descriptor_pool_holding(shared, &totals, count)? {
++            Some(spare) => spare,
++            None => {
++                let sizes = totals.sizes(1);
++                let info = vk::DescriptorPoolCreateInfo::default()
++                    .max_sets(count)
++                    .pool_sizes(&sizes);
++                // SAFETY: `info` and its array are live for the call.
++                let raw_pool =
++                    unsafe { raw.create_descriptor_pool(&info, None) }.map_err(vulkan)?;
++                DescriptorPool {
++                    raw: raw_pool,
++                    room: Room {
++                        flags: totals.flags,
++                        sets: count,
++                        counts: totals.counts.clone(),
++                    },
++                }
++            }
++        };
++        let pool_raw = pool.raw;
+         let mut owned = OwnedSets {
+             device: device.clone(),
+-            pool,
++            pool: Some(pool),
+             sets: Vec::new(),
+         };
+         let layouts: Vec<vk::DescriptorSetLayout> =
+             kernels.iter().map(|kernel| kernel.set_layout).collect();
+         let info = vk::DescriptorSetAllocateInfo::default()
+-            .descriptor_pool(pool)
++            .descriptor_pool(pool_raw)
+             .set_layouts(&layouts);
+         // SAFETY: the pool holds `count` sets, each of its kernel's images and storage buffers.
+         owned.sets = unsafe { raw.allocate_descriptor_sets(&info) }.map_err(vulkan)?;
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -1,7 +1,8 @@
+ //! A device's spare command pools and descriptor pools: a command buffer that completed gives back
+ //! the command pool its encoders recorded into, with the command buffers made from it, and the
+-//! descriptor pools its commands' sets came from (`descriptor_arena.rs`); the next command buffer
+-//! takes them, reset, where it would make its own. Made, used once and destroyed, a command pool
++//! descriptor pools its commands' sets came from (`descriptor_arena.rs`, and the runtime's own
++//! commands' in `owned_kernel.rs`); the next command buffer or command takes them, reset, where it
++//! would make its own. Made, used once and destroyed, a command pool
+ //! cost 38 to 48 us and a descriptor pool 23 to 26 us on RADV (Radeon 780M), 7 to 8 and 3 on ANV,
+ //! against 0.2 and 0.02, and 1.3 and 0.1, reset (EV PERF-raw1).
+ //!
+@@ -156,10 +157,31 @@
+         device: &DeviceShared,
+         needs: &SetNeeds,
+     ) -> Result<Option<DescriptorPool>, Error> {
++        self.descriptor_pool_where(device, |room| room.fits(needs))
++    }
++
++    /// A spare descriptor pool of `device`, reset, with room for `sets` sets that take `totals`
++    /// together (an owned command's, `owned_kernel.rs`), the newest such; `None` as
++    /// [`Spares::descriptor_pool`]'s.
++    pub(super) fn descriptor_pool_holding(
++        &self,
++        device: &DeviceShared,
++        totals: &SetNeeds,
++        sets: u32,
++    ) -> Result<Option<DescriptorPool>, Error> {
++        self.descriptor_pool_where(device, |room| room.holds(totals, sets))
++    }
++
++    /// The newest spare descriptor pool of `device` whose room `fits`, reset.
++    fn descriptor_pool_where(
++        &self,
++        device: &DeviceShared,
++        fits: impl Fn(&Room) -> bool,
++    ) -> Result<Option<DescriptorPool>, Error> {
+         if exit_guard::in_section() {
+             return Ok(None);
+         }
+-        let pool = take_descriptor_pool(&mut lock(&self.descriptor_pools), needs);
++        let pool = take_descriptor_pool_where(&mut lock(&self.descriptor_pools), fits);
+         let Some(pool) = pool else {
+             return Ok(None);
+         };
+@@ -235,7 +257,15 @@
+     pools: &mut VecDeque<DescriptorPool>,
+     needs: &SetNeeds,
+ ) -> Option<DescriptorPool> {
+-    let at = pools.iter().rposition(|pool| pool.room.fits(needs))?;
++    take_descriptor_pool_where(pools, |room| room.fits(needs))
++}
++
++/// The newest of the spare descriptor pools `pools` (oldest first) whose room `fits`, taken out.
++fn take_descriptor_pool_where(
++    pools: &mut VecDeque<DescriptorPool>,
++    fits: impl Fn(&Room) -> bool,
++) -> Option<DescriptorPool> {
++    let at = pools.iter().rposition(|pool| fits(&pool.room))?;
+     pools.remove(at)
+ }
+ 
