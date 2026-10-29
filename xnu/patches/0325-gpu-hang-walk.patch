@@ -1,0 +1,141 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index b8d91cf..a2d7f33 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -3249,6 +3249,128 @@ gpu_hang_ib(const char *tag, uint64_t base, uint32_t init, uint32_t rem)
+ 	printf("PANDORA GPU HANG: %s %llx not in a pool buffer\n", tag, (unsigned long long)base);
+ }
+ 
++/* 0325: the GPU page table's leaf for VA, 0 when there is none. */
++static uint64_t
++smmu_leaf(struct smmu_ctx *c, uint64_t va)
++{
++	uint64_t pool = c->tables.root_physical;
++	unsigned in = c->tcfg.input_bits, start = c->tables.start_level;
++	if (va >= (1ull << in)) {
++		return 0;
++	}
++	uint64_t *t = (uint64_t *)c->tva;
++	for (unsigned level = start; level < 3 && t; level++) {
++		unsigned shift = 39 - 9 * level, width = level == start ? in - shift : 9;
++		uint64_t e = t[(va >> shift) & ((1u << width) - 1)];
++		t = e ? (uint64_t *)(c->tva + ((e & 0xfffffffff000ull) - pool)) : NULL;
++	}
++	return t ? t[(va >> 12) & 511] : 0;
++}
++
++/* 0325: the mapped buffer that holds [va, va + len), NULL when none does. */
++static const struct gpu_bo *
++gpu_bo_at(uint64_t va, uint64_t len)
++{
++	for (unsigned j = 0; j < GPU_MAX_BOS; j++) {
++		const struct gpu_bo *b = &gpu_bos[j];
++		if (b->used && b->iova && va >= b->iova && va + len <= b->iova + b->bytes) {
++			return b;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * 0325: post15, post18 and post19 hung the same way: the BR in an IB2 at an address without its upper
++ * half (0xed42000, 0, 0x5362000; the client windows start at 4 GiB), an SMMU fault on it, then an opcode
++ * error (CP_INTERRUPT_STATUS_PIPE bit 8). This walks the whole IB1 as it is in memory now and lists its
++ * CP_INDIRECT_BUFFER (0x3f) and CP_INDIRECT_BUFFER_CHAIN (0x57) packets, and the CP_SET_DRAW_STATE
++ * (0x43) groups whose address is in no buffer or has the low half the CP took. If the packet there has
++ * the address the CP took, its writer put it there; if it has the full address, the CP read something
++ * else than what the memory holds now. Also the GPU page table's leaf for the IB1 next to the pool page
++ * its buffer has, and the first dwords at the CP's IB2 address with the IB1's upper half.
++ */
++static void
++gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
++{
++	const struct gpu_bo *b = base && init ? gpu_bo_at(base, (uint64_t)init * 4) : NULL;
++	if (!b || b->pages || init > (1u << 20)) {
++		printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u is in no pool buffer\n", name, (unsigned long long)base, init);
++		return;
++	}
++	const uint64_t off = b->off + (base - b->iova), len = (uint64_t)init * 4;
++	printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u in buffer %llx+%llx of client %d; page table %llx, pool page %llx\n",
++	    name, (unsigned long long)base, init, (unsigned long long)b->iova, (unsigned long long)b->bytes, b->client,
++	    (unsigned long long)(smmu_leaf(&gpu_smmu, base) & 0xfffffffff000ull),
++	    (unsigned long long)((gpu_pool_pa + off) & ~0xfffull));
++	gpu_pool_sync(off, len, true);
++	vm_offset_t va = gpu_pool_map(off, len);
++	if (!va) {
++		return;
++	}
++	const volatile uint32_t *p = (const volatile uint32_t *)va;
++	uint32_t calls = 0, groups = 0, outside = 0, lines = 0, i = 0;
++	while (i < init) {
++		const uint32_t h = p[i], type = h >> 28, op = (h >> 16) & 0x7f;
++		const uint32_t cnt = type == 7 ? (h & 0x3fff) : type == 4 ? (h & 0x7f) : UINT32_MAX;
++		if (cnt == UINT32_MAX || i + 1 + cnt > init) {
++			printf("PANDORA GPU HANG: %s IB1 walk: no packet at +%u (%08x)\n", name, i, h);
++			break;
++		}
++		if (type == 7 && (op == 0x3f || op == 0x57) && cnt >= 3) {
++			const uint64_t a = p[i + 1] | ((uint64_t)p[i + 2] << 32);
++			const uint32_t sz = p[i + 3] & 0xfffff;
++			const bool in = gpu_bo_at(a, (uint64_t)MAX(sz, 1u) * 4) != NULL, hit = (uint32_t)a == (uint32_t)cp_ib2;
++			calls++;
++			outside += !in;
++			if (lines < 32 && (lines < 16 || !in || hit)) {
++				lines++;
++				printf("PANDORA GPU HANG: %s IB1 +%u: %s %llx+%u%s%s\n", name, i, op == 0x3f ? "IB" : "IB chain",
++				    (unsigned long long)a, sz, in ? "" : " in no buffer", hit ? " <- the CP's IB2" : "");
++			}
++		} else if (type == 7 && op == 0x43) {
++			for (uint32_t g = 0; g + 3 <= cnt; g += 3) {
++				const uint32_t d = p[i + 1 + g];
++				const uint64_t a = p[i + 2 + g] | ((uint64_t)p[i + 3 + g] << 32);
++				if ((d & 0xffff) == 0 || (d & (3u << 17))) {   /* empty, DISABLE, DISABLE_ALL_GROUPS */
++					continue;
++				}
++				const bool in = gpu_bo_at(a, (uint64_t)(d & 0xffff) * 4) != NULL, hit = (uint32_t)a == (uint32_t)cp_ib2;
++				groups++;
++				outside += !in;
++				if (lines < 32 && (!in || hit)) {
++					lines++;
++					printf("PANDORA GPU HANG: %s IB1 +%u: draw state group %u %llx+%u flags %x%s%s\n", name, i,
++					    (d >> 24) & 0x3f, (unsigned long long)a, d & 0xffff, (d >> 16) & 0xff,
++					    in ? "" : " in no buffer", hit ? " <- the CP's IB2" : "");
++				}
++			}
++		}
++		i += 1 + cnt;
++	}
++	gpu_pool_unmap(va, off, len);
++	printf("PANDORA GPU HANG: %s IB1 walk: %u dwords read, %u IB calls, %u draw state groups, %u in no buffer\n",
++	    name, i, calls, groups, outside);
++	const uint64_t full = (base & ~0xffffffffull) | (uint32_t)cp_ib2;
++	const struct gpu_bo *t = cp_ib2 >> 32 ? NULL : gpu_bo_at(full, 32);
++	if (t && !t->pages) {
++		const uint64_t toff = t->off + (full - t->iova);
++		gpu_pool_sync(toff, 32, true);
++		vm_offset_t tva = gpu_pool_map(toff, 32);
++		if (tva) {
++			const volatile uint32_t *q = (const volatile uint32_t *)tva;
++			printf("PANDORA GPU HANG: %s IB2 %llx with the IB1's upper half, in buffer %llx+%llx of client %d: "
++			    "%08x %08x %08x %08x %08x %08x %08x %08x\n", name, (unsigned long long)full,
++			    (unsigned long long)t->iova, (unsigned long long)t->bytes, t->client, q[0], q[1], q[2], q[3], q[4],
++			    q[5], q[6], q[7]);
++			gpu_pool_unmap(tva, toff, 32);
++		}
++	} else if (cp_ib2 && !(cp_ib2 >> 32)) {
++		printf("PANDORA GPU HANG: %s IB2 %llx with the IB1's upper half is in no pool buffer\n", name,
++		    (unsigned long long)full);
++	}
++}
++
+ static void
+ gpu_hang_dump(uint32_t ring)
+ {
+@@ -3276,6 +3398,7 @@ gpu_hang_dump(uint32_t ring)
+ 		gpu_hang_ib(tag, ib1, i1, r1);
+ 		snprintf(tag, sizeof(tag), "%s IB2", name);
+ 		gpu_hang_ib(tag, ib2, i2, r2);
++		gpu_hang_walk(name, ib1, i1, ib2);   /* 0325 */
+ 	}
+ 	gw(CP_APERTURE_CNTL_HOST, 0);
+ 	for (uint32_t k = 0; k < GPU_HIST; k++) {
