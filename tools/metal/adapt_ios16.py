@@ -1259,6 +1259,40 @@ fn pandora_boot_arg_is(name: &str, value: &str) -> bool {
     args.split_whitespace().any(|arg| arg.trim_end_matches('\0') == wanted)
 }
 ''')
+# A texture made on an IOSurface counts as a use of the surface (IOSurfaceIncrementUseCount) until it goes. Settings showed
+# one row's words in another row for a second or two (shot1, shot2: 完成 and 音符 drawn as 圆圈, the row below), with
+# every imported surface out of the CPU caches before each submission too (shot2, pandora_gpu_flushall=1). QuartzCore
+# reuses a backing-store buffer when IOSurfaceIsInUse says no (buffer_is_unused, ios-fuxi docs-lanes/gpu-scanout.md);
+# the kernel publishes the clients' use counts there (0217), but nothing counted the render server's textures, so an
+# app could draw new words into a surface backboardd still showed. ios-fuxi's frontend counts its imports the same way.
+# Views hold their parent texture and count nothing of their own. Only the render server counts, as AdrenoMetal aff537e
+# does: a client's textures over its own drawables would keep them in use while CAMetalLayer holds them for reuse.
+edit('NativeBridgeMetalFrontend.mm',
+     """@property(nonatomic) IOSurfaceRef surface;
+""",
+     """@property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic) BOOL surfaceUse;   // data-a-live: holds an IOSurfaceIncrementUseCount
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}""",
+     """- (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_surfaceUse)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}""")
+edit('NativeBridgeMetalFrontend.mm',
+     """gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;""",
+     """gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ static const bool countsUse=!strcmp(getprogname(),"backboardd");
+ if(countsUse){IOSurfaceIncrementUseCount(surface);texture.surfaceUse=YES;}
+ return (id<MTLTexture>)texture;""")
+
+# AegirPoster (the Astronomy poster) aborted at every launch with CAMetalLayerInvalid "unsupported extended range format"
+# (post1): QuartzCore's layer pixel-format check asks supportsExtendedXR10Formats for its BGR10_XR_sRGB layer, and the
+# frontend answers NO in every process. The NO stays for the render server (an XR10 answer there picks a 64-bit
+# framebuffer this scanout cannot show, int-089) and PosterBoard; poster extensions get the device's answer, as
+# AdrenoMetal aff537e and myron's stage 115 (AEGIRPOSTER-SOLUTION.md 3.5) do.
+edit('NativeBridgeMetalFrontend.mm',
+     """   if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;""",
+     """   if(!strcmp(name,"supportsExtendedXR10Formats") && (!strstr(getprogname(),"Poster") || !strcmp(getprogname(),"PosterBoard")))value=0;
+   if(!strcmp(name,"supportsExtendedXR10Formats"))NSLog(@"pandora-metal: supportsExtendedXR10Formats %llu",(unsigned long long)value);""")
+
 p = ROOT / 'NativeBridgeMetalFrontend.mm'
 p.write_text(p.read_text() + r'''
 // data-a-live: the runtime's work counts that changed since the last call (NativeMetalObjects.rs nmb_device_work_counts).
