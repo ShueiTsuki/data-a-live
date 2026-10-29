@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+index d231dba..b8d91cf 100644
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -3396,6 +3396,42 @@ const uint32_t pandora_gpu_level_count = NGPU - 1;   /* levels 1 .. this */
+ /* qcom,gpu-pwrlevels-1 qcom,bus-freq per level, in gpu_opps order (160 .. 1200 MHz). */
+ static const uint8_t gpu_opp_bw[] = { 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11 };
+ 
++/*
++ * 0324: a context fault as it happens. The DCVS thread wakes every 16 ms; the watch looks every 5 s, when the job
++ * that faulted has long retired (post18: two reads of address 0, then a hang, and no way to tell whose). Each new
++ * fault: its address and syndromes, UCHE_CLIENT_PF (the part of the GPU behind a UCHE fault, as Linux's
++ * a6xx_fault_handler reads it), and the job then on the GPU, the first one not retired. The watch still clears
++ * the status. FSR bit 10 stays set from boot on (the watch's note), so only the other bits count.
++ */
++#define UCHE_CLIENT_PF_A8XX 0x0e11u
++static uint32_t gpu_fault_fsr, gpu_fault_far;
++
++static void
++gpu_fault_check(void)
++{
++	const uint32_t fsr = gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x58);
++	if ((fsr & ~0x400u) == 0) {
++		gpu_fault_fsr = fsr;
++		return;
++	}
++	const uint32_t far_lo = gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x60);
++	if (fsr == gpu_fault_fsr && far_lo == gpu_fault_far) {
++		return;
++	}
++	gpu_fault_fsr = fsr;
++	gpu_fault_far = far_lo;
++	const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
++	flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
++	const uint32_t ring = mem[1];
++	const struct gpu_hist *h = &gpu_hist[(ring + 1) % GPU_HIST];
++	const bool known = h->seq == ring + 1 && h->client >= 0 && h->client < (int)GPU_MAX_CLIENTS;
++	printf("PANDORA GPU FAULT: fsr %08x far %08x%08x fsynr0 %08x fsynr1 %08x uche client pf %08x; retired %u issued %u; "
++	    "next fence %u client %d (%s) thread %u ibs %u ib0 %llx+%u\n", fsr,
++	    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x64), far_lo, gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x68),
++	    gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x6c), gr(UCHE_CLIENT_PF_A8XX), ring, gpu_seqno, h->seq, h->client,
++	    known ? gpu_clients[h->client].name : "?", h->thread, h->n, (unsigned long long)h->ib0, h->dw0);
++}
++
+ static uint64_t
+ gpu_busy_ticks(void)
+ {
+@@ -3464,6 +3500,7 @@ gpu_dcvs_thread(void *arg, wait_result_t result)
+ 		clock_interval_to_deadline(DCVS_TICK_MS, NSEC_PER_MSEC, &deadline);
+ 		(void)assert_wait_deadline(&gpu_dcvs_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
++		gpu_fault_check();   /* 0324 */
+ 		const uint64_t busy = gpu_busy_ticks(), t = mach_absolute_time();
+ 		uint64_t ns, since;
+ 		absolutetime_to_nanoseconds(t - last_t, &ns);

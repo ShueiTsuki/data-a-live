@@ -62,6 +62,52 @@ edit('NativeAdrenoMetalPlugin.mm',
     }
     if (port) return publish::clientDevice(port);
     static bool attempted;""")
+edit('bridge/NativeMetalObjects.rs',
+     """#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
+    guard(false, || {
+        get(command_buffer)?.0.commit().map_err(e("commit"))?;
+        Ok(true)
+    })
+}""",
+     """// data-a-live: what a completed command buffer's execution status reported beyond a clean run, through syslog (the
+// unified log), the first 64 per process: resident-set misses (a stored pointer that reached no resident allocation,
+// or null), a read of an argument function constants removed, a device replay fault, a clamped indirect count, a
+// cubic argument sampler. post18's hang followed two GPU reads of address 0 by the Astronomy poster.
+unsafe extern "C" {
+    fn syslog(priority: i32, format: *const c_char, ...);
+}
+
+fn nmb_report_execution(done: &CommandBuffer) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    let Some(report) = done.execution_report() else { return };
+    if !(report.resident_miss || report.absent_argument_read || report.replay_fault || report.overflow
+        || report.cubic_argument_sampler)
+    {
+        return;
+    }
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    let text = format!(
+        "pandora-metal: execution report: resident misses {} ({}), absent argument read {}, replay fault {} ({:#x}), \\
+         clamped {}, cubic argument sampler {}\\0",
+        report.resident_misses, report.resident_miss, report.absent_argument_read, report.replay_fault,
+        report.replay_faults.0, report.overflow, report.cubic_argument_sampler
+    );
+    unsafe { syslog(3, c"%s".as_ptr(), text.as_ptr() as *const c_char) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
+    guard(false, || {
+        let command_buffer = &get(command_buffer)?.0;
+        let _ = command_buffer.add_completed_handler(Box::new(nmb_report_execution));
+        command_buffer.commit().map_err(e("commit"))?;
+        Ok(true)
+    })
+}""")
 edit('NativeAdrenoMetalPlugin.mm',
      """static id clientDevice(unsigned port) {
     if (!listedClient()) return nil;""",
