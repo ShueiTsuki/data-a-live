@@ -1,14 +1,27 @@
-diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
-index d11fe26..d9db0a4 100644
---- a/iokit/Kernel/arm/SweetKeyStore.cpp
-+++ b/iokit/Kernel/arm/SweetKeyStore.cpp
-@@ -238,4 +238,68 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
- 	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
- 	return ret;
- }
-+
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index efdec4c..fb9a36a 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,12 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#if defined(PANDORA)
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOKitKeys.h>
++#include <sys/proc.h>
++#endif
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -129,4 +135,70 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+  * is what the iPhone userland (MobileGestalt) expects.
+  */
++#if defined(PANDORA)
 +/*
-+ * PANDORA (0314): Apple's FairPlay driver by its class names, refusing every call. The real one
++ * 0314: Apple's FairPlay driver by its class names, refusing every call. The real one
 + * (com.apple.driver.FairPlayIOKit) works with keys this SoC does not have; without any, fairplayd exits at
 + * start and the requests to its ports (locationd's FairPlay signer among them) wait for good. With this one
 + * fairplayd runs and answers them with its own errors. The first 64 calls are logged.
@@ -65,11 +78,13 @@ index d11fe26..d9db0a4 100644
 +		IOLog("PANDORA FAIRPLAY: %s sel %u in %u/%u out %u/%u -> unsupported\n", name, selector,
 +		    args->scalarInputCount, args->structureInputDescriptor != NULL ?
 +		    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize,
-+		    args->scalarOutputCount, sweet_aks_struct_out_size(args));
++		    args->scalarOutputCount, args->structureOutputDescriptor != NULL ?
++		    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize);
 +	}
 +	args->scalarOutputCount = 0;
 +	return kIOReturnUnsupported;
 +}
++#endif /* PANDORA */
  #endif /* SWEET */
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index 9227aaf..5b04c8f 100644

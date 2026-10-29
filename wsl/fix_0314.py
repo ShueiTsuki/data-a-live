@@ -14,19 +14,23 @@ def patch(p, subs):
 # special port 17) with no timeout, its silo hangs and with it locationd's SPI service, where the Astronomy poster's
 # editor waits for its location authorization (post3, post4). A driver with Apple's class names that refuses every
 # call lets fairplayd run and answer its clients with FairPlay's own errors.
-patch('iokit/Kernel/arm/SweetKeyStore.cpp', [
-    ("""	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\\n", name, selector,
-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
-	return ret;
-}
-#endif /* SWEET */""",
-     """	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\\n", name, selector,
-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
-	return ret;
-}
-
+# In SweetPlatformExpert.cpp, a file local builds already compile: the first try put it in SweetKeyStore.cpp, which
+# had only ever come from CI objects, and that kernel (post5) panicked before the USB console came up.
+patch('iokit/Kernel/arm/SweetPlatformExpert.cpp', [
+    ("""#include <IOKit/IOLib.h>
+""",
+     """#include <IOKit/IOLib.h>
+#if defined(PANDORA)
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOKitKeys.h>
+#include <sys/proc.h>
+#endif
+"""),
+    ("""#endif /* SWEET */""",
+     """#if defined(PANDORA)
 /*
- * PANDORA (0314): Apple's FairPlay driver by its class names, refusing every call. The real one
+ * 0314: Apple's FairPlay driver by its class names, refusing every call. The real one
  * (com.apple.driver.FairPlayIOKit) works with keys this SoC does not have; without any, fairplayd exits at
  * start and the requests to its ports (locationd's FairPlay signer among them) wait for good. With this one
  * fairplayd runs and answers them with its own errors. The first 64 calls are logged.
@@ -83,11 +87,13 @@ com_apple_driver_FairPlayIOKitUserClient::externalMethod(uint32_t selector, IOEx
 		IOLog("PANDORA FAIRPLAY: %s sel %u in %u/%u out %u/%u -> unsupported\\n", name, selector,
 		    args->scalarInputCount, args->structureInputDescriptor != NULL ?
 		    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize,
-		    args->scalarOutputCount, sweet_aks_struct_out_size(args));
+		    args->scalarOutputCount, args->structureOutputDescriptor != NULL ?
+		    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize);
 	}
 	args->scalarOutputCount = 0;
 	return kIOReturnUnsupported;
 }
+#endif /* PANDORA */
 #endif /* SWEET */"""),
 ])
 
