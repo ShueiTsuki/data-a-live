@@ -28,7 +28,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
-LOG_CFG=() RENAMES=() PUTS=() EXECS=()
+LOG_CFG=() RENAMES=() PUTS=() EXECS=() RMS=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -47,6 +47,7 @@ while [ $# -gt 0 ]; do
 	--rename) RENAMES+=("$2"); shift 2 ;;  # "FROM TO": the installer renames FROM to TO in iOS (patch 0286), repeatable
 	--put) PUTS+=("$2"); shift 2 ;;        # "LOCAL MODE DEST": install LOCAL at DEST in iOS, repeatable
 	--exec) EXECS+=("$2"); shift 2 ;;      # "LOCAL MODE DEST": as --put, and LOCAL (signed) goes into the trust cache
+	--rm) RMS+=("$2"); shift 2 ;;          # "PATH": the installer removes the file PATH in iOS (patch 0297), repeatable
 	*) echo "unknown option $1"; exit 2 ;;
 	esac
 done
@@ -171,6 +172,9 @@ for c in "${LOG_CFG[@]}"; do
 done
 for r in "${RENAMES[@]}"; do
 	printf '> %s\n' "$r" >> "$T/files.txt"
+done
+for r in "${RMS[@]}"; do
+	printf '! - %s\n' "$r" >> "$T/files.txt"
 done
 # --put: the pack names files by basename, so each goes in under its own name (put<N>.<basename>)
 n=0

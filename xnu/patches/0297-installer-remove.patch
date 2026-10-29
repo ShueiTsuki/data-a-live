@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 1e65141..979715a 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1855,11 +1855,13 @@ spk_graph_begin(void)
+ 	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
+ 	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x08001B07u, d, 4), false);
+ 	{
+-		/* 0276: the stream's volume control (0x401f, MODULE_ID_VOL_CTRL) has no calibration in the ACDB; PAL sets
+-		 * the stream volume itself at stream start, and Linux q6apm sets VOL_CTRL_DEFAULT_GAIN 0x2000 (Q13, unity).
+-		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. Unity gain and unmute
+-		 * (PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain, u16 0}, _MUTE 0x08001036 {u32 0}) there, and unmute
+-		 * on the device volume control (0x437e, calibrated to 0x2000). */
++		/* 0276: unity gain and unmute on the stream's volume control (0x401f, MODULE_ID_VOL_CTRL;
++		 * PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain Q13, u16 0}, _MUTE 0x08001036 {u32 0}) and unmute on
++		 * the device volume control (0x437e, calibrated to 0x2000), as Linux q6apm's VOL_CTRL_DEFAULT_GAIN.
++		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. 0x401f's calibration is
++		 * the ACDB's Volume table (spkgraph.bin): Level_15, which the graph had until aud25, mutes it and gives
++		 * its channels 0x00170894 (Q28, -45 dB) in 0x08001038, which this does not touch; Level_0 has no mute
++		 * and 0x10000000 (0 dB) there. */
+ 		uint8_t v[96], g[4] = {0x00, 0x20, 0, 0}, m[4] = {0, 0, 0, 0};
+ 		uint32_t vl = spk_param(v, 0x401f, 0x08001035u, g, 4);
+ 		vl += spk_param(v + vl, 0x401f, 0x08001036u, m, 4);
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+index 62cebf0..8a719e1 100644
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -9,6 +9,7 @@
+  * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
+  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
+  * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
++ * Patch 0297: a "! - PATH" line removes the file PATH (a missing one counts as done).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -30,6 +31,7 @@ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vnode_t rootvnode;
+ extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
+ extern int pandora_rename(const char *from, const char *to);   /* bsd/vfs/vfs_syscalls.c (patch 0286) */
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);   /* bsd/vfs/vfs_syscalls.c */
+ void pandora_files_init(void);
+ 
+ #define PF_MAX_FILE   (64u << 20)
+@@ -203,6 +205,21 @@ pf_thread(void *arg, wait_result_t result)
+ 			}
+ 			continue;
+ 		}
++		/* "! - PATH" (patch 0297): remove the file PATH as the unlink syscall does. First user: the listening
++		 * test's player (Camera.app/PP) and its music, gone again after the test as the user asked. */
++		if (!strcmp(name, "!") && path[0] == '/') {
++			int error = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++			if (!error) {
++				written++;
++				printf("PANDORA FILES: removed %s\n", path);
++			} else if (error == ENOENT) {
++				same++;
++			} else {
++				failed++;
++				printf("PANDORA FILES: remove %s: error %d\n", path, error);
++			}
++			continue;
++		}
+ 		struct pf_ent *e = pf_find(name);
+ 		if (!e || e->size > PF_MAX_FILE || path[0] != '/') {
+ 			printf("PANDORA FILES: %s: not in the pack or too big\n", name);

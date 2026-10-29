@@ -9,6 +9,7 @@
  * Patch 0182: files up to 64 MiB, copied and compared 1 MiB at a time (the Turnip library).
  * Patch 0185: a "- MODE PATH" line makes the directory PATH (an existing one counts as the same).
  * Patch 0286: a "> FROM TO" line renames FROM to TO (a missing FROM counts as done).
+ * Patch 0297: a "! - PATH" line removes the file PATH (a missing one counts as done).
  */
 #if defined(PANDORA)
 #include <sys/param.h>
@@ -30,6 +31,7 @@ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
 extern vnode_t rootvnode;
 extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
 extern int pandora_rename(const char *from, const char *to);   /* bsd/vfs/vfs_syscalls.c (patch 0286) */
+extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);   /* bsd/vfs/vfs_syscalls.c */
 void pandora_files_init(void);
 
 #define PF_MAX_FILE   (64u << 20)
@@ -200,6 +202,21 @@ pf_thread(void *arg, wait_result_t result)
 			} else {
 				failed++;
 				printf("PANDORA FILES: rename %s -> %s: error %d\n", from, path, error);
+			}
+			continue;
+		}
+		/* "! - PATH" (patch 0297): remove the file PATH as the unlink syscall does. First user: the listening
+		 * test's player (Camera.app/PP) and its music, gone again after the test as the user asked. */
+		if (!strcmp(name, "!") && path[0] == '/') {
+			int error = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+			if (!error) {
+				written++;
+				printf("PANDORA FILES: removed %s\n", path);
+			} else if (error == ENOENT) {
+				same++;
+			} else {
+				failed++;
+				printf("PANDORA FILES: remove %s: error %d\n", path, error);
 			}
 			continue;
 		}

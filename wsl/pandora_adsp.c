@@ -815,7 +815,7 @@ struct edge {
 	uint32_t bells[2];                       /* doorbells seen: SMP2P, GLINK */
 	struct {
 		uint8_t agreed, broken;
-		uint32_t unknown, bells;
+		uint32_t unknown;
 	} shown;                                 /* what gl_report printed last */
 };
 static struct edge ed_adsp = {.name = "ADSP", .pid = AD_PID, .item_in = AD_ITEM_P2P_IN,
@@ -1249,22 +1249,22 @@ gl_service(struct edge *e)
 	(void)qcom_glink_poll(&e->gl);
 }
 
-/* What changed in the link since the last report. */
+/* The link's state when it changed (agreed, broken, opens nobody serves) and with FORCE (every 5 s at first, then
+ * every 60 s). 0298: no longer for every doorbell: with the speaker graph up (pandora_spk_live) each 20 ms buffer
+ * rings, and the line filled the log (aud23-aud26). */
 static void
 gl_report(struct edge *e, bool force)
 {
 	if (!e->gl_on) {
 		return;
 	}
-	uint32_t bells = e->bells[0] + e->bells[1];
 	if (!force && e->shown.agreed == e->gl.version_agreed && e->shown.broken == e->gl.broken &&
-	    e->shown.unknown == e->gl.unknown_opens && e->shown.bells == bells) {
+	    e->shown.unknown == e->gl.unknown_opens) {
 		return;
 	}
 	e->shown.agreed = e->gl.version_agreed;
 	e->shown.broken = e->gl.broken;
 	e->shown.unknown = e->gl.unknown_opens;
-	e->shown.bells = bells;
 	e->gl.unknown_names[sizeof(e->gl.unknown_names) - 1] = 0;
 	printf("PANDORA %s: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
 	    "serves %u (%s); FIFOs ours %u/%u theirs %u/%u (tail/head); doorbells SMP2P %u GLINK %u; AOP %u other %u "
@@ -1855,11 +1855,13 @@ spk_graph_begin(void)
 	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
 	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, 0x4163, 0x08001B07u, d, 4), false);
 	{
-		/* 0276: the stream's volume control (0x401f, MODULE_ID_VOL_CTRL) has no calibration in the ACDB; PAL sets
-		 * the stream volume itself at stream start, and Linux q6apm sets VOL_CTRL_DEFAULT_GAIN 0x2000 (Q13, unity).
-		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. Unity gain and unmute
-		 * (PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain, u16 0}, _MUTE 0x08001036 {u32 0}) there, and unmute
-		 * on the device volume control (0x437e, calibrated to 0x2000). */
+		/* 0276: unity gain and unmute on the stream's volume control (0x401f, MODULE_ID_VOL_CTRL;
+		 * PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain Q13, u16 0}, _MUTE 0x08001036 {u32 0}) and unmute on
+		 * the device volume control (0x437e, calibrated to 0x2000), as Linux q6apm's VOL_CTRL_DEFAULT_GAIN.
+		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. 0x401f's calibration is
+		 * the ACDB's Volume table (spkgraph.bin): Level_15, which the graph had until aud25, mutes it and gives
+		 * its channels 0x00170894 (Q28, -45 dB) in 0x08001038, which this does not touch; Level_0 has no mute
+		 * and 0x10000000 (0 dB) there. */
 		uint8_t v[96], g[4] = {0x00, 0x20, 0, 0}, m[4] = {0, 0, 0, 0};
 		uint32_t vl = spk_param(v, 0x401f, 0x08001035u, g, 4);
 		vl += spk_param(v + vl, 0x401f, 0x08001036u, m, 4);

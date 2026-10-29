@@ -4,7 +4,12 @@ Reads the phone's ACDB (/odm/etc/acdbdata/Mi/Mi_acdb_cal.acdb; a copy of a phone
 the repo, as OUT is) and writes what bsd/dev/pandora_adsp.c sends to the DSP's APM to open and calibrate
 the graph Android opens for a speaker playback (D:\\DeepSeekHarness\\spkstart, acdbcheck): graph key
 vector StreamRX PCM_Deep_Buffer, Instance 1, DeviceRX Speaker, DevicePP_Rx Audio_MIPLAY; calibration
-key vector Volume 15.
+key vector Volume 0.
+
+Volume picks one of the stream subgraph's 16 tables for its volume module 0x401f (acdbcheck
+raw/ckv_volume_table.txt): Level_0 has the gain 0x10000000 (Q28, 0 dB), each level about 3 dB less, Level_15
+0x00170894 (-45 dB). The Android playback that was traced had Level_15 at media volume 0; iOS scales the
+samples by its own volume before they reach the ring, so the DSP takes them at Level_0, Android's full volume.
 
 The layouts are AudioReach graphservices' (acdb/src/acdb_command.c, gsl/src/gsl_graph.c):
   OPEN  the APM_CMD_GRAPH_OPEN payload: AcdbCmdGetSubgraphData's SPF blob (each subgraph's SPF
@@ -26,7 +31,7 @@ import struct
 import sys
 
 GKV = {0xa1000000: 0xa1000001, 0xab000000: 0x1, 0xa2000000: 0xa2000001, 0xac000000: 0xac000100}
-CKV = {0xa4000000: 0xf}
+CKV = {0xa4000000: 0x0}                # Volume Level_0
 TAG_HW_EP_RX = 0xc0000004
 TKV = {0xa9000000: 2}                  # Channels
 PARAM_ID_TDM_INTF_CFG = 0x0800101B

@@ -24,6 +24,8 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSCollectionIterator.h>
 #include <libkern/c++/OSSymbol.h>
@@ -181,6 +183,22 @@ void
 pandora_audio_ringer_known(void)
 {
 	pa_ringer_known = true;
+}
+
+/* 0298: the amps' power follows the speaker's IO (bsd/dev/pandora_amp.c); a power off or restart takes them down
+ * first, through the root domain's priority power-state message (IOPMrootDomain::handlePlatformHaltRestart sends
+ * kIOMessageSystemWillPowerOff / WillRestart to these clients one after another and waits for each). */
+#define PA_AMP_WAIT_MS 300u
+extern "C" int pandora_amp_io(int on, unsigned wait_ms);
+extern "C" void pandora_amp_final(const char *why);
+
+static IOReturn
+pa_power_message(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
+{
+	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) {
+		pandora_amp_final(type == kIOMessageSystemWillRestart ? "restart" : "power off");
+	}
+	return kIOReturnSuccess;
 }
 
 static uint64_t
@@ -378,6 +396,9 @@ IOAudio2Device::start(IOService *provider)
 	if (pa_speaker == nullptr) {
 		retain();
 		pa_speaker = this;
+		if (registerPrioritySleepWakeInterest(pa_power_message, this, nullptr) == nullptr) {
+			IOLog("PANDORA AUDIO Speaker: no power-off message: the amps are not taken down first\n");
+		}
 		provider->retain();
 		thread_t thread;
 		if (kernel_thread_start(pa_supervise, provider, &thread) == KERN_SUCCESS) {
@@ -513,6 +534,11 @@ pa_clock_thread(void *arg, wait_result_t)
 IOReturn
 IOAudio2Device::startIO(void)
 {
+	/* 0298: the amps up before the clock starts (Android powers them up before its first buffer, iOS before the
+	 * engine runs): the start waits for them, up to PA_AMP_WAIT_MS, and goes on either way. */
+	if (!hawking_ && !running_) {
+		(void)pandora_amp_io(1, PA_AMP_WAIT_MS);
+	}
 	for (unsigned t = 0; t < 50 && !running_ && thread_on_; t++) {
 		IOSleep(10);                                     /* the last run's clock thread is still leaving */
 	}
@@ -548,6 +574,9 @@ IOAudio2Device::stopIO(void)
 	IOLockUnlock(lock_);
 	if (was) {
 		IOLog("PANDORA AUDIO %s: IO stopped\n", tag());
+		if (!hawking_) {
+			(void)pandora_amp_io(0, 0);        /* 0298: the amps down, as Android's at its stream's standby */
+		}
 	}
 }
 
