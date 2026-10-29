@@ -2132,10 +2132,14 @@ static uint32_t gpu_seqno;
 
 /* The last submissions, by fence (0193, gpu_hang_dump). */
 #define GPU_HIST 16u
+#define GPU_HIST_IBS 64u        /* 0326: the IBs of a submission kept, the first this many */
 struct gpu_hist {
 	uint32_t seq, thread, n, first, dw0, dwn;
 	int client;
 	uint64_t ib0, ibn;
+	uint32_t nibs;
+	uint64_t ibs[GPU_HIST_IBS];
+	uint32_t dws[GPU_HIST_IBS];
 };
 static struct gpu_hist gpu_hist[GPU_HIST];
 
@@ -2820,6 +2824,50 @@ static int gpu_dcvs_chan;
 static uint32_t gpu_dcvs_kick;
 static uint64_t gpu_last_submit_abs;
 
+/*
+ * 0326: post20's hang dump found no IB call in the IB1 the BR was in, yet the BR was in an IB2 at 0: the
+ * memory of that IB1 no longer held what the CP had read. A submission whose IBs overlap an IB of a
+ * submission still pending, other than the very same IB again (same address and size), means its
+ * memory was written while the GPU could still read it: the first 40 such are logged. Under the lock.
+ */
+static uint32_t gpu_reuse_lines;
+static uint64_t gpu_reuse_count, gpu_resubmit_count;
+
+static void
+gpu_reuse_check(int client, const uint64_t *ib, const uint32_t *dw, unsigned n)
+{
+	const volatile uint32_t *mem = (const volatile uint32_t *)(gpu_bufs[2].va + MEMPTRS_OFF);
+	flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
+	const uint32_t retired = mem[1];
+	for (uint32_t k = 0; k < GPU_HIST; k++) {
+		const struct gpu_hist *h = &gpu_hist[k];
+		if (!h->seq || (int32_t)(h->seq - retired) <= 0) {
+			continue;
+		}
+		for (unsigned i = 0; i < n; i++) {
+			const uint64_t a = ib[i], ae = a + (uint64_t)dw[i] * 4;
+			for (uint32_t j = 0; j < h->nibs; j++) {
+				const uint64_t b = h->ibs[j], be = b + (uint64_t)h->dws[j] * 4;
+				if (a >= be || b >= ae) {
+					continue;
+				}
+				if (a == b && dw[i] == h->dws[j]) {
+					gpu_resubmit_count++;
+					continue;
+				}
+				gpu_reuse_count++;
+				if (gpu_reuse_lines < 40) {
+					gpu_reuse_lines++;
+					printf("PANDORA GPU REUSE: fence %u client %d IB %u %llx+%u overlaps IB %u %llx+%u of fence %u "
+					    "client %d, pending (retired %u); %llu overlaps, %llu same IBs again\n", gpu_seqno + 1,
+					    client, i, (unsigned long long)a, dw[i], j, (unsigned long long)b, h->dws[j], h->seq,
+					    h->client, retired, gpu_reuse_count, gpu_resubmit_count);
+				}
+			}
+		}
+	}
+}
+
 int pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence);
 int
 pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsigned n, uint64_t *fence)
@@ -2891,11 +2939,17 @@ pandora_gpu_submit(int client, const uint64_t *iova, const uint64_t *bytes, unsi
 		}
 	}
 	if (!err) {
+		gpu_reuse_check(client, ib, dw, n);   /* 0326 */
 		uint32_t thread = first == 0x70970001u ? 3 : 1;
 		*fence = gpu_submit(ib, dw, n, thread, gpu_clients[client].reset);
 		struct gpu_hist *h = &gpu_hist[(uint32_t)*fence % GPU_HIST];
 		*h = (struct gpu_hist){ .seq = (uint32_t)*fence, .client = client, .thread = thread, .n = n,
 			                .first = first, .ib0 = ib[0], .dw0 = dw[0], .ibn = ib[n - 1], .dwn = dw[n - 1] };
+		h->nibs = MIN(n, GPU_HIST_IBS);
+		for (unsigned i = 0; i < h->nibs; i++) {
+			h->ibs[i] = ib[i];
+			h->dws[i] = dw[i];
+		}
 		gpu_clients[client].submits++;
 		gpu_clients[client].fence = (uint32_t)*fence;
 		gpu_clients[client].reset = false;
@@ -3289,27 +3343,31 @@ gpu_bo_at(uint64_t va, uint64_t len)
  * the address the CP took, its writer put it there; if it has the full address, the CP read something
  * else than what the memory holds now. Also the GPU page table's leaf for the IB1 next to the pool page
  * its buffer has, and the first dwords at the CP's IB2 address with the IB1's upper half.
+ * QUIET (0326, the IBs of the stuck submission): only the calls in no buffer or at the CP's IB2, and the
+ * summary only when there are some. Returns how many such there were.
  */
-static void
-gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
+static uint32_t
+gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2, bool quiet)
 {
 	const struct gpu_bo *b = base && init ? gpu_bo_at(base, (uint64_t)init * 4) : NULL;
 	if (!b || b->pages || init > (1u << 20)) {
 		printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u is in no pool buffer\n", name, (unsigned long long)base, init);
-		return;
+		return 1;
 	}
 	const uint64_t off = b->off + (base - b->iova), len = (uint64_t)init * 4;
-	printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u in buffer %llx+%llx of client %d; page table %llx, pool page %llx\n",
-	    name, (unsigned long long)base, init, (unsigned long long)b->iova, (unsigned long long)b->bytes, b->client,
-	    (unsigned long long)(smmu_leaf(&gpu_smmu, base) & 0xfffffffff000ull),
-	    (unsigned long long)((gpu_pool_pa + off) & ~0xfffull));
+	if (!quiet) {
+		printf("PANDORA GPU HANG: %s IB1 walk: %llx+%u in buffer %llx+%llx of client %d; page table %llx, pool page %llx\n",
+		    name, (unsigned long long)base, init, (unsigned long long)b->iova, (unsigned long long)b->bytes, b->client,
+		    (unsigned long long)(smmu_leaf(&gpu_smmu, base) & 0xfffffffff000ull),
+		    (unsigned long long)((gpu_pool_pa + off) & ~0xfffull));
+	}
 	gpu_pool_sync(off, len, true);
 	vm_offset_t va = gpu_pool_map(off, len);
 	if (!va) {
-		return;
+		return 0;
 	}
 	const volatile uint32_t *p = (const volatile uint32_t *)va;
-	uint32_t calls = 0, groups = 0, outside = 0, lines = 0, i = 0;
+	uint32_t calls = 0, groups = 0, outside = 0, hits = 0, lines = 0, i = 0;
 	while (i < init) {
 		const uint32_t h = p[i], type = h >> 28, op = (h >> 16) & 0x7f;
 		const uint32_t cnt = type == 7 ? (h & 0x3fff) : type == 4 ? (h & 0x7f) : UINT32_MAX;
@@ -3323,7 +3381,8 @@ gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
 			const bool in = gpu_bo_at(a, (uint64_t)MAX(sz, 1u) * 4) != NULL, hit = (uint32_t)a == (uint32_t)cp_ib2;
 			calls++;
 			outside += !in;
-			if (lines < 32 && (lines < 16 || !in || hit)) {
+			hits += hit;
+			if (lines < 32 && ((!quiet && lines < 16) || !in || hit)) {
 				lines++;
 				printf("PANDORA GPU HANG: %s IB1 +%u: %s %llx+%u%s%s\n", name, i, op == 0x3f ? "IB" : "IB chain",
 				    (unsigned long long)a, sz, in ? "" : " in no buffer", hit ? " <- the CP's IB2" : "");
@@ -3338,6 +3397,7 @@ gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
 				const bool in = gpu_bo_at(a, (uint64_t)(d & 0xffff) * 4) != NULL, hit = (uint32_t)a == (uint32_t)cp_ib2;
 				groups++;
 				outside += !in;
+				hits += hit;
 				if (lines < 32 && (!in || hit)) {
 					lines++;
 					printf("PANDORA GPU HANG: %s IB1 +%u: draw state group %u %llx+%u flags %x%s%s\n", name, i,
@@ -3349,8 +3409,14 @@ gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
 		i += 1 + cnt;
 	}
 	gpu_pool_unmap(va, off, len);
+	if (quiet && !outside && !hits && i == init) {
+		return 0;
+	}
 	printf("PANDORA GPU HANG: %s IB1 walk: %u dwords read, %u IB calls, %u draw state groups, %u in no buffer\n",
 	    name, i, calls, groups, outside);
+	if (quiet) {
+		return outside + hits + (i != init);
+	}
 	const uint64_t full = (base & ~0xffffffffull) | (uint32_t)cp_ib2;
 	const struct gpu_bo *t = cp_ib2 >> 32 ? NULL : gpu_bo_at(full, 32);
 	if (t && !t->pages) {
@@ -3369,6 +3435,7 @@ gpu_hang_walk(const char *name, uint64_t base, uint32_t init, uint64_t cp_ib2)
 		printf("PANDORA GPU HANG: %s IB2 %llx with the IB1's upper half is in no pool buffer\n", name,
 		    (unsigned long long)full);
 	}
+	return outside + hits;
 }
 
 static void
@@ -3377,6 +3444,8 @@ gpu_hang_dump(uint32_t ring)
 	printf("PANDORA GPU HANG: ring timestamp %u, issued %u, rbbm %08x int0 %08x cp int %08x "
 	    "rptr %u rptr bv %u wptr %u\n", ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(RBBM_INT_0_STATUS),
 	    gr(CP_INTERRUPT_STATUS_GLOBAL), gr(CP_RB_RPTR), gr(CP_RB_RPTR_BV), ring_wptr);
+	uint64_t br_ib1 = 0, br_ib2 = 0;
+	uint32_t br_ib1_dw = 0;
 	for (uint32_t pipe = 1; pipe <= 2; pipe++) {
 		gw(CP_APERTURE_CNTL_HOST, CP_APERTURE_PIPE(pipe));
 		printf("PANDORA GPU HANG: %s IB1 base %08x%08x rem %08x init %08x hw fault %08x int %08x sqe %08x\n",
@@ -3391,16 +3460,48 @@ gpu_hang_dump(uint32_t ring)
 		const uint32_t r1 = gr(CP_IB1_REM_SIZE_PIPE), i1 = gr(CP_IB1_INIT_SIZE_PIPE);
 		const uint32_t r2 = gr(CP_IB2_REM_SIZE_PIPE), i2 = gr(CP_IB2_INIT_SIZE_PIPE);
 		const char *name = pipe == 1 ? "BR" : "BV";
-		printf("PANDORA GPU HANG: %s IB2 base %llx rem %08x init %08x IB3 base %llx\n", name,
-		    (unsigned long long)ib2, r2, i2, (unsigned long long)ib3);
+		/* 0326: draw state (SDS) execution, CP_SDS_BASE 0x90c, REM 0x90e, INIT 0x90f (a6xx.xml A8XX). */
+		const uint64_t sds = ((uint64_t)gr(0x90d) << 32) | gr(0x90c);
+		printf("PANDORA GPU HANG: %s IB2 base %llx rem %08x init %08x IB3 base %llx SDS base %llx rem %08x init %08x\n",
+		    name, (unsigned long long)ib2, r2, i2, (unsigned long long)ib3, (unsigned long long)sds, gr(0x90e),
+		    gr(0x90f));
+		if (pipe == 1) {
+			br_ib1 = ib1;
+			br_ib1_dw = i1;
+			br_ib2 = ib2;
+		}
 		char tag[16];
 		snprintf(tag, sizeof(tag), "%s IB1", name);
 		gpu_hang_ib(tag, ib1, i1, r1);
 		snprintf(tag, sizeof(tag), "%s IB2", name);
 		gpu_hang_ib(tag, ib2, i2, r2);
-		gpu_hang_walk(name, ib1, i1, ib2);   /* 0325 */
+		(void)gpu_hang_walk(name, ib1, i1, ib2, false);   /* 0325 */
 	}
 	gw(CP_APERTURE_CNTL_HOST, 0);
+	/* 0326: the submissions that had the BR's IB1 among their IBs, and every IB of the first one pending
+	 * walked for calls in no buffer or at the BR's IB2. */
+	for (uint32_t k = 0; k < GPU_HIST; k++) {
+		const struct gpu_hist *h = &gpu_hist[(gpu_seqno + 1 + k) % GPU_HIST];
+		for (uint32_t j = 0; h->seq && br_ib1 && j < h->nibs; j++) {
+			if (br_ib1 < h->ibs[j] + (uint64_t)h->dws[j] * 4 && h->ibs[j] < br_ib1 + (uint64_t)br_ib1_dw * 4) {
+				printf("PANDORA GPU HANG: BR IB1 %llx+%u is IB %u %llx+%u of fence %u%s client %d\n",
+				    (unsigned long long)br_ib1, br_ib1_dw, j, (unsigned long long)h->ibs[j], h->dws[j], h->seq,
+				    (int32_t)(h->seq - ring) > 0 ? " (pending)" : "", h->client);
+			}
+		}
+	}
+	const struct gpu_hist *stuck = &gpu_hist[(ring + 1) % GPU_HIST];
+	if (stuck->seq == ring + 1) {
+		uint32_t found = 0;
+		for (uint32_t j = 0; j < stuck->nibs; j++) {
+			char tag[32];
+			snprintf(tag, sizeof(tag), "fence %u IB %u", stuck->seq, j);
+			found += gpu_hang_walk(tag, stuck->ibs[j], stuck->dws[j], br_ib2, true);
+		}
+		printf("PANDORA GPU HANG: fence %u: %u of %u IBs walked, %u calls in no buffer or at the BR's IB2; "
+		    "%llu overlaps with pending IBs, %llu same IBs again since boot\n", stuck->seq, stuck->nibs, stuck->n,
+		    found, gpu_reuse_count, gpu_resubmit_count);
+	}
 	for (uint32_t k = 0; k < GPU_HIST; k++) {
 		const struct gpu_hist *h = &gpu_hist[(gpu_seqno + 1 + k) % GPU_HIST];
 		if (h->seq) {
