@@ -124,6 +124,8 @@ public:
 	volatile uint32_t traps_ = 0;
 	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
 	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
+	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
+	uint32_t resyncs_ = 0;
 
 	const char *tag(void) const { return hawking_ ? "Hawking" : "Speaker"; }
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -493,8 +495,8 @@ IOAudio2Device::clockThread(void)
 				peak = a > peak ? a : peak;
 				nonzero += s[i] != 0;
 			}
-			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u\n", tag(), n,
-			    peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_);
+			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u, DSP reads at "
+			    "%llu (%u restarts)\n", tag(), n, peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_, rp_, resyncs_);
 		}
 	}
 	thread_on_ = false;
@@ -520,6 +522,7 @@ IOAudio2Device::startIO(void)
 		return running_ ? kIOReturnSuccess : kIOReturnBusy;
 	}
 	seed_++;
+	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);           /* 0295: no tail of the last run reaches the DSP */
 	t0_ = mach_absolute_time();
 	pa_publish(this, 0);
 	running_ = true;
@@ -546,6 +549,49 @@ IOAudio2Device::stopIO(void)
 	if (was) {
 		IOLog("PANDORA AUDIO %s: IO stopped\n", tag());
 	}
+}
+
+/*
+ * 0295: the speaker's samples for the audio DSP (pandora_adsp.c, pandora_spk_live=1): FRAMES interleaved s32 stereo
+ * frames, slot 0 the top amp, slot 1 the bottom, as the ring holds them. Silence when IO is not running. The DSP takes
+ * a 20 ms buffer each time one comes back and keeps four queued; reads follow on from the last one and stay behind
+ * the sample time of now (our clock, the one the zero time stamps come from), where HAL has written already: it
+ * writes the safety offset (960 frames) ahead of now. A run starts PA_OUT_LAG + 4 buffers back so that after the
+ * first four the reads are PA_OUT_LAG behind; a read ahead of now or more than PA_OUT_SLACK behind starts over there.
+ * Returns the frames taken from the ring.
+ */
+#define PA_OUT_LAG        960u
+#define PA_OUT_SLACK      (PA_RING_FRAMES / 2u)
+
+extern "C" uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
+uint32_t
+pandora_audio_out_fill(int32_t *dst, uint32_t frames)
+{
+	IOAudio2Device *d = pa_speaker;
+	if (d == nullptr || !d->running_ || d->ring_ == nullptr || frames > PA_RING_FRAMES) {
+		bzero(dst, (size_t)frames * PA_BYTES_FRAME);
+		return 0;
+	}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - d->t0_, &ns);
+	const uint64_t now = ns * 3u / 62500u;                    /* frames at 48 kHz */
+	const uint64_t start_back = PA_OUT_LAG + 4u * frames;
+	if (d->rp_seed_ != d->seed_ || d->rp_ + frames > now || d->rp_ + PA_OUT_SLACK < now) {
+		if (d->rp_seed_ == d->seed_) {
+			d->resyncs_++;
+		}
+		d->rp_seed_ = d->seed_;
+		d->rp_ = now > start_back ? now - start_back : 0;
+	}
+	const int32_t *ring = (const int32_t *)d->ring_->getBytesNoCopy();
+	const uint32_t at = (uint32_t)(d->rp_ % PA_RING_FRAMES);
+	const uint32_t first = frames < PA_RING_FRAMES - at ? frames : PA_RING_FRAMES - at;
+	memcpy(dst, ring + (size_t)at * PA_CHANNELS, (size_t)first * PA_BYTES_FRAME);
+	if (first < frames) {
+		memcpy(dst + (size_t)first * PA_CHANNELS, ring, (size_t)(frames - first) * PA_BYTES_FRAME);
+	}
+	d->rp_ += frames;
+	return frames;
 }
 
 IOReturn

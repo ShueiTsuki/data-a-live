@@ -1,0 +1,167 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index ac8fb16..0a84044 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1554,6 +1554,13 @@ static struct {
+ 	uint32_t sent, done, bad, inflight, busy;
+ 	uint64_t frames;
+ } spk_tone;
++/*
++ * 0295: boot-arg pandora_spk_live=1: the speaker graph runs on (no SPK_RUN_MS stop, no test tone) and its buffers
++ * carry iOS's output, pandora_audio_out_fill (PandoraAudio.cpp: the "Speaker" device's ring, silence while its IO is
++ * stopped); pandora_amp.c keeps the amps playing.
++ */
++static int spk_live;
++extern uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
+ 
+ static void
+ spk_put32(uint8_t *p, uint32_t v)
+@@ -1889,6 +1896,10 @@ spk_graph_done(bool aborted)
+ 		    ad_ms(spk.t0), spk.failed);
+ 		spk.state = SpkRunning;
+ 		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
++		if (spk_live) {
++			spk.run_until = ~0ull;
++			printf("PANDORA SPK: live: the graph stays up and plays iOS's speaker output\n");
++		}
+ 		bzero(&spk_tone, sizeof(spk_tone));
+ 		spk_tone.on = true;                   /* 0271: the test tone, from now until the graph stops */
+ 		pandora_amp_tdm();
+@@ -2035,10 +2046,14 @@ spk_tone_pump(void)
+ 			break;
+ 		}
+ 		int32_t *s = (int32_t *)(ad_shm_va + off);
+-		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
+-			const uint64_t n = spk_tone.frames + f;
+-			s[2 * f] = spk_tone_sample(n, true);
+-			s[2 * f + 1] = spk_tone_sample(n, false);
++		if (spk_live) {
++			(void)pandora_audio_out_fill(s, SPK_TONE_FRAMES);
++		} else {
++			for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
++				const uint64_t n = spk_tone.frames + f;
++				s[2 * f] = spk_tone_sample(n, true);
++				s[2 * f + 1] = spk_tone_sample(n, false);
++			}
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		const uint64_t a = ad_shm_pa + off;
+@@ -2821,6 +2836,7 @@ adsp_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("pandora_battery", &battery, sizeof(battery));
+ 	(void)PE_parse_boot_argn("pandora_battery_delay", &bdelay_s, sizeof(bdelay_s));
+ 	(void)PE_parse_boot_argn("pandora_spk", &spk.level, sizeof(spk.level));
++	(void)PE_parse_boot_argn("pandora_spk_live", &spk_live, sizeof(spk_live));
+ 	if (mode < 2) {
+ 		spk.level = 0;                     /* the speakers need the DSP */
+ 	}
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 0326198..a97bca6 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -882,6 +882,24 @@ pa_tdm_thread(void *arg, wait_result_t result)
+ 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
+ 		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
+ 	}
++	/* 0295: boot-arg pandora_spk_live=1: the amps keep playing (the DSP sends iOS's speaker output, silence between
++	 * sounds); readouts every 10 s for a minute. Powering down when idle comes later. */
++	int live = 0;
++	(void)PE_parse_boot_argn("pandora_spk_live", &live, sizeof(live));
++	if (live) {
++		for (unsigned s = 10; s <= 60; s += 10) {
++			char when[16];
++			pa_sleep(10000);
++			snprintf(when, sizeof(when), "live %u s", s);
++			pa_levels(0x40, when);
++			pa_levels(0x42, when);
++		}
++		pa_state(0x40, "live 60 s");
++		pa_state(0x42, "live 60 s");
++		printf("PANDORA AMP: live: the amps stay up\n");
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ 	/* 0279: 18 s of play (pandora_adsp.c's bottom, top, both pieces end 18 s after the tone starts, about 16 s into
+ 	 * the play), the firmware's readouts every second. 0278's dump while playing matched Android's chips; not now. */
+ 	for (unsigned s = 1; s <= 18; s++) {
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index cc21f85..306ed25 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -124,6 +124,8 @@ public:
+ 	volatile uint32_t traps_ = 0;
+ 	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
+ 	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
++	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
++	uint32_t resyncs_ = 0;
+ 
+ 	const char *tag(void) const { return hawking_ ? "Hawking" : "Speaker"; }
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -493,8 +495,8 @@ IOAudio2Device::clockThread(void)
+ 				peak = a > peak ? a : peak;
+ 				nonzero += s[i] != 0;
+ 			}
+-			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u\n", tag(), n,
+-			    peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_);
++			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u, DSP reads at "
++			    "%llu (%u restarts)\n", tag(), n, peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_, rp_, resyncs_);
+ 		}
+ 	}
+ 	thread_on_ = false;
+@@ -520,6 +522,7 @@ IOAudio2Device::startIO(void)
+ 		return running_ ? kIOReturnSuccess : kIOReturnBusy;
+ 	}
+ 	seed_++;
++	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);           /* 0295: no tail of the last run reaches the DSP */
+ 	t0_ = mach_absolute_time();
+ 	pa_publish(this, 0);
+ 	running_ = true;
+@@ -548,6 +551,49 @@ IOAudio2Device::stopIO(void)
+ 	}
+ }
+ 
++/*
++ * 0295: the speaker's samples for the audio DSP (pandora_adsp.c, pandora_spk_live=1): FRAMES interleaved s32 stereo
++ * frames, slot 0 the top amp, slot 1 the bottom, as the ring holds them. Silence when IO is not running. The DSP takes
++ * a 20 ms buffer each time one comes back and keeps four queued; reads follow on from the last one and stay behind
++ * the sample time of now (our clock, the one the zero time stamps come from), where HAL has written already: it
++ * writes the safety offset (960 frames) ahead of now. A run starts PA_OUT_LAG + 4 buffers back so that after the
++ * first four the reads are PA_OUT_LAG behind; a read ahead of now or more than PA_OUT_SLACK behind starts over there.
++ * Returns the frames taken from the ring.
++ */
++#define PA_OUT_LAG        960u
++#define PA_OUT_SLACK      (PA_RING_FRAMES / 2u)
++
++extern "C" uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
++uint32_t
++pandora_audio_out_fill(int32_t *dst, uint32_t frames)
++{
++	IOAudio2Device *d = pa_speaker;
++	if (d == nullptr || !d->running_ || d->ring_ == nullptr || frames > PA_RING_FRAMES) {
++		bzero(dst, (size_t)frames * PA_BYTES_FRAME);
++		return 0;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - d->t0_, &ns);
++	const uint64_t now = ns * 3u / 62500u;                    /* frames at 48 kHz */
++	const uint64_t start_back = PA_OUT_LAG + 4u * frames;
++	if (d->rp_seed_ != d->seed_ || d->rp_ + frames > now || d->rp_ + PA_OUT_SLACK < now) {
++		if (d->rp_seed_ == d->seed_) {
++			d->resyncs_++;
++		}
++		d->rp_seed_ = d->seed_;
++		d->rp_ = now > start_back ? now - start_back : 0;
++	}
++	const int32_t *ring = (const int32_t *)d->ring_->getBytesNoCopy();
++	const uint32_t at = (uint32_t)(d->rp_ % PA_RING_FRAMES);
++	const uint32_t first = frames < PA_RING_FRAMES - at ? frames : PA_RING_FRAMES - at;
++	memcpy(dst, ring + (size_t)at * PA_CHANNELS, (size_t)first * PA_BYTES_FRAME);
++	if (first < frames) {
++		memcpy(dst + (size_t)first * PA_CHANNELS, ring, (size_t)(frames - first) * PA_BYTES_FRAME);
++	}
++	d->rp_ += frames;
++	return frames;
++}
++
+ IOReturn
+ IOAudio2DeviceUserClient::clientClose(void)
+ {

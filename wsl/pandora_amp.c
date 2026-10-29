@@ -882,6 +882,24 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
 		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
 	}
+	/* 0295: boot-arg pandora_spk_live=1: the amps keep playing (the DSP sends iOS's speaker output, silence between
+	 * sounds); readouts every 10 s for a minute. Powering down when idle comes later. */
+	int live = 0;
+	(void)PE_parse_boot_argn("pandora_spk_live", &live, sizeof(live));
+	if (live) {
+		for (unsigned s = 10; s <= 60; s += 10) {
+			char when[16];
+			pa_sleep(10000);
+			snprintf(when, sizeof(when), "live %u s", s);
+			pa_levels(0x40, when);
+			pa_levels(0x42, when);
+		}
+		pa_state(0x40, "live 60 s");
+		pa_state(0x42, "live 60 s");
+		printf("PANDORA AMP: live: the amps stay up\n");
+		(void)thread_terminate(current_thread());
+		thread_block(THREAD_CONTINUE_NULL);
+	}
 	/* 0279: 18 s of play (pandora_adsp.c's bottom, top, both pieces end 18 s after the tone starts, about 16 s into
 	 * the play), the firmware's readouts every second. 0278's dump while playing matched Android's chips; not now. */
 	for (unsigned s = 1; s <= 18; s++) {

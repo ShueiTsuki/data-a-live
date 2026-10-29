@@ -1554,6 +1554,13 @@ static struct {
 	uint32_t sent, done, bad, inflight, busy;
 	uint64_t frames;
 } spk_tone;
+/*
+ * 0295: boot-arg pandora_spk_live=1: the speaker graph runs on (no SPK_RUN_MS stop, no test tone) and its buffers
+ * carry iOS's output, pandora_audio_out_fill (PandoraAudio.cpp: the "Speaker" device's ring, silence while its IO is
+ * stopped); pandora_amp.c keeps the amps playing.
+ */
+static int spk_live;
+extern uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
 
 static void
 spk_put32(uint8_t *p, uint32_t v)
@@ -1889,6 +1896,10 @@ spk_graph_done(bool aborted)
 		    ad_ms(spk.t0), spk.failed);
 		spk.state = SpkRunning;
 		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
+		if (spk_live) {
+			spk.run_until = ~0ull;
+			printf("PANDORA SPK: live: the graph stays up and plays iOS's speaker output\n");
+		}
 		bzero(&spk_tone, sizeof(spk_tone));
 		spk_tone.on = true;                   /* 0271: the test tone, from now until the graph stops */
 		pandora_amp_tdm();
@@ -2035,10 +2046,14 @@ spk_tone_pump(void)
 			break;
 		}
 		int32_t *s = (int32_t *)(ad_shm_va + off);
-		for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
-			const uint64_t n = spk_tone.frames + f;
-			s[2 * f] = spk_tone_sample(n, true);
-			s[2 * f + 1] = spk_tone_sample(n, false);
+		if (spk_live) {
+			(void)pandora_audio_out_fill(s, SPK_TONE_FRAMES);
+		} else {
+			for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
+				const uint64_t n = spk_tone.frames + f;
+				s[2 * f] = spk_tone_sample(n, true);
+				s[2 * f + 1] = spk_tone_sample(n, false);
+			}
 		}
 		__asm__ volatile ("dsb sy" ::: "memory");
 		const uint64_t a = ad_shm_pa + off;
@@ -2821,6 +2836,7 @@ adsp_thread(void *arg, wait_result_t result)
 	(void)PE_parse_boot_argn("pandora_battery", &battery, sizeof(battery));
 	(void)PE_parse_boot_argn("pandora_battery_delay", &bdelay_s, sizeof(bdelay_s));
 	(void)PE_parse_boot_argn("pandora_spk", &spk.level, sizeof(spk.level));
+	(void)PE_parse_boot_argn("pandora_spk_live", &spk_live, sizeof(spk_live));
 	if (mode < 2) {
 		spk.level = 0;                     /* the speakers need the DSP */
 	}
