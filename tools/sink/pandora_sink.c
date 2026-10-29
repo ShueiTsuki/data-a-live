@@ -2,9 +2,10 @@
  * pandora_sink: runs in place of a launchd daemon the kernel no longer starts (crashed sweetcrashstop times this boot,
  * or listed in sweetnoexec; kernel 0330 execs /usr/libexec/pandora_sink instead, argv and environment unchanged). It
  * looks up its job in /System/Library/xpc/launchd.plist (by XPC_SERVICE_NAME, which launchd sets to the job's label,
- * else by the program path in argv[0]), checks in every Mach service of the job, and answers each request at once:
- * a MIG request carrying a reply port gets a MIG error reply (MIG_BAD_ID), anything else (XPC) is destroyed, which
- * gives the sender's reply port a send-once notification and its XPC call an interrupted connection. Before, a
+ * else by the program path in argv[0]), checks in every Mach service of the job, and answers each request: a MIG
+ * request carrying a reply port gets a MIG error reply (MIG_BAD_ID) at once, anything else (XPC) is destroyed after
+ * a second (HOLD_NS), which gives the sender's reply port a send-once notification and its XPC call an interrupted
+ * connection. Before, a
  * daemon that was not started left its services registered with launchd and their requests queued for good: the
  * Settings Notifications page waited on CommCenter (post25: viewDidLoad in _CTServerConnectionCopyCellBroadcast-
  * AlertTypesForAllSIMSlots, xpc_connection_send_message_with_reply_sync). It stays running (jobs are often
@@ -19,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* libSystem (libxpc) exports it; the iOS SDK has no servers/bootstrap.h. */
@@ -29,6 +31,59 @@ extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *service_name
 
 static os_log_t sink_log;
 static char job[128] = "?";
+
+/*
+ * post27: dropping an XPC message at once gives its sender an interrupted connection, and CoreTelephony's clients
+ * (SpringBoard, mediaserverd, UserEventAgent, apsd) reconnect and send again at once: the sink took 63 % of a CPU,
+ * they 40-60 % each, and the phone reached 45 C. A message that is not a MIG request is now held for HOLD_NS before
+ * it is dropped (at most HOLD_MAX at a time, the oldest dropped first), so each sender retries about once a second
+ * and a synchronous call returns its error after a second.
+ */
+#define HOLD_NS  (1000ull * 1000 * 1000)
+#define HOLD_MAX 256
+static mach_msg_header_t *held[HOLD_MAX];
+static uint64_t held_at[HOLD_MAX];
+static unsigned held_head, held_count;
+
+static void
+drop_oldest(void)
+{
+	mach_msg_header_t *m = held[held_head];
+	held[held_head] = NULL;
+	held_head = (held_head + 1) % HOLD_MAX;
+	held_count--;
+	if (m) {
+		mach_msg_destroy(m);
+		free(m);
+	}
+}
+
+static void
+release_held(uint64_t now)
+{
+	while (held_count && now - held_at[held_head] >= HOLD_NS) {
+		drop_oldest();
+	}
+}
+
+/* Keep a copy of message M (its rights go with it) until NOW + HOLD_NS. */
+static void
+hold(mach_msg_header_t *m, uint64_t now)
+{
+	mach_msg_header_t *copy = malloc(m->msgh_size);
+	if (copy == NULL) {
+		mach_msg_destroy(m);
+		return;
+	}
+	memcpy(copy, m, m->msgh_size);
+	if (held_count == HOLD_MAX) {
+		drop_oldest();
+	}
+	const unsigned at = (held_head + held_count) % HOLD_MAX;
+	held[at] = copy;
+	held_at[at] = now;
+	held_count++;
+}
 
 static CFDictionaryRef
 load_plist(void)
@@ -155,8 +210,16 @@ main(int argc, char **argv)
 			mach_msg_header_t head;
 			uint8_t bytes[16384 + MAX_TRAILER_SIZE];
 		} in;
-		kern_return_t kr = mach_msg(&in.head, MACH_RCV_MSG | MACH_RCV_LARGE, 0, sizeof(in), set,
-		    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+		/* Until the oldest held message is due, or for good when none is held. */
+		const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		release_held(now);
+		const mach_msg_timeout_t wait = held_count ?
+		    (mach_msg_timeout_t)((held_at[held_head] + HOLD_NS - now) / 1000000 + 1) : MACH_MSG_TIMEOUT_NONE;
+		kern_return_t kr = mach_msg(&in.head, MACH_RCV_MSG | MACH_RCV_LARGE | (held_count ? MACH_RCV_TIMEOUT : 0), 0,
+		    sizeof(in), set, wait, MACH_PORT_NULL);
+		if (kr == MACH_RCV_TIMED_OUT) {
+			continue;
+		}
 		if (kr == MACH_RCV_TOO_LARGE) {
 			/* Too big for the buffer: take it again into a big enough one and drop it. */
 			const mach_msg_size_t size = in.head.msgh_size + MAX_TRAILER_SIZE;
@@ -183,7 +246,11 @@ main(int argc, char **argv)
 		if (logged < 64) {
 			logged++;
 			os_log_error(sink_log, "pandora-sink %{public}s: message %d on %{public}s, %{public}s", job,
-			    in.head.msgh_id, service, mig && reply ? "MIG error reply" : "dropped");
+			    in.head.msgh_id, service, mig && reply ? "MIG error reply" : "dropped after 1 s");
+		}
+		if (!mig) {
+			hold(&in.head, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+			continue;
 		}
 		if (mig && reply != MACH_PORT_NULL && reply_type != 0) {
 			mig_reply_error_t out;
