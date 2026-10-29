@@ -1,0 +1,13 @@
+diff --git a/config/MASTER.arm64.pandora b/config/MASTER.arm64.pandora
+index 99f6430..7e4b263 100644
+--- a/config/MASTER.arm64.pandora
++++ b/config/MASTER.arm64.pandora
+@@ -77,7 +77,7 @@
+ #  SCHED_RELEASE =  [ SCHED_BASE ]
+ #  SCHED_DEV =      [ SCHED_BASE ]
+ #  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
+-#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  VM_BASE =        [ vm_pressure_events jetsam memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
+ #  VM_RELEASE =     [ VM_BASE ]
+ #  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
+ #  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
