@@ -63,6 +63,20 @@ edit('NativeAdrenoMetalPlugin.mm',
     if (port) return publish::clientDevice(port);
     static bool attempted;""")
 edit('NativeAdrenoMetalPlugin.mm',
+     """static id clientDevice(unsigned port) {
+    if (!listedClient()) return nil;""",
+     """static id clientDevice(unsigned port) {
+    if (!listedClient()) {
+        // data-a-live: which processes ask for Metal without a device (towards every process having one, as
+        // on an iPhone): logged once per process.
+        static bool told;
+        if (!told) {
+            told = true;
+            NSLog(@"pandora-metal: %s asked for a device, not in NativeAdrenoMetal.clients", getprogname());
+        }
+        return nil;
+    }""")
+edit('NativeAdrenoMetalPlugin.mm',
      """static void reportDisplayState(Gpu &gpu) {
     ++gReports;""",
      """static void reportDisplayState(Gpu &gpu) {
