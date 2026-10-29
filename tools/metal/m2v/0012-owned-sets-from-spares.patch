@@ -175,11 +175,11 @@ diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-run
  //! cost 38 to 48 us and a descriptor pool 23 to 26 us on RADV (Radeon 780M), 7 to 8 and 3 on ANV,
  //! against 0.2 and 0.02, and 1.3 and 0.1, reset (EV PERF-raw1).
  //!
-@@ -156,10 +157,31 @@
+@@ -156,10 +157,33 @@
          device: &DeviceShared,
          needs: &SetNeeds,
      ) -> Result<Option<DescriptorPool>, Error> {
-+        self.descriptor_pool_where(device, |room| room.fits(needs))
++        self.descriptor_pool_taken(device, |pools| take_descriptor_pool(pools, needs))
 +    }
 +
 +    /// A spare descriptor pool of `device`, reset, with room for `sets` sets that take `totals`
@@ -191,24 +191,26 @@ diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-run
 +        totals: &SetNeeds,
 +        sets: u32,
 +    ) -> Result<Option<DescriptorPool>, Error> {
-+        self.descriptor_pool_where(device, |room| room.holds(totals, sets))
++        self.descriptor_pool_taken(device, |pools| {
++            take_descriptor_pool_where(pools, |room| room.holds(totals, sets))
++        })
 +    }
 +
-+    /// The newest spare descriptor pool of `device` whose room `fits`, reset.
-+    fn descriptor_pool_where(
++    /// The spare descriptor pool of `device` that `take` takes out of the spares, reset.
++    fn descriptor_pool_taken(
 +        &self,
 +        device: &DeviceShared,
-+        fits: impl Fn(&Room) -> bool,
++        take: impl FnOnce(&mut VecDeque<DescriptorPool>) -> Option<DescriptorPool>,
 +    ) -> Result<Option<DescriptorPool>, Error> {
          if exit_guard::in_section() {
              return Ok(None);
          }
 -        let pool = take_descriptor_pool(&mut lock(&self.descriptor_pools), needs);
-+        let pool = take_descriptor_pool_where(&mut lock(&self.descriptor_pools), fits);
++        let pool = take(&mut *lock(&self.descriptor_pools));
          let Some(pool) = pool else {
              return Ok(None);
          };
-@@ -235,7 +257,15 @@
+@@ -235,7 +259,15 @@
      pools: &mut VecDeque<DescriptorPool>,
      needs: &SetNeeds,
  ) -> Option<DescriptorPool> {

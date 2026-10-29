@@ -450,7 +450,8 @@ pprof_thread(__unused void *arg, __unused wait_result_t wr)
 /*
  * 0313: where every thread of a process stands, the user call stack of each, for a process that hangs. Boot-arg
  * pandora_stacks=NAME[,NAME...] (up to 4 processes), pandora_stacks_at (seconds after boot, default 60),
- * pandora_stacks_every (seconds between snapshots, default 0: one). The sampler above takes only threads on a CPU, so
+ * pandora_stacks_every (seconds between snapshots, default 0: one; 0319: also as pandora_stacks=NAME...:SECONDS, as the
+ * boot-args are near their 607 characters with the speaker's). The sampler above takes only threads on a CPU, so
  * a queue stuck in a wait never shows there; a thread blocked in the kernel keeps its user registers (get_user_regs),
  * and its frame records are read from the task's map. Per snapshot and per running process of each name: the task's
  * images (pprof_images, for the addresses), then per thread "PANDORA STACKS NAME[pid] tid T st S hint H pc P lr L"
@@ -464,6 +465,7 @@ pprof_thread(__unused void *arg, __unused wait_result_t wr)
 
 static char pstacks_names[PSTACKS_NAMES][PPROF_NAME + 1];
 static unsigned pstacks_count;
+static uint32_t pstacks_every;                          /* from pandora_stacks=...:SECONDS (0319) */
 static thread_t pstacks_threads[PSTACKS_THREADS];       /* the snapshot thread's only */
 
 /* 0317: every running process of that name (up to max; the Astronomy poster runs as two, its preview and its editor). */
@@ -550,7 +552,7 @@ pstacks_dump(task_t task, const char *name)
 static void
 pstacks_thread(__unused void *arg, __unused wait_result_t wr)
 {
-	uint32_t at = 60, every = 0;
+	uint32_t at = 60, every = pstacks_every;
 	PE_parse_boot_argn("pandora_stacks_at", &at, sizeof(at));
 	PE_parse_boot_argn("pandora_stacks_every", &every, sizeof(every));
 	for (;;) {
@@ -589,6 +591,15 @@ pstacks_start(void)
 	char list[PSTACKS_NAMES * (PPROF_NAME + 1)];
 	if (!PE_parse_boot_arg_str("pandora_stacks", list, sizeof(list)) || list[0] == 0) {
 		return;
+	}
+	for (char *c = list; *c != 0; c++) {
+		if (*c == ':') {
+			*c = 0;
+			for (c++; *c >= '0' && *c <= '9'; c++) {
+				pstacks_every = pstacks_every * 10 + (uint32_t)(*c - '0');
+			}
+			break;
+		}
 	}
 	for (char *at = list; *at != 0 && pstacks_count < PSTACKS_NAMES;) {
 		size_t len = 0;
