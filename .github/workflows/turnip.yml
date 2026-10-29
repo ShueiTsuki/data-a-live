@@ -67,6 +67,8 @@ jobs:
           python3 tools/turnip/pandora_rpstats.py mesa
           # Fence waits of up to 100 ms a kernel call, not 1 ms (the kernel sleeps until the fence's interrupt).
           python3 tools/turnip/pandora_wait.py mesa
+          # A DSB SY where command streams in write-combined memory are handed on (post15's half-seen IB packet).
+          python3 tools/turnip/pandora_dsb.py mesa
           ls nativeadreno/NativeAdrenoABI.h
           # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
           python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
