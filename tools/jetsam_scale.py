@@ -8,6 +8,11 @@ Every value whose key ends in "MemoryLimit" and is above 0 (megabytes; -1 means 
 FACTOR; the rest stays as it is, in the file's own format. The iPhone X has 3 GB of memory, this phone 15 GB: at
 the iPhone X limits the Astronomy poster (PosterProvider_Rendering_EntitledSoftMemoryLimit, 200 MB) had no room
 left once the GPU translation's memory was counted (post6). Apple's file: keep OUT_PLIST out of git.
+
+DO NOT INSTALL ITS OUTPUT as it is: in post7 the rewritten file (plistlib's binary writer, 41 KB for Apple's 101 KB)
+made launchd use 87 % of a core and grow to 4 GB within seconds of "init-with-data-volume"; the kernel's low-swap
+policy killed it at 19 s and iOS restarted. Whether the writer or the values did it is not known. The limits also
+had no effect: without CONFIG_JETSAM (0315) RunningBoard sets no limit at all.
 """
 import argparse
 import plistlib
