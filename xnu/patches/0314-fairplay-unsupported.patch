@@ -87,14 +87,14 @@ index efdec4c..fb9a36a 100644
 +#endif /* PANDORA */
  #endif /* SWEET */
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 9227aaf..5b04c8f 100644
+index 9227aaf..1397785 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
 @@ -65,6 +65,11 @@ const char * gIOKernelConfigTables =
      "     'IOMatchCategory' = AppleKeyStore;"
      "   },"
      "   {"
-+    "     'IOClass'         = com_apple_driver_FairPlayIOKit;"
++    "     'IOClass'         = 'com_apple_driver_FairPlayIOKit';"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = FairPlayIOKit;"
 +    "   },"

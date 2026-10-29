@@ -14,8 +14,8 @@ def patch(p, subs):
 # special port 17) with no timeout, its silo hangs and with it locationd's SPI service, where the Astronomy poster's
 # editor waits for its location authorization (post3, post4). A driver with Apple's class names that refuses every
 # call lets fairplayd run and answer its clients with FairPlay's own errors.
-# In SweetPlatformExpert.cpp, a file local builds already compile: the first try put it in SweetKeyStore.cpp, which
-# had only ever come from CI objects, and that kernel (post5) panicked before the USB console came up.
+# In SweetPlatformExpert.cpp, a file local builds already compile (SweetKeyStore.cpp's object has always come from
+# CI).
 patch('iokit/Kernel/arm/SweetPlatformExpert.cpp', [
     ("""#include <IOKit/IOLib.h>
 """,
@@ -108,9 +108,12 @@ patch('iokit/KernelConfigTables.cpp', [
     "     'IOMatchCategory' = AppleKeyStore;"
     "   },"
     "   {"
-    "     'IOClass'         = com_apple_driver_FairPlayIOKit;"
+    "     'IOClass'         = 'com_apple_driver_FairPlayIOKit';"
     "     'IOProviderClass' = IOResources;"
     "     'IOMatchCategory' = FairPlayIOKit;"
     "   },"
 """),
 ])
+# The class name is quoted: an unquoted word in this table may hold only letters, digits and '-'
+# (libkern/c++/OSUnserialize.y isAlphaNumeric); unquoted, the whole table failed to parse and IOKit panicked at
+# start (post5, post5b: no USB console, no log).
