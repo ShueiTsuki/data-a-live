@@ -636,6 +636,8 @@
     - 用户：「可以，开始第2步」。0295（k0295）：启动参数 pandora_spk_live=1（与 pandora_spk=3 pandora_amp=3 一起；之前的 aud 测试没带 pandora_spk，喇叭图没起）：喇叭图不再 26 s 就停、不放测试音，每个 20 ms 缓冲由 PandoraAudio.cpp 的 pandora_audio_out_fill 填（扬声器设备环形缓冲，读位置跟在“现在”的采样时间后 960 帧，连续往后读，偏出就重新对齐并计数；IO 停时静音；每次开 IO 清空缓冲）；功放 PLAY 后不暂停不下电，头一分钟每 10 s 读一次。闲时下电留到第 3 步。测试 aud22（自动，先看机制），通了再叫用户来听。
     - aud22（k0295）：不崩；喇叭图常开，两个功放 PLAY 后一直播；插电提示音 IO 32.3–35.4 s。DSP 每还回一个缓冲打一行「GPR in」（每秒 50 行）冲掉了内核日志，环形缓冲统计和功放读数没留下。0296（k0296）：「GPR in」只打前 64 行，常开时每 10 s 汇总一次缓冲数。测试 aud23。
     - **用户：「关机有声音了」「不，就是正常手机息屏关闭屏幕的咔咔声」——iOS 的锁屏音从喇叭放出来了（aud22 结束、手机重启前锁屏那一下）。第 2 步通了。** 请用户在 aud23 里试打字声、音量条、锁屏音。
+    - aud23（k0296）：DSP 连续取数据（92 s 时送出 3508、收回 3504、无错误，每秒 50 个）；插电提示音 32.7–35.8 s 时下功放 V max 0xad、I max 0x73（其余读数为 0）；读位置每秒前进约 48000 帧，开播时重新对齐共 3 次。**用户：「充电提示音也有，可能是没开打字的声音，音量条正常，没有杂音」——第 2 步完成。**
+    - 第 3 步待用户点头：①没声音时功放下电（现在常开），关机/重启前先下电；②音量键、静音；③收尾：0293 的重插和 pandora_audio_delay/now 可去掉或留作开关，coreaudio_trace.plist 只在调试时装；④「GLINK version agreed」行太密。第 4 步：麦克风、听筒（通话时 GPIO174 拉低）、耳机；做录音/相机时恢复 StartRecorderServer。
     - 新工具 tools/ioslog_fetch.py NAME [--minutes N] [--parse]：用 pinfile rawreadat 只读 iOS 镜像的 HFS+ 卷头、目录表和日志文件，uuidtext 缓存在 /opt/work/ul_cache（第一次 520 MiB / 214 s，之后只读新文件），不再拷 17 GB。用户：「日志太大了能截取吗」。
   - 用户（2026-10-28）：「能不能给垃圾删了」→ 删了 out-root 的三个 17 GB 镜像（ios-root.img 和 WSL 里那份 SHA-256 相同才删）、127 个旧测试包、WSL 里的日志解析结果（ul_*.jsonl / la_*，version.plist 存到 /opt/work/tools/ul_version.plist）；WSL 虚拟磁盘没压缩（用户：「算了，继续任务」）。
   - 用户（2026-10-28）：「如果有什么大事的时候你可以用电脑播放一次急促的音频给我」→ D:\DeepSeekHarness\claude\alert\alert.ps1（记忆 pc-alert-sound）。
