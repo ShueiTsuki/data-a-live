@@ -20,6 +20,8 @@
  * free again after a minute without time, the name taken again at every switch, 256 process names.
  */
 #include <kern/thread.h>
+#include <kern/thread_group.h>
+#include <kern/work_interval.h>
 #include <kern/task.h>
 #include <kern/processor.h>
 #include <kern/cpu_number.h>
@@ -168,12 +170,49 @@ pctl_work_interval_notify(__unused perfcontrol_state_t state, perfcontrol_work_i
 	pctl_frame(wi->start, wi->finish, wi->deadline);
 }
 
+static uint64_t pctl_instance_ids;
+
 static void
 pctl_work_interval_ctl(__unused perfcontrol_state_t state, perfcontrol_work_interval_instance_t wi)
 {
 	os_atomic_inc(&pctl_ctls, relaxed);
-	if (wi->ctl == WORK_INTERVAL_FINISH) {
+	if (wi->ctl == WORK_INTERVAL_START) {
+		/* 0322: the performance controller names each instance (Apple's kernel copies it out after the callout);
+		 * libsystem_kernel skips update and finish while it is 0. */
+		wi->instance_id = os_atomic_inc(&pctl_instance_ids, relaxed);
+	} else if (wi->ctl == WORK_INTERVAL_FINISH) {
 		pctl_frame(wi->start, wi->finish, wi->deadline);
+	}
+}
+
+/*
+ * 0322: the machine layer of work interval instances (osfmk/kern/work_interval.c kern_work_interval_instance_ctl),
+ * as the 20H392 iPhone10,3 kernelcache's: the instance with the thread's ID and thread group, handed to the
+ * performance controller's work_interval_ctl callout with the thread's perfcontrol state. A start goes in with no
+ * instance ID and no finish and comes back with the ID the controller gave it; an update has no finish.
+ */
+extern sched_perfcontrol_work_interval_ctl_t sched_perfcontrol_work_interval_ctl;   /* machine_routines_common.c */
+
+void
+machine_work_interval_instance_ctl(thread_t thread, uint32_t ctl, struct kern_work_interval_instance_args *args)
+{
+	struct thread_group *tg = thread_group_get(thread);
+	struct perfcontrol_work_interval_instance wi = {
+		.ctl = (work_interval_ctl_t)ctl,
+		.create_flags = args->create_flags,
+		.complexity = args->complexity,
+		.thread_id = thread_tid(thread),
+		.work_interval_id = args->work_interval_id,
+		.instance_id = ctl == WORK_INTERVAL_START ? 0 : args->instance_id,
+		.start = args->start,
+		.finish = ctl == WORK_INTERVAL_FINISH ? args->finish : 0,
+		.deadline = args->deadline,
+		.thread_group_id = tg ? thread_group_get_id(tg) : 0,
+		.thread_group_data = tg ? thread_group_get_machine_data(tg) : NULL,
+	};
+	sched_perfcontrol_work_interval_ctl(&thread->machine.perfctrl_state, &wi);
+	if (ctl == WORK_INTERVAL_START) {
+		args->instance_id = wi.instance_id;
 	}
 }
 

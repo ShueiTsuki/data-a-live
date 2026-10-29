@@ -1,0 +1,238 @@
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index 03fd05f..dd3f537 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -270,6 +270,45 @@ work_interval_ctl_inner(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 
+ 		break;
+ 
++#if defined(PANDORA)
++	case WORK_INTERVAL_OPERATION_INSTANCE_START:
++	case WORK_INTERVAL_OPERATION_INSTANCE_UPDATE:
++	case WORK_INTERVAL_OPERATION_INSTANCE_FINISH: {
++		/* 0322: as the 20H392 kernelcache: an update or finish of an instance never started is a no-op; a start
++		 * copies the instance back with the ID the performance controller gave it. */
++		struct work_interval_instance_params instance;
++		if (uap->arg == USER_ADDR_NULL || uap->work_interval_id == 0 || uap->len < sizeof(instance)) {
++			return EINVAL;
++		}
++		if ((error = copyin(uap->arg, &instance, sizeof(instance)))) {
++			return error;
++		}
++		const bool start = operation == WORK_INTERVAL_OPERATION_INSTANCE_START;
++		if (!start && instance.wiip_instance_id == 0) {
++			break;
++		}
++		struct kern_work_interval_instance_args instance_args = {
++			.work_interval_id = uap->work_interval_id,
++			.instance_id = instance.wiip_instance_id,
++			.start = instance.wiip_start,
++			.finish = instance.wiip_finish,
++			.deadline = instance.wiip_deadline,
++			.complexity = instance.wiip_complexity,
++			.create_flags = instance.wiip_create_flags,
++		};
++		kret = kern_work_interval_instance_ctl(current_thread(),
++		    operation - WORK_INTERVAL_OPERATION_INSTANCE_START, &instance_args);
++		if (kret != KERN_SUCCESS) {
++			return EINVAL;
++		}
++		if (start) {
++			instance.wiip_instance_id = instance_args.instance_id;
++			error = copyout(&instance, uap->arg, sizeof(instance));
++		}
++		break;
++	}
++#endif /* PANDORA */
++
+ 	default:
+ 		return ENOTSUP;
+ 	}
+diff --git a/bsd/sys/work_interval.h b/bsd/sys/work_interval.h
+index 940c2f5..15d96ff 100644
+--- a/bsd/sys/work_interval.h
++++ b/bsd/sys/work_interval.h
+@@ -293,6 +293,13 @@ int     work_interval_leave(void);
+ #define WORK_INTERVAL_OPERATION_GET_FLAGS 0x00000009    /* arg is a port name */
+ #define WORK_INTERVAL_OPERATION_SET_NAME  0x0000000a    /* arg is name string (char[WORK_INTERVAL_NAME_MAX])*/
+ #define WORK_INTERVAL_OPERATION_SET_WORKLOAD_ID  0x0000000b    /* arg is a work_interval_workload_id_params */
++#if defined(PANDORA)
++/* 0322: the instance operations of iOS 16 (libsystem_kernel work_interval_instance_*), arg a
++ * work_interval_instance_params; left out of the open-source release. */
++#define WORK_INTERVAL_OPERATION_INSTANCE_START   0x00000006
++#define WORK_INTERVAL_OPERATION_INSTANCE_UPDATE  0x00000007
++#define WORK_INTERVAL_OPERATION_INSTANCE_FINISH  0x00000008
++#endif
+ 
+ #define WORK_INTERVAL_NAME_MAX  32
+ #define WORK_INTERVAL_WORKLOAD_ID_NAME_MAX  64
+@@ -324,6 +331,20 @@ struct work_interval_notification {
+ };
+ typedef struct work_interval_notification *work_interval_notification_t;
+ 
++#if defined(PANDORA)
++/* 0322: libsystem_kernel's 56-byte instance (work_interval_instance_alloc), passed whole to operations 6-8. */
++struct work_interval_instance_params {
++	uint64_t        wiip_work_interval_id;
++	uint64_t        wiip_instance_id;       /* out at start; update and finish need it */
++	uint64_t        wiip_start;
++	uint64_t        wiip_finish;
++	uint64_t        wiip_deadline;
++	uint64_t        wiip_complexity;
++	uint32_t        wiip_create_flags;
++	uint32_t        wiip_reserved;
++};
++#endif
++
+ struct work_interval_create_params {
+ 	uint64_t        wicp_id;          /* in/out param */
+ 	mach_port_name_t wicp_port;       /* in/out param */
+diff --git a/osfmk/arm/pandora_perfctl.c b/osfmk/arm/pandora_perfctl.c
+index bcd74fd..17fade8 100644
+--- a/osfmk/arm/pandora_perfctl.c
++++ b/osfmk/arm/pandora_perfctl.c
+@@ -20,6 +20,8 @@
+  * free again after a minute without time, the name taken again at every switch, 256 process names.
+  */
+ #include <kern/thread.h>
++#include <kern/thread_group.h>
++#include <kern/work_interval.h>
+ #include <kern/task.h>
+ #include <kern/processor.h>
+ #include <kern/cpu_number.h>
+@@ -168,15 +170,52 @@ pctl_work_interval_notify(__unused perfcontrol_state_t state, perfcontrol_work_i
+ 	pctl_frame(wi->start, wi->finish, wi->deadline);
+ }
+ 
++static uint64_t pctl_instance_ids;
++
+ static void
+ pctl_work_interval_ctl(__unused perfcontrol_state_t state, perfcontrol_work_interval_instance_t wi)
+ {
+ 	os_atomic_inc(&pctl_ctls, relaxed);
+-	if (wi->ctl == WORK_INTERVAL_FINISH) {
++	if (wi->ctl == WORK_INTERVAL_START) {
++		/* 0322: the performance controller names each instance (Apple's kernel copies it out after the callout);
++		 * libsystem_kernel skips update and finish while it is 0. */
++		wi->instance_id = os_atomic_inc(&pctl_instance_ids, relaxed);
++	} else if (wi->ctl == WORK_INTERVAL_FINISH) {
+ 		pctl_frame(wi->start, wi->finish, wi->deadline);
+ 	}
+ }
+ 
++/*
++ * 0322: the machine layer of work interval instances (osfmk/kern/work_interval.c kern_work_interval_instance_ctl),
++ * as the 20H392 iPhone10,3 kernelcache's: the instance with the thread's ID and thread group, handed to the
++ * performance controller's work_interval_ctl callout with the thread's perfcontrol state. A start goes in with no
++ * instance ID and no finish and comes back with the ID the controller gave it; an update has no finish.
++ */
++extern sched_perfcontrol_work_interval_ctl_t sched_perfcontrol_work_interval_ctl;   /* machine_routines_common.c */
++
++void
++machine_work_interval_instance_ctl(thread_t thread, uint32_t ctl, struct kern_work_interval_instance_args *args)
++{
++	struct thread_group *tg = thread_group_get(thread);
++	struct perfcontrol_work_interval_instance wi = {
++		.ctl = (work_interval_ctl_t)ctl,
++		.create_flags = args->create_flags,
++		.complexity = args->complexity,
++		.thread_id = thread_tid(thread),
++		.work_interval_id = args->work_interval_id,
++		.instance_id = ctl == WORK_INTERVAL_START ? 0 : args->instance_id,
++		.start = args->start,
++		.finish = ctl == WORK_INTERVAL_FINISH ? args->finish : 0,
++		.deadline = args->deadline,
++		.thread_group_id = tg ? thread_group_get_id(tg) : 0,
++		.thread_group_data = tg ? thread_group_get_machine_data(tg) : NULL,
++	};
++	sched_perfcontrol_work_interval_ctl(&thread->machine.perfctrl_state, &wi);
++	if (ctl == WORK_INTERVAL_START) {
++		args->instance_id = wi.instance_id;
++	}
++}
++
+ /*
+  * 0320: P-spill. With two clusters (patch 0320's board config, a device tree from mkadt_pandora.py --amp: the six
+  * Oryon performance cores as the E cluster, the two prime cores as the P cluster) the scheduler is Apple's Edge
+diff --git a/osfmk/kern/machine.h b/osfmk/kern/machine.h
+index 4dc023a..6ff4970 100644
+--- a/osfmk/kern/machine.h
++++ b/osfmk/kern/machine.h
+@@ -140,6 +140,11 @@ extern void machine_max_runnable_latency(uint64_t bg_max_latency,
+     uint64_t realtime_max_latency);
+ 
+ extern void machine_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_args);
++#if defined(PANDORA)
++struct kern_work_interval_instance_args;
++extern void machine_work_interval_instance_ctl(thread_t thread, uint32_t ctl,
++    struct kern_work_interval_instance_args *args);   /* osfmk/arm/pandora_perfctl.c (0322) */
++#endif
+ 
+ 
+ extern void machine_perfcontrol_deadline_passed(uint64_t deadline);
+diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
+index f2b9ce2..2f1fa39 100644
+--- a/osfmk/kern/work_interval.c
++++ b/osfmk/kern/work_interval.c
+@@ -1013,6 +1013,36 @@ kern_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_a
+ 	return KERN_SUCCESS;
+ }
+ 
++#if defined(PANDORA)
++/*
++ * 0322: a work interval instance, as the 20H392 iPhone10,3 kernelcache does it: the calling thread must have
++ * joined the work interval; an ignored one (WORK_INTERVAL_FLAG_IGNORED) succeeds without a callout; a
++ * complexity is refused where the workload has an ID without WORK_INTERVAL_WORKLOAD_ID_COMPLEXITY_ALLOWED.
++ * (Apple's also fails on one thread flag this source does not show; not modeled.)
++ */
++kern_return_t
++kern_work_interval_instance_ctl(thread_t thread, uint32_t ctl, struct kern_work_interval_instance_args *args)
++{
++	assert(thread == current_thread());
++
++	struct work_interval *work_interval = thread->th_work_interval;
++	if (args->work_interval_id == 0 || work_interval == NULL ||
++	    work_interval->wi_id != args->work_interval_id) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	if (args->create_flags & WORK_INTERVAL_FLAG_IGNORED) {
++		return KERN_SUCCESS;
++	}
++	if (args->complexity != 0 &&
++	    (work_interval->wi_wlid_flags & (WORK_INTERVAL_WORKLOAD_ID_COMPLEXITY_ALLOWED | WORK_INTERVAL_WORKLOAD_ID_HAS_ID)) ==
++	    WORK_INTERVAL_WORKLOAD_ID_HAS_ID) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	machine_work_interval_instance_ctl(thread, ctl, args);
++	return KERN_SUCCESS;
++}
++#endif /* PANDORA */
++
+ /* Start at 1, 0 is not a valid work interval ID */
+ static _Atomic uint64_t unique_work_interval_id = 1;
+ 
+diff --git a/osfmk/kern/work_interval.h b/osfmk/kern/work_interval.h
+index 8b46efb..13d4f59 100644
+--- a/osfmk/kern/work_interval.h
++++ b/osfmk/kern/work_interval.h
+@@ -81,6 +81,20 @@ kern_work_interval_join(thread_t thread, mach_port_name_t port_name);
+ 
+ extern kern_return_t
+ kern_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_args);
++#if defined(PANDORA)
++/* 0322: an instance start (0), update (1) or finish (2), as work_interval_ctl_t. */
++struct kern_work_interval_instance_args {
++	uint64_t work_interval_id;
++	uint64_t instance_id;
++	uint64_t start;
++	uint64_t finish;
++	uint64_t deadline;
++	uint64_t complexity;
++	uint32_t create_flags;
++};
++extern kern_return_t
++kern_work_interval_instance_ctl(thread_t thread, uint32_t ctl, struct kern_work_interval_instance_args *args);
++#endif
+ extern kern_return_t
+ kern_work_interval_set_name(mach_port_name_t port_name, char *name, size_t len);
+ extern kern_return_t
