@@ -1,10 +1,11 @@
-"""spk_graph.py ACDB OUT: the speaker playback graph of Android's ACDB as the audio DSP takes it.
+"""spk_graph.py ACDB OUT [receiver]: the speaker (or receiver) playback graph of Android's ACDB as the audio DSP takes it.
 
 Reads the phone's ACDB (/odm/etc/acdbdata/Mi/Mi_acdb_cal.acdb; a copy of a phone file, kept outside
 the repo, as OUT is) and writes what bsd/dev/pandora_adsp.c sends to the DSP's APM to open and calibrate
 the graph Android opens for a speaker playback (D:\\DeepSeekHarness\\spkstart, acdbcheck): graph key
 vector StreamRX PCM_Deep_Buffer, Instance 1, DeviceRX Speaker, DevicePP_Rx Audio_MIPLAY; calibration
-key vector Volume 0.
+key vector Volume 0. With "receiver" the graph Android opens for a playback on the earpiece (usecaseKvManager.xml
+PAL_DEVICE_OUT_HANDSET, deep buffer): DeviceRX Handset, DevicePP_Rx Audio_MBDRC, the TDM tag data for Channels 1.
 
 Volume picks one of the stream subgraph's 16 tables for its volume module 0x401f (acdbcheck
 raw/ckv_volume_table.txt): Level_0 has the gain 0x10000000 (Q28, 0 dB), each level about 3 dB less, Level_15
@@ -23,8 +24,11 @@ The layouts are AudioReach graphservices' (acdb/src/acdb_command.c, gsl/src/gsl_
   TDM   the device_hw_ep_rx tag's data for Channels 2 (AcdbCmdGetModuleTagData; AGM configure_tdm_ep),
         PARAM_ID_TDM_INTF_CFG among it; pandora_adsp.c fills in LPAIF type and interface index.
   SGS   the subgraph ids, for PREPARE, START, STOP and CLOSE.
+  IIDS  the TDM channel count, then the instance of each module pandora_adsp.c configures at run time, found by its
+        module tag as AGM and PAL find them (AcdbCmdGetTaggedModules: TMLU <subgraph, tag, offset>, TMDE {count,
+        <module id, instance id>}): {u32 channels, u32 count, count x <u32 tag, u32 instance>}.
 
-OUT: "PSPKGR01", u32 section count, then sections {u32 type (1 OPEN, 2 CAL, 3 TDM, 4 SGS), u32 bytes,
+OUT: "PSPKGR01", u32 section count, then sections {u32 type (1 OPEN, 2 CAL, 3 TDM, 4 SGS, 5 IIDS), u32 bytes,
 data padded to 8}.
 """
 import struct
@@ -34,7 +38,12 @@ GKV = {0xa1000000: 0xa1000001, 0xab000000: 0x1, 0xa2000000: 0xa2000001, 0xac0000
 CKV = {0xa4000000: 0x0}                # Volume Level_0
 TAG_HW_EP_RX = 0xc0000004
 TKV = {0xa9000000: 2}                  # Channels
+RECEIVER_GKV = {0xa1000000: 0xa1000001, 0xab000000: 0x1, 0xa2000000: 0xa2000004, 0xac000000: 0xac000002}
+RECEIVER_TKV = {0xa9000000: 1}
 PARAM_ID_TDM_INTF_CFG = 0x0800101B
+# kvh2xml.xml module tags: sh_ep, stream_pcm_decoder, stream_pcm_converter, stream_volume, stream_spr, pspd_mfc,
+# device_hw_ep_rx
+RUN_TAGS = (0xc0000001, 0xc000000e, 0xc0000010, 0xc000000d, 0xc0000013, 0xc0000019, TAG_HW_EP_RX)
 
 
 def tag(name):
@@ -212,6 +221,18 @@ class Acdb:
                 sg, 'yes' if default else 'no', len(matched), len(override)))
         return out, count
 
+    def tagged(self, sg_ids, tag_id):
+        """AcdbCmdGetTaggedModules: the instances carrying TAG_ID in the subgraphs."""
+        lut, _ = self.chunk('TMLU')
+        de, _ = self.chunk('TMDE')
+        out = []
+        for i in range(self.u32(lut)):
+            sg, t, off = self.u32(lut + 4 + 12 * i, 3)
+            if t == tag_id and sg in sg_ids:
+                o = de + off
+                out += [self.u32(o + 8 + 8 * j) for j in range(self.u32(o))]
+        return out
+
     def tag_data(self, sg_ids, tag_id, tkv):
         """AcdbCmdGetModuleTagData: MTKT <sg, tag, offset>, MTLU {nk, ne, <values, def, dot>}."""
         kt, ksz = self.chunk('MTKT')
@@ -239,17 +260,18 @@ class Acdb:
 
 
 def main(argv):
-    if len(argv) != 3:
+    if len(argv) not in (3, 4) or (len(argv) == 4 and argv[3] != 'receiver'):
         raise SystemExit(__doc__)
     a = Acdb(argv[1])
-    sg_list_off, sg_prop_off = a.find_graph(GKV)
+    gkv, tkv = (RECEIVER_GKV, RECEIVER_TKV) if len(argv) == 4 else (GKV, TKV)
+    sg_list_off, sg_prop_off = a.find_graph(gkv)
     sgs = a.sg_list(sg_list_off)
     print('subgraphs (sink first): %s' % ', '.join('%#x -> %s' % (s, [hex(x) for x in d]) for s, d in sgs))
     sg_ids = [s for s, _ in sgs]
     spf = b''.join(a.sg_spf_blob(sg_prop_off, s) for s in sg_ids)
     conn = a.sg_connections([(s, d) for s, ds in sgs for d in ds])
     cal, ncal = a.calibration(sg_ids, CKV)
-    tdm = a.tag_data(sg_ids, TAG_HW_EP_RX, TKV)
+    tdm = a.tag_data(sg_ids, TAG_HW_EP_RX, tkv)
     o = 0
     while o + 16 <= len(tdm):
         miid, pid, size, _ = struct.unpack_from('<IIII', tdm, o)
@@ -259,7 +281,16 @@ def main(argv):
                   'sync_mode %d invert_sync %d data_delay %d lane_mask %#x' % (
                       f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[11]))
         o += 16 + size + (-size % 8)
-    sections = [(1, spf + conn), (2, cal), (3, tdm), (4, struct.pack('<I%dI' % len(sg_ids), len(sg_ids), *sg_ids))]
+    iids = []
+    for t in RUN_TAGS:
+        found = a.tagged(sg_ids, t)
+        if len(found) != 1:
+            raise SystemExit('tag %#x: %d instances %s' % (t, len(found), [hex(x) for x in found]))
+        iids.append((t, found[0]))
+    print('  run-time instances: %s' % ', '.join('%#x %#x' % x for x in iids))
+    run = struct.pack('<II', tkv[0xa9000000], len(iids)) + b''.join(struct.pack('<II', *x) for x in iids)
+    sections = [(1, spf + conn), (2, cal), (3, tdm), (4, struct.pack('<I%dI' % len(sg_ids), len(sg_ids), *sg_ids)),
+                (5, run)]
     blob = b'PSPKGR01' + struct.pack('<I', len(sections))
     for t, data in sections:
         blob += struct.pack('<II', t, len(data)) + pad8(data)

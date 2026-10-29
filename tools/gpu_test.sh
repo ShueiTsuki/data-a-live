@@ -3,6 +3,7 @@
 #
 #   tools/gpu_test.sh NAME TURNIP_ZIP [--write-pack] [--secs N] [--kernel K] [--level L] [--args "BOOT-ARGS"] [--no-metal]
 #                     [--clients "NAMES"] [--no-vktest] [--pool MIB] [--hz N] [--amp-fw DIR] [--log-cfg PLIST]
+#                     [--tunings DIR]
 #
 #   1. unpacks TURNIP_ZIP (the turnip-ios artifact of .github/workflows/turnip.yml) into
 #      out-root/turnip/NAME, or with TURNIP_ZIP = release downloads the rolling turnip-ci
@@ -28,7 +29,7 @@ ADB=/d/Android/platform-tools/adb.exe
 NAME=$1 ZIP=$2; shift 2
 WRITE=0 SECS=180 KERNEL=/opt/work/plk/k0187-amfi.macho LEVEL=15 ARGS= METAL=1 CLIENTS="bluetoothd vktest mtltest"
 SWAP="sweetexecswap=bluetoothd:/usr/libexec/vktest" POOL=1024
-LOG_CFG=() RENAMES=() PUTS=() EXECS=() RMS=()
+LOG_CFG=() RENAMES=() PUTS=() EXECS=() RMS=() TUNINGS=
 while [ $# -gt 0 ]; do
 	case $1 in
 	--write-pack) WRITE=1; shift ;;
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
 	--metal-from) METAL_FROM=$2; shift 2 ;;  # a local plugin build (tools/metal/build_plugin_linux.sh OUT, WSL path)
 	--amp-fw) AMP_FW=$2; shift 2 ;;        # the amplifiers' firmware files (Windows-side directory)
 	--log-cfg) LOG_CFG+=("$2"); shift 2 ;; # a unified-log subsystem config (tools/logging/SUBSYSTEM.plist), repeatable
+	--tunings) TUNINGS=$2; shift 2 ;;    # the speaker strips from tools/spk_tunings.py (PRODUCT.NAME.austrip)
 	--rename) RENAMES+=("$2"); shift 2 ;;  # "FROM TO": the installer renames FROM to TO in iOS (patch 0286), repeatable
 	--put) PUTS+=("$2"); shift 2 ;;        # "LOCAL MODE DEST": install LOCAL at DEST in iOS, repeatable
 	--exec) EXECS+=("$2"); shift 2 ;;      # "LOCAL MODE DEST": as --put, and LOCAL (signed) goes into the trust cache
@@ -153,10 +155,12 @@ if [ -n "${AMP_FW:-}" ]; then
 		[ -f "$AMP_FW/$f" ] || { echo "no $AMP_FW/$f"; exit 1; }
 		PARTS+=("$(winp "$AMP_FW/$f")")
 	done
-	# the speaker graph from the phone's ACDB (tools/spk_graph.py), when made
-	if [ -f "$AMP_FW/spkgraph.bin" ]; then
-		PARTS+=("$(winp "$AMP_FW/spkgraph.bin")")
-	fi
+	# the speaker's and the receiver's graphs from the phone's ACDB (tools/spk_graph.py), when made
+	for g in spkgraph.bin rcvgraph.bin; do
+		if [ -f "$AMP_FW/$g" ]; then
+			PARTS+=("$(winp "$AMP_FW/$g")")
+		fi
+	done
 	# this phone's speaker calibration (Android /mnt/vendor/persist/audio/crus_calr.bin), when copied there;
 	# goes only into the pack on the phone, never into the repo
 	if [ -f "$AMP_FW/crus_calr.bin" ]; then
@@ -170,6 +174,15 @@ for c in "${LOG_CFG[@]}"; do
 	printf '%s 644 /Library/Preferences/Logging/Subsystems/%s\n' "$(basename "$c")" "$(basename "$c")" >> "$T/files.txt"
 	PARTS+=("$(winp "$c")")
 done
+# --tunings: each PRODUCT.NAME.austrip at /Library/Audio/Tunings/PRODUCT/VAD/NAME
+if [ -n "$TUNINGS" ]; then
+	for t in "$TUNINGS"/*.austrip; do
+		[ -f "$t" ] || { echo "no strips in $TUNINGS"; exit 1; }
+		b=$(basename "$t")
+		printf '%s 644 /Library/Audio/Tunings/%s/VAD/%s\n' "$b" "${b%%.*}" "${b#*.}" >> "$T/files.txt"
+		PARTS+=("$(winp "$t")")
+	done
+fi
 for r in "${RENAMES[@]}"; do
 	printf '> %s\n' "$r" >> "$T/files.txt"
 done

@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index b0594bd..f0dc6f6 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1566,13 +1566,16 @@ static int spk_live;
+ extern uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
+ 
+ /*
+- * 0300: with pandora_spk_live the graphs open and close with the route, as PAL opens a stream's graph at the stream's
+- * start and closes it at its standby (AudioFlinger's, 2 s after the sound): pandora_adsp_route (PandoraAudio.cpp) asks
+- * for the speaker's graph (spkgraph.bin), the receiver's (rcvgraph.bin, tools/spk_graph.py ACDB OUT receiver) or none.
+- * The first graph after boot is the speaker's, for the amps' first play; it closes once the amps are down and nobody
+- * has asked for a route. Closing stops and closes the graph and releases the TDM clock (state SpkIdle); the memory map
+- * stays. The instances the run-time settings go to come from the file's IIDS section (tagged modules, spk_graph.py);
+- * a file without it gets the speaker graph's.
++ * 0300: with pandora_spk_live the graph follows the route: pandora_adsp_route (PandoraAudio.cpp) asks for the
++ * speaker's graph (spkgraph.bin), the receiver's (rcvgraph.bin, tools/spk_graph.py ACDB OUT receiver) or none. The
++ * instances the run-time settings go to come from the file's IIDS section (tagged modules, spk_graph.py); a file
++ * without it gets the speaker graph's.
++ * 0301: aud30 closed the graph when the route went to none, as PAL closes a stream's graph at its standby, and released
++ * the TDM clock: 60 ms later the DSP crashed, "systemcache.c:1048:F03C0C44: Island SCID 12 is not configured" (with no
++ * use case left it goes to its island low-power mode, which needs a system cache (LLCC) slice that Android's kernel
++ * configures and ours does not). So a graph always runs: none keeps the one there is (silence, the amps down), and a
++ * change of route closes the graph and opens the other with the clock held. Without a graph (SpkIdle) only after a
++ * failure; the next request tries again.
+  */
+ enum {SpkNone = 0, SpkSpeaker = 1, SpkReceiver = 2};
+ static volatile uint32_t spk_want = SpkSpeaker;   /* the graph asked for */
+@@ -1580,10 +1583,10 @@ static uint32_t spk_cur = SpkSpeaker;             /* the graph running, opening
+ static volatile uint32_t spk_req, spk_done;       /* route requests, the last one dealt with */
+ static uint32_t spk_doing;                        /* the request the change under way is for */
+ static bool spk_amp_started;
++static bool spk_swap;                             /* 0301: closing for the other graph, the clock held */
+ static struct {
+ 	uint32_t ch, sh_ep, dec, cnv, vol, spr, mfc, tdm;
+ } spk_ii;
+-extern int pandora_amp_mode(void);                /* pandora_amp.c: -1 before its power thread runs */
+ 
+ static void
+ spk_put32(uint8_t *p, uint32_t v)
+@@ -1949,7 +1952,12 @@ spk_graph_end(bool started)
+ static void
+ spk_graph_done(bool aborted)
+ {
+-	if (spk.closing) {
++	if (spk.closing && spk_swap && spk_live && spk.handle && spk_want != SpkNone) {
++		spk_swap = false;                     /* 0301: straight to the other graph, the clock held */
++		spk_cur = spk_want;
++		spk_graph_begin();
++	} else if (spk.closing) {
++		spk_swap = false;
+ 		spk_clock(0);
+ 	} else if (!aborted) {
+ 		printf("PANDORA SPK: %s graph running after %llu ms, %u commands refused\n",
+@@ -2210,23 +2218,22 @@ spk_step(void)
+ 	/* 0300: the route's graph (spk_want, pandora_adsp_route): close the one that runs, open the one asked for */
+ 	if (spk_live && !spk.tx_len && (spk.state == SpkRunning || spk.state == SpkIdle)) {
+ 		const uint32_t req = __atomic_load_n(&spk_req, __ATOMIC_ACQUIRE);
+-		if (req == 0 && spk.state == SpkRunning && pandora_amp_mode() == 0) {
+-			spk_want = SpkNone;                   /* the boot's graph: the amps are down and nobody asked */
+-		}
+ 		const uint32_t want = spk_want;
+-		if (spk.state == SpkRunning && want != spk_cur) {
++		const bool fresh = __atomic_load_n(&spk_done, __ATOMIC_ACQUIRE) != req;
++		if (spk.state == SpkRunning && want != SpkNone && want != spk_cur) {
+ 			spk_doing = req;
+ 			spk_tone.on = false;
+-			printf("PANDORA SPK: closing the %s graph for %s\n", spk_cur == SpkReceiver ? "receiver" : "speaker",
+-			    want == SpkReceiver ? "the receiver" : want == SpkSpeaker ? "the speaker" : "no route");
++			spk_swap = true;
++			printf("PANDORA SPK: closing the %s graph for the %s's\n", spk_cur == SpkReceiver ? "receiver" : "speaker",
++			    want == SpkReceiver ? "receiver" : "speaker");
+ 			spk_graph_end(true);
+-		} else if (spk.state == SpkIdle && want != SpkNone) {
++		} else if (spk.state == SpkIdle && want != SpkNone && fresh) {
+ 			spk_doing = req;
+ 			spk_cur = want;
+ 			spk.t0 = now;
+ 			spk_clock(SPK_TDM_HZ);
+-		} else if (__atomic_load_n(&spk_done, __ATOMIC_ACQUIRE) != req) {
+-			__atomic_store_n(&spk_done, req, __ATOMIC_RELEASE);      /* already as asked */
++		} else if (fresh) {
++			__atomic_store_n(&spk_done, req, __ATOMIC_RELEASE);      /* already as asked (none: the graph stays) */
+ 			thread_wakeup((event_t)&spk_done);
+ 		}
+ 	}
+@@ -2290,7 +2297,7 @@ pandora_adsp_route(unsigned which, unsigned wait_ms)
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+-	const bool ok = which == SpkNone ? spk.state == SpkIdle : spk.state == SpkRunning && spk_cur == which;
++	const bool ok = which == SpkNone || (spk.state == SpkRunning && spk_cur == which);
+ 	return ok ? 0 : EIO;
+ }
+ 
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 8aaa432..18c00c3 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -1044,15 +1044,6 @@ pandora_amp_io(int mode, unsigned wait_ms)
+ 	return pa_mode == pa_want ? 0 : EIO;
+ }
+ 
+-/* The amps' mode for pandora_adsp.c (0300: the boot's graph closes once the amps are down): -1 before the power
+- * thread runs. */
+-int pandora_amp_mode(void);
+-int
+-pandora_amp_mode(void)
+-{
+-	return pa_follow ? (int)pa_mode : -1;
+-}
+-
+ /* Before a power off or a restart (PandoraAudio.cpp's power-off and restart message, sweet_ufs.c's
+  * pandora_reboot_after): the amps down, up to 1 s, and they stay down. */
+ void pandora_amp_final(const char *why);

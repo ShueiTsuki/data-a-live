@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index f0dc6f6..eb7cb95 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1903,6 +1903,25 @@ spk_graph_begin(void)
+ 	spk_put16(d + 6, spk_ii.ch);
+ 	spk_put32(d + 8, 1);
+ 	spk_add_oob("TDM media format", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.tdm, 0x08001017u, d, 12), false);
++	/* 0304: the backend's LPAIF type and interface index in PARAM_ID_TDM_INTF_CFG, as AGM's configure_tdm_ep fills
++	 * them for TDM-LPAIF-RX-PRIMARY (LPAIF 0, primary 0): the ACDB's values are placeholders. The speaker's tag data
++	 * holds 0 and 0 already; the receiver's holds interface 1 (aud33: no sound, the samples went to the secondary
++	 * TDM, which no amp listens to). */
++	{
++		uint8_t *t = (uint8_t *)(uintptr_t)sec[3];
++		for (uint32_t o = 0; o + 16 <= len[3];) {
++			const uint32_t pid = spk_le32(t + o + 4), n = spk_le32(t + o + 8);
++			if (pid == 0x0800101Bu && n >= 8 && o + 16 + n <= len[3]) {
++				if (spk_le32(t + o + 16) != 0 || spk_le32(t + o + 20) != 0) {
++					printf("PANDORA SPK: TDM interface: LPAIF %u interface %u in the ACDB, primary TDM set\n",
++					    spk_le32(t + o + 16), spk_le32(t + o + 20));
++				}
++				spk_put32(t + o + 16, 0);
++				spk_put32(t + o + 20, 0);
++			}
++			o += 16 + ((n + 7u) & ~7u);
++		}
++	}
+ 	spk_add_oob("TDM interface", APM_CMD_SET_CFG, sec[3], len[3], false);
+ 	spk_add_oob("PCM decoder output", APM_CMD_SET_CFG, b, spk_pcm_out(b, spk_ii.dec), false);
+ 	spk_add_oob("PCM converter output", APM_CMD_SET_CFG, b, spk_pcm_out(b, spk_ii.cnv), false);

@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index 466c46e..53fdc6e 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -877,6 +877,20 @@ pandora_audio_out_fill(int32_t *dst, uint32_t frames)
+ 			d->lv_sq_[0] = d->lv_sq_[1] = 0;
+ 		}
+ 	}
++	/*
++	 * 0306: the speaker's channels as iPhone X's: channel 0 for the bottom (main) speaker, channel 1 for the top one
++	 * (on iPhone X the receiver doubles as it), which iOS's speaker chain shades by orientation (AURotationShading).
++	 * aud35: iOS's channel 0 carried the full signal from the start, channel 1 started 8-12 dB lower and rose by about
++	 * 7 dB over 5 s; with channel 0 on TDM slot 0 (the top amp, Android's left) the bottom speaker played the shaded
++	 * channel, heard as a slow start. The DSP's slot 0 drives the top amp, slot 1 the bottom: the two swap here.
++	 */
++	if (d->speaker()) {
++		for (uint32_t f = 0; f < frames; f++) {
++			const int32_t t = dst[2 * f];
++			dst[2 * f] = dst[2 * f + 1];
++			dst[2 * f + 1] = t;
++		}
++	}
+ 	return frames;
+ }
+ 

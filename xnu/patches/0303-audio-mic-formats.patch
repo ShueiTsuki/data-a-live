@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 9a1e172..18c00c3 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -989,12 +989,10 @@ pa_power_loop(void)
+ 			    pa_final ? ", final" : "", was, pa_ms_since(t0), err);
+ 			since = mach_absolute_time();
+ 		}
+-		bool came_up = false;
+ 		if (want != pa_mode) {
+ 			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
+ 			const int err = want == PA_RECEIVER ? pa_receiver_up() : pa_speaker_up();
+ 			pa_mode = err ? PA_OFF : want;
+-			came_up = pa_mode != PA_OFF;
+ 			ups++;
+ 			printf("PANDORA AMP: %s up (%u) after %llu ms down, in %llu ms, err %d\n", pa_mode_name[want], ups, was,
+ 			    pa_ms_since(t0), err);
+@@ -1002,19 +1000,6 @@ pa_power_loop(void)
+ 		}
+ 		__atomic_store_n(&pa_seen, req, __ATOMIC_RELEASE);
+ 		thread_wakeup((event_t)&pa_seen);
+-		/* 0303: aud31, the user: the speaker's sound grows louder at its start ("声音是逐渐变大的"), where iOS's samples
+-		 * in the ring rise about as much as the file's. The firmware's readouts (input into the amp from the DSP, its
+-		 * voltage and current out) every 100 ms for 3 s after each power-up show which stage rises; a new request ends
+-		 * them. */
+-		for (unsigned k = 1; came_up && k <= 30 && __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE) == seen; k++) {
+-			char when[24];
+-			pa_sleep(100);
+-			snprintf(when, sizeof(when), "up +%u ms", k * 100);
+-			if (pa_mode == PA_SPEAKER) {
+-				pa_levels(0x40, when);
+-			}
+-			pa_levels(0x42, when);
+-		}
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index b5bca72..9a2efc6 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -92,11 +92,21 @@ pa_format(bool range, uint32_t channels = PA_CHANNELS)
+ }
+ 
+ static OSDictionary *
+-pa_stream(bool input, uint32_t id = PA_STREAM_ID, uint32_t terminal = 0, uint32_t channels = PA_CHANNELS)
++pa_stream(bool input, uint32_t id = PA_STREAM_ID, uint32_t terminal = 0, uint32_t channels = PA_CHANNELS,
++    uint32_t max_channels = 0)
+ {
+ 	OSDictionary *s = OSDictionary::withCapacity(6);
+ 	OSDictionary *cur = pa_format(false, channels), *avail = pa_format(true, channels);
+ 	OSArray *list = avail == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&avail, 1);
++	for (uint32_t ch = 1; list != nullptr && ch <= max_channels; ch++) {   /* 0303: the other formats offered */
++		if (ch != channels) {
++			OSDictionary *f = pa_format(true, ch);
++			if (f != nullptr) {
++				list->setObject(f);
++			}
++			OSSafeReleaseNULL(f);
++		}
++	}
+ 	if (s == nullptr || cur == nullptr || list == nullptr) {
+ 		OSSafeReleaseNULL(s);
+ 	} else {
+@@ -171,6 +181,7 @@ public:
+ 	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
+ 	bool codec_ = false;                                     /* 0299: the "Codec" device (receiver, microphones) */
+ 	volatile bool out_active_ = false;                       /* 0300: its output stream set active (method 6) */
++	uint32_t in_channels_ = 1;                               /* 0303: the Codec's microphone stream's channels */
+ 	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
+ 	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
+ 	uint32_t resyncs_ = 0;
+@@ -472,6 +483,9 @@ IOAudio2Device::start(IOService *provider)
+ 	 * its custom properties through ({"property selector", "registry key"}: 'MCCs' maxChannelCount, 'LPEm', 'LPAm');
+ 	 * VirtualAudio's Device_Codec_Aspen reads MaxInputChannelCount from 'MCCs'. The input carries this phone's
+ 	 * microphones: two, as Android's handset recording (handset-dmic-endfire: AMIC1 bottom and AMIC4).
++	 * aud32: the same refusal with two channels; HAL never asked for another format (method 5), as only one was
++	 * offered. The stream now offers mono (current: one microphone, what iPhone X's general recording chain takes)
++	 * and two channels; method 5 switches between them.
+ 	 */
+ 	codec_ = role != nullptr && role->isEqualTo("Codec");
+ 	if (codec_) {
+@@ -482,7 +496,7 @@ IOAudio2Device::start(IOService *provider)
+ 		    page_size);
+ 		OSSafeReleaseNULL(stream);
+ 		stream = pa_stream(false, 1, PA_4CC('r', 's', 'p', 'k'));     /* kAudioStreamTerminalTypeReceiverSpeaker */
+-		OSDictionary *in = pa_stream(true, 2, 0, PA_CODEC_MICS);
++		OSDictionary *in = pa_stream(true, 2, 0, in_channels_, PA_CODEC_MICS);
+ 		OSDictionary *mute = pa_control(1, PA_4CC('t', 'o', 'g', 'l'), PA_4CC('m', 'u', 't', 'e'),
+ 		    PA_4CC('o', 'u', 't', 'p'), 3, 0);
+ 		OSDictionary *source = pa_control(2, PA_4CC('s', 'l', 'c', 't'), PA_4CC('d', 's', 'r', 'c'),
+@@ -941,6 +955,20 @@ IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 			IOLog("PANDORA AUDIO %s: %s: format of stream %llu: rate bits %#llx (48000.0 = 0x40e7700000000000) "
+ 			    "id %#x flags %#x %u B/packet %u frames/packet %u B/frame %u ch %u bits\n", device_->tag(), name_, s[0],
+ 			    rate_bits, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
++			/* 0303: the Codec's microphone stream takes 1 or 2 channels; its "current format" follows */
++			if (device_->codec_ && s[0] == 2 && f[5] >= 1 && f[5] <= PA_CODEC_MICS && f[5] != device_->in_channels_) {
++				OSDictionary *in = pa_stream(true, 2, 0, f[5], PA_CODEC_MICS);
++				OSArray *ins = in == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&in, 1);
++				if (ins != nullptr) {
++					device_->setProperty("input streams", ins);
++					device_->in_channels_ = f[5];
++					IOLog("PANDORA AUDIO Codec: microphone stream now %u channels\n", f[5]);
++				} else {
++					ret = kIOReturnNoMemory;
++				}
++				OSSafeReleaseNULL(in);
++				OSSafeReleaseNULL(ins);
++			}
+ 		}
+ 		break;
+ 	case 6:                                                  /* stream ID, active */

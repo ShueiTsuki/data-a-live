@@ -1,0 +1,58 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index 9a2efc6..466c46e 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -185,6 +185,8 @@ public:
+ 	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
+ 	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
+ 	uint32_t resyncs_ = 0;
++	uint64_t lv_seed_ = 0, lv_sq_[2] = {};                   /* 0305: the start's levels (pandora_audio_out_fill) */
++	uint32_t lv_frames_ = 0, lv_win_ = 0, lv_peak_[2] = {};
+ 
+ 	const char *tag(void) const { return codec_ ? "Codec" : hawking_ ? "Hawking" : "Speaker"; }
+ 	bool speaker(void) const { return !hawking_ && !codec_; }
+@@ -837,6 +839,44 @@ pandora_audio_out_fill(int32_t *dst, uint32_t frames)
+ 		memcpy(dst + (size_t)first * PA_CHANNELS, ring, (size_t)(frames - first) * PA_BYTES_FRAME);
+ 	}
+ 	d->rp_ += frames;
++	/*
++	 * 0305: the user hears the speaker's sound start low and reach its level after a few seconds (aud31, aud33), and
++	 * iOS's samples in the ring rise by about 9 dB over 4 s where the file's peaks rise by 1.4 dB. Per channel, every
++	 * 100 ms for 6 s after each start: the peak and the RMS (16-bit scale) of what the DSP gets, to compare with the
++	 * file's envelope and between the channels (AURotationShading in iPhone X's speaker chain sets their balance).
++	 */
++	if (d->lv_seed_ != d->seed_) {
++		d->lv_seed_ = d->seed_;
++		d->lv_frames_ = d->lv_win_ = 0;
++		d->lv_peak_[0] = d->lv_peak_[1] = 0;
++		d->lv_sq_[0] = d->lv_sq_[1] = 0;
++	}
++	for (uint32_t f = 0; d->lv_win_ < 60 && f < frames; f++) {
++		for (unsigned c = 0; c < 2; c++) {
++			const int32_t v = dst[2 * f + c];
++			const uint32_t a = v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
++			const uint64_t h = a >> 16;
++			d->lv_peak_[c] = a > d->lv_peak_[c] ? a : d->lv_peak_[c];
++			d->lv_sq_[c] += h * h;
++		}
++		if (++d->lv_frames_ == PA_RATE / 10u) {
++			uint32_t rms[2];
++			for (unsigned c = 0; c < 2; c++) {
++				const uint64_t m = d->lv_sq_[c] / (PA_RATE / 10u);
++				uint32_t r = 0;
++				while ((uint64_t)(r + 1) * (r + 1) <= m) {
++					r++;
++				}
++				rms[c] = r;
++			}
++			d->lv_win_++;
++			IOLog("PANDORA AUDIO %s: out +%u ms: L peak %#x rms %u, R peak %#x rms %u\n", d->tag(), d->lv_win_ * 100u,
++			    d->lv_peak_[0], rms[0], d->lv_peak_[1], rms[1]);
++			d->lv_frames_ = 0;
++			d->lv_peak_[0] = d->lv_peak_[1] = 0;
++			d->lv_sq_[0] = d->lv_sq_[1] = 0;
++		}
++	}
+ 	return frames;
+ }
+ 

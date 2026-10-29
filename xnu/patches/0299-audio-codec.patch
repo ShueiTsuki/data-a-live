@@ -1,0 +1,233 @@
+diff --git a/iokit/Kernel/arm/PandoraAudio.cpp b/iokit/Kernel/arm/PandoraAudio.cpp
+index 467d750..0c5a8e6 100644
+--- a/iokit/Kernel/arm/PandoraAudio.cpp
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -91,7 +91,7 @@ pa_format(bool range)
+ }
+ 
+ static OSDictionary *
+-pa_stream(bool input)
++pa_stream(bool input, uint32_t id = PA_STREAM_ID, uint32_t terminal = 0)
+ {
+ 	OSDictionary *s = OSDictionary::withCapacity(6);
+ 	OSDictionary *cur = pa_format(false), *avail = pa_format(true);
+@@ -99,10 +99,11 @@ pa_stream(bool input)
+ 	if (s == nullptr || cur == nullptr || list == nullptr) {
+ 		OSSafeReleaseNULL(s);
+ 	} else {
+-		pa_num(s, "stream ID", PA_STREAM_ID, 32);
++		pa_num(s, "stream ID", id, 32);
+ 		pa_num(s, "starting channel", 1, 32);
+-		/* kAudioStreamTerminalTypeMicrophone / kAudioStreamTerminalTypeSpeaker */
+-		pa_num(s, "terminal type", input ? PA_4CC('m', 'i', 'c', 'r') : PA_4CC('s', 'p', 'k', 'r'), 32);
++		/* kAudioStreamTerminalTypeMicrophone / kAudioStreamTerminalTypeSpeaker unless given */
++		pa_num(s, "terminal type", terminal ? terminal : input ? PA_4CC('m', 'i', 'c', 'r') : PA_4CC('s', 'p', 'k', 'r'),
++		    32);
+ 		s->setObject("current format", cur);
+ 		s->setObject("available formats", list);
+ 	}
+@@ -112,12 +113,54 @@ pa_stream(bool input)
+ 	return s;
+ }
+ 
++/*
++ * 0299: a control as IOAudio2Family describes one (keys in the iPhone X kernelcache next to "control ID": "base class",
++ * "class", "scope", "element", "read only", "value", "selectors"; CoreAudio's HALS_IOA2UCDevice reads the same).
++ * ITEMS: for a selector, its items {"value", "name"}.
++ */
++static OSDictionary *
++pa_control(uint32_t id, uint32_t base, uint32_t cls, uint32_t scope, uint32_t element, uint32_t value,
++    const uint32_t *items = nullptr, const char *const *names = nullptr, unsigned nitems = 0)
++{
++	OSDictionary *c = OSDictionary::withCapacity(8);
++	if (c == nullptr) {
++		return nullptr;
++	}
++	pa_num(c, "control ID", id, 32);
++	pa_num(c, "base class", base, 32);
++	pa_num(c, "class", cls, 32);
++	pa_num(c, "scope", scope, 32);
++	pa_num(c, "element", element, 32);
++	pa_num(c, "value", value, 32);
++	c->setObject("read only", kOSBooleanFalse);
++	if (nitems) {
++		OSArray *list = OSArray::withCapacity(nitems);
++		for (unsigned i = 0; list != nullptr && i < nitems; i++) {
++			OSDictionary *it = OSDictionary::withCapacity(2);
++			OSString *name = OSString::withCString(names[i]);
++			if (it != nullptr && name != nullptr) {
++				pa_num(it, "value", items[i], 32);
++				it->setObject("name", name);
++				list->setObject(it);
++			}
++			OSSafeReleaseNULL(it);
++			OSSafeReleaseNULL(name);
++		}
++		if (list != nullptr) {
++			c->setObject("selectors", list);
++		}
++		OSSafeReleaseNULL(list);
++	}
++	return c;
++}
++
+ class IOAudio2Device : public IOService {
+ 	OSDeclareDefaultStructors(IOAudio2Device);
+ 
+ public:
+ 	IOBufferMemoryDescriptor *status_ = nullptr;
+ 	IOBufferMemoryDescriptor *ring_ = nullptr;
++	IOBufferMemoryDescriptor *in_ring_ = nullptr;           /* 0299: the "Codec" device's input stream (ID 2) */
+ 	IOLock *lock_ = nullptr;
+ 	volatile bool running_ = false;
+ 	volatile bool thread_on_ = false;
+@@ -125,11 +168,13 @@ public:
+ 	uint64_t t0_ = 0;
+ 	volatile uint32_t traps_ = 0;
+ 	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
++	bool codec_ = false;                                     /* 0299: the "Codec" device (receiver, microphones) */
+ 	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
+ 	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
+ 	uint32_t resyncs_ = 0;
+ 
+-	const char *tag(void) const { return hawking_ ? "Hawking" : "Speaker"; }
++	const char *tag(void) const { return codec_ ? "Codec" : hawking_ ? "Hawking" : "Speaker"; }
++	bool speaker(void) const { return !hawking_ && !codec_; }
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void free(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -363,6 +408,72 @@ IOAudio2Device::start(IOService *provider)
+ 		    PA_CHANNELS, PA_RING_FRAMES);
+ 		return true;
+ 	}
++	/*
++	 * 0299: a third instance (personality PandoraAudioRole = Codec) is the iPhone's "Codec" device (iPhone X:
++	 * AppleCS42L75Audio's "Codec": receiver, headphones and microphones). VirtualAudio's Device_Codec_Aspen
++	 * (0x23f8d0) makes its ports from the device's properties: a receiver port ("Built-In Receiver") when
++	 * kAudioDevicePropertyMute exists on output element 3 (element 4 makes a speaker port, 5 hearing aid
++	 * compliance), an internal microphone port when kAudioDevicePropertyDataSources ('ssc#') on the input scope lists
++	 * one of imic, smic, fmic, lmic, tmic, umic, imi1-imi4 and the transducer database has imic or imi1. In IOAudio2
++	 * terms: a mute control on output element 3 and a data source selector on the input. Output stream 1 (the
++	 * receiver), input stream 2 (the microphones, silent until they are driven). Published at once, as Hawking.
++	 */
++	codec_ = role != nullptr && role->isEqualTo("Codec");
++	if (codec_) {
++		static const uint32_t mics[5] = {PA_4CC('i', 'm', 'i', '1'), PA_4CC('i', 'm', 'i', '2'),
++		    PA_4CC('i', 'm', 'i', '3'), PA_4CC('i', 'm', 'i', '4'), PA_4CC('i', 'm', 'i', 'c')};
++		static const char *const mic_names[5] = {"Bottom", "Front", "Back", "Top", "Microphone"};
++		in_ring_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PA_RING_BYTES,
++		    page_size);
++		OSSafeReleaseNULL(stream);
++		stream = pa_stream(false, 1, PA_4CC('r', 's', 'p', 'k'));     /* kAudioStreamTerminalTypeReceiverSpeaker */
++		OSDictionary *in = pa_stream(true, 2);
++		OSDictionary *mute = pa_control(1, PA_4CC('t', 'o', 'g', 'l'), PA_4CC('m', 'u', 't', 'e'),
++		    PA_4CC('o', 'u', 't', 'p'), 3, 0);
++		OSDictionary *source = pa_control(2, PA_4CC('s', 'l', 'c', 't'), PA_4CC('d', 's', 'r', 'c'),
++		    PA_4CC('i', 'n', 'p', 't'), 0, mics[0], mics, mic_names, 5);
++		if (in_ring_ == nullptr || stream == nullptr || in == nullptr || mute == nullptr || source == nullptr) {
++			IOLog("PANDORA AUDIO Codec: no memory for the device\n");
++			OSSafeReleaseNULL(stream);
++			OSSafeReleaseNULL(in);
++			OSSafeReleaseNULL(mute);
++			OSSafeReleaseNULL(source);
++			OSSafeReleaseNULL(outs);
++			OSSafeReleaseNULL(ins);
++			OSSafeReleaseNULL(controls);
++			return false;
++		}
++		bzero(in_ring_->getBytesNoCopy(), PA_RING_BYTES);
++		outs->replaceObject(0, stream);
++		ins->setObject(in);
++		controls->setObject(mute);
++		controls->setObject(source);
++		setProperty("device UID", "Codec");
++		setProperty("device name", "Codec");
++		setProperty("device manufacturer", "Pandora");
++		setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);
++		setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
++		setProperty("io buffer frame size", PA_RING_FRAMES, 32);
++		setProperty("output latency", PA_OUT_LATENCY, 32);
++		setProperty("output safety offset", PA_OUT_SAFETY, 32);
++		setProperty("input latency", PA_OUT_LATENCY, 32);
++		setProperty("input safety offset", PA_OUT_SAFETY, 32);
++		setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
++		setProperty("output streams", outs);
++		setProperty("input streams", ins);
++		setProperty("controls", controls);
++		OSSafeReleaseNULL(stream);
++		OSSafeReleaseNULL(in);
++		OSSafeReleaseNULL(mute);
++		OSSafeReleaseNULL(source);
++		OSSafeReleaseNULL(outs);
++		OSSafeReleaseNULL(ins);
++		OSSafeReleaseNULL(controls);
++		registerService();
++		IOLog("PANDORA AUDIO Codec: registered: receiver output (mute control, element 3), microphone input "
++		    "(data source selector), %u Hz, %u channels, s32\n", PA_RATE, PA_CHANNELS);
++		return true;
++	}
+ 	/* 0282: the UID VirtualAudio looks the speaker up by (aud1: HAL activated "PandoraBuiltInSpeaker" as device 33,
+ 	 * but VirtualAudio built no route to it). Its table of physical devices takes the iPhone's UIDs: "Codec"
+ 	 * (CS42L75: receiver, headphones, mics), "Speaker" (CS35L26), "Voice", "Reference", "Baseband Voice". */
+@@ -418,6 +529,7 @@ IOAudio2Device::free(void)
+ {
+ 	OSSafeReleaseNULL(status_);
+ 	OSSafeReleaseNULL(ring_);
++	OSSafeReleaseNULL(in_ring_);
+ 	if (lock_ != nullptr) {
+ 		IOLockFree(lock_);
+ 		lock_ = nullptr;
+@@ -536,7 +648,7 @@ IOAudio2Device::startIO(void)
+ {
+ 	/* 0298: the amps up before the clock starts (Android powers them up before its first buffer, iOS before the
+ 	 * engine runs): the start waits for them, up to PA_AMP_WAIT_MS, and goes on either way. */
+-	if (!hawking_ && !running_) {
++	if (speaker() && !running_) {
+ 		(void)pandora_amp_io(1, PA_AMP_WAIT_MS);
+ 	}
+ 	for (unsigned t = 0; t < 50 && !running_ && thread_on_; t++) {
+@@ -549,6 +661,9 @@ IOAudio2Device::startIO(void)
+ 	}
+ 	seed_++;
+ 	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);           /* 0295: no tail of the last run reaches the DSP */
++	if (in_ring_ != nullptr) {
++		bzero(in_ring_->getBytesNoCopy(), PA_RING_BYTES);    /* 0299: the microphones are silent for now */
++	}
+ 	t0_ = mach_absolute_time();
+ 	pa_publish(this, 0);
+ 	running_ = true;
+@@ -574,7 +689,7 @@ IOAudio2Device::stopIO(void)
+ 	IOLockUnlock(lock_);
+ 	if (was) {
+ 		IOLog("PANDORA AUDIO %s: IO stopped\n", tag());
+-		if (!hawking_) {
++		if (speaker()) {
+ 			(void)pandora_amp_io(0, 0);        /* 0298: the amps down, as Android's at its stream's standby */
+ 		}
+ 	}
+@@ -665,6 +780,8 @@ IOAudio2DeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options
+ 		md = device_->status_;
+ 	} else if (device_ != nullptr && (type >> 28) == 1 && (type & 0x0fffffffu) == PA_STREAM_ID) {
+ 		md = device_->ring_;
++	} else if (device_ != nullptr && (type >> 28) == 1 && (type & 0x0fffffffu) == 2 && device_->in_ring_ != nullptr) {
++		md = device_->in_ring_;
+ 	}
+ 	IOLog("PANDORA AUDIO %s: %s maps type %#x (options %#x): %s\n", device_ != nullptr ? device_->tag() : "?",
+ 	    name_, (unsigned)type, options != nullptr ? (unsigned)*options : 0u, md == nullptr ? "refused" :
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 6ca0b3f..9227aaf 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -130,6 +130,12 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory'  = PandoraAudioHawking;"
+     "     'PandoraAudioRole' = Hawking;"
+     "   },"
++    "   {"
++    "     'IOClass'          = IOAudio2Device;"
++    "     'IOProviderClass'  = IOResources;"
++    "     'IOMatchCategory'  = PandoraAudioCodec;"
++    "     'PandoraAudioRole' = Codec;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

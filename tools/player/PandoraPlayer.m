@@ -1,6 +1,7 @@
 /*
- * PandoraPlayer: a one-button UIKit app that plays an audio file with AVAudioPlayer (the media path: AVAudioSession
- * playback category -> mediaserverd -> the default output), for listening tests of the speakers. It has no bundle of
+ * PandoraPlayer: a UIKit app that plays an audio file with AVAudioPlayer, for listening tests: "外放" with the
+ * playback category (mediaserverd -> the default output, the speakers), "听筒" with the play-and-record category,
+ * which iOS routes to the receiver. It has no bundle of
  * its own: installed inside an app bundle that is already on the home screen (Camera.app, unusable on this phone)
  * and started in place of that app's executable (boot-arg sweetexecswap=Camera:/Applications/Camera.app/
  * PandoraPlayer). The scene configuration comes from the app delegate, so the host bundle's scene manifest and
@@ -29,6 +30,7 @@ say(NSString *s)
 @interface PlayerController : UIViewController <AVAudioPlayerDelegate>
 @property (nonatomic, strong) AVAudioPlayer *player;
 @property (nonatomic, strong) UIButton *button;
+@property (nonatomic, strong) UIButton *ear;
 @property (nonatomic, strong) UILabel *status;
 @end
 
@@ -48,13 +50,23 @@ say(NSString *s)
 
 	self.button = [UIButton buttonWithType:UIButtonTypeSystem];
 	self.button.titleLabel.font = [UIFont boldSystemFontOfSize:40];
-	[self.button setTitle:@"播放" forState:UIControlStateNormal];
+	[self.button setTitle:@"外放" forState:UIControlStateNormal];
 	[self.button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 	self.button.backgroundColor = [UIColor colorWithRed:0.20 green:0.45 blue:0.95 alpha:1];
 	self.button.layer.cornerRadius = 20;
 	self.button.translatesAutoresizingMaskIntoConstraints = NO;
 	[self.button addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
 	[self.view addSubview:self.button];
+
+	self.ear = [UIButton buttonWithType:UIButtonTypeSystem];
+	self.ear.titleLabel.font = [UIFont boldSystemFontOfSize:40];
+	[self.ear setTitle:@"听筒" forState:UIControlStateNormal];
+	[self.ear setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+	self.ear.backgroundColor = [UIColor colorWithRed:0.15 green:0.65 blue:0.35 alpha:1];
+	self.ear.layer.cornerRadius = 20;
+	self.ear.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.ear addTarget:self action:@selector(earpiece) forControlEvents:UIControlEventTouchUpInside];
+	[self.view addSubview:self.ear];
 
 	self.status = [[UILabel alloc] init];
 	self.status.textColor = UIColor.lightGrayColor;
@@ -71,7 +83,11 @@ say(NSString *s)
 		[self.button.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
 		[self.button.widthAnchor constraintEqualToConstant:220],
 		[self.button.heightAnchor constraintEqualToConstant:100],
-		[self.status.topAnchor constraintEqualToAnchor:self.button.bottomAnchor constant:30],
+		[self.ear.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+		[self.ear.topAnchor constraintEqualToAnchor:self.button.bottomAnchor constant:30],
+		[self.ear.widthAnchor constraintEqualToConstant:220],
+		[self.ear.heightAnchor constraintEqualToConstant:100],
+		[self.status.topAnchor constraintEqualToAnchor:self.ear.bottomAnchor constant:30],
 		[self.status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
 		[self.status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
 	]];
@@ -95,26 +111,53 @@ say(NSString *s)
 	    (unsigned long)self.player.numberOfChannels]);
 }
 
-- (void)toggle
+/* Stops what plays, sets CATEGORY and plays from the start; the route iOS picked goes to the status line. */
+- (void)playWith:(AVAudioSessionCategory)category name:(NSString *)name
 {
-	if (self.player.playing) {
-		[self.player pause];
-		[self.button setTitle:@"播放" forState:UIControlStateNormal];
-		say(@"paused");
-		return;
-	}
 	NSError *err = nil;
-	if (![AVAudioSession.sharedInstance setActive:YES error:&err]) {
+	AVAudioSession *session = AVAudioSession.sharedInstance;
+	[self.player stop];
+	self.player.currentTime = 0;
+	if (![session setCategory:category error:&err]) {
+		say([NSString stringWithFormat:@"setCategory %@: %@", category, err]);
+	}
+	if (![session setActive:YES error:&err]) {
 		say([NSString stringWithFormat:@"setActive: %@", err]);
 	}
 	BOOL ok = [self.player play];
-	[self.button setTitle:@"暂停" forState:UIControlStateNormal];
-	say([NSString stringWithFormat:@"play: %d", ok]);
+	NSMutableArray *outs = [NSMutableArray array];
+	for (AVAudioSessionPortDescription *port in session.currentRoute.outputs) {
+		[outs addObject:[NSString stringWithFormat:@"%@ (%@)", port.portName, port.portType]];
+	}
+	NSString *route = [outs componentsJoinedByString:@", "];
+	self.status.text = [NSString stringWithFormat:@"%@：%@", name, route];
+	say([NSString stringWithFormat:@"%@ play: %d, category %@, route %@", name, ok, category, route]);
+}
+
+- (void)toggle
+{
+	if (self.player.playing) {
+		[self.player stop];
+		say(@"stopped");
+		self.status.text = @"停";
+		return;
+	}
+	[self playWith:AVAudioSessionCategoryPlayback name:@"外放"];
+}
+
+- (void)earpiece
+{
+	if (self.player.playing) {
+		[self.player stop];
+		say(@"stopped");
+		self.status.text = @"停";
+		return;
+	}
+	[self playWith:AVAudioSessionCategoryPlayAndRecord name:@"听筒"];
 }
 
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag
 {
-	[self.button setTitle:@"播放" forState:UIControlStateNormal];
 	player.currentTime = 0;
 	say([NSString stringWithFormat:@"finished: %d", flag]);
 }

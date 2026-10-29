@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+index 18c00c3..0ce0a42 100644
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -989,10 +989,12 @@ pa_power_loop(void)
+ 			    pa_final ? ", final" : "", was, pa_ms_since(t0), err);
+ 			since = mach_absolute_time();
+ 		}
++		bool speaker_up = false;
+ 		if (want != pa_mode) {
+ 			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
+ 			const int err = want == PA_RECEIVER ? pa_receiver_up() : pa_speaker_up();
+ 			pa_mode = err ? PA_OFF : want;
++			speaker_up = pa_mode == PA_SPEAKER;
+ 			ups++;
+ 			printf("PANDORA AMP: %s up (%u) after %llu ms down, in %llu ms, err %d\n", pa_mode_name[want], ups, was,
+ 			    pa_ms_since(t0), err);
+@@ -1000,6 +1002,17 @@ pa_power_loop(void)
+ 		}
+ 		__atomic_store_n(&pa_seen, req, __ATOMIC_RELEASE);
+ 		thread_wakeup((event_t)&pa_seen);
++		/* 0307: the user hears the speaker reach its level about 3 s after a start, the receiver not; iOS's output does
++		 * not rise (0305 levels against the file). The firmware's readouts (its input from the DSP, its voltage out)
++		 * every 100 ms for 6 s after a speaker power-up, next to PandoraAudio's levels of what the DSP got; a new
++		 * request ends them. */
++		for (unsigned k = 1; speaker_up && k <= 60 && __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE) == seen; k++) {
++			char when[24];
++			pa_sleep(100);
++			snprintf(when, sizeof(when), "up +%u ms", k * 100);
++			pa_levels(0x40, when);
++			pa_levels(0x42, when);
++		}
+ 	}
+ }
+ 

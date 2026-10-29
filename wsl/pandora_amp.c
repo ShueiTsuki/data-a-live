@@ -803,17 +803,19 @@ static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id)
  * Android's, in its order. Before a power off or a restart (pandora_amp_final) down, and they stay down.
  * One thread (pa_tdm_thread, after the first play) does all of it: nothing else uses the amps' bus by then.
  */
-static volatile uint32_t pa_want_on;       /* the speaker's IO runs */
-static volatile uint32_t pa_amps_up;            /* the amps are up */
+static volatile uint32_t pa_want;          /* 0300: the mode asked for: PA_OFF, PA_SPEAKER, PA_RECEIVER */
+static volatile uint32_t pa_mode;          /* the mode the amps are in */
 static volatile uint32_t pa_req;           /* bumped with each request (pandora_amp_io, pandora_amp_final) */
 static volatile uint32_t pa_seen;          /* the last request the power thread has dealt with */
 static volatile bool pa_follow;            /* the power thread follows the IO */
 static volatile bool pa_final;             /* power off or restart: down and stay down */
 
+enum { PA_OFF = 0, PA_SPEAKER = 1, PA_RECEIVER = 2 };
+
 /* Both amps up as Android's second play (beep2): routing and noise gate, serial port and enables, then each amp: the
  * test-key unlock with 0x2084 0x000F1AA0, GLOBAL_EN, 0x2018 bit 0, PLAY with AUDIO_STATE checked. */
 static int
-pa_power_up(void)
+pa_speaker_up(void)
 {
 	static const uint8_t amps[2] = {0x40, 0x42};
 	int err = 0;
@@ -847,11 +849,34 @@ pa_power_up(void)
 	return err;
 }
 
-/* Both amps down as Android (beep1, beep2): enables but bit 0 and 5, then each amp: PAUSE with AUDIO_STATE checked,
- * 0x2018 bit 0, the test key with 0x2084 0x000F1AA3, GLOBAL_EN and the serial port off, the power-down done bit
- * (0x10010 bit 16) awaited and cleared; then the noise gate and the routing. Every step is tried even after an error. */
+/* One amp's power stage off, as cs35l43_main_amp_event's power-down: 0x2018 bit 0, the test key with 0x2084
+ * 0x000F1AA3, GLOBAL_EN and the serial port off, the power-down done bit (0x10010 bit 16) awaited and cleared. */
 static int
-pa_power_down(void)
+pa_stage_down(uint8_t amp)
+{
+	int e = pa_write1(amp, 0x2018, 0x20);
+	e = e ? e : pa_key(amp, 0x000f1aa3);
+	pa_sleep(1);
+	e = e ? e : pa_write1(amp, 0x2014, 0);
+	e = e ? e : pa_write1(amp, 0x4800, 0);
+	pa_sleep(1);
+	uint32_t irq = 0;
+	for (unsigned t = 0; t < 100 && !e && !(irq & 0x10000u); t++) {
+		e = pa_reg(amp, 0x10010, &irq);
+		if (!(irq & 0x10000u)) {
+			pa_sleep(1);
+		}
+	}
+	if (!e && !(irq & 0x10000u)) {
+		printf("PANDORA AMP: %#x no power-down done bit after 100 ms\n", amp);
+	}
+	return e ? e : pa_write1(amp, 0x10010, 0x10000);
+}
+
+/* Both amps down as Android (beep1, beep2): enables but bit 0 and 5, then each amp: PAUSE with AUDIO_STATE checked
+ * and its power stage off; then the noise gate and the routing. Every step is tried even after an error. */
+static int
+pa_speaker_down(void)
 {
 	static const uint8_t amps[2] = {0x40, 0x42};
 	int err = 0;
@@ -870,23 +895,7 @@ pa_power_down(void)
 				printf("PANDORA AMP: %#x PAUSE: AUDIO_STATE %#x, NOT paused\n", amps[i], a);
 			}
 		}
-		e = e ? e : pa_write1(amps[i], 0x2018, 0x20);
-		e = e ? e : pa_key(amps[i], 0x000f1aa3);
-		pa_sleep(1);
-		e = e ? e : pa_write1(amps[i], 0x2014, 0);
-		e = e ? e : pa_write1(amps[i], 0x4800, 0);
-		pa_sleep(1);
-		uint32_t irq = 0;
-		for (unsigned t = 0; t < 100 && !e && !(irq & 0x10000u); t++) {
-			e = pa_reg(amps[i], 0x10010, &irq);
-			if (!(irq & 0x10000u)) {
-				pa_sleep(1);
-			}
-		}
-		if (!e && !(irq & 0x10000u)) {
-			printf("PANDORA AMP: %#x no power-down done bit after 100 ms\n", amps[i]);
-		}
-		e = e ? e : pa_write1(amps[i], 0x10010, 0x10000);
+		e = e ? e : pa_stage_down(amps[i]);
 		err = err ? err : e;
 	}
 	for (unsigned i = 0; i < 2; i++) {
@@ -900,6 +909,45 @@ pa_power_down(void)
 	return err;
 }
 
+/*
+ * 0300: the receiver, as Android plays on the earpiece (miccheck\android\probe_earpiece.txt, mixer_paths "handset"):
+ * the top amp only, its DSP bypassed (T PCM Source ASPRX1: 0x4C00 = 0x8; T ASP TX1 Source ASPRX1: 0x4C20 = 0x8),
+ * T Amp Gain 13 (0x6C04 = 0x1A0; the speaker's 18 is 0x240), GPIO 174 low (T Enable RCV Pin Control 0, DT
+ * rcv_gpio_low "pull down"), then the serial port and the power stage as for the speaker. No PLAY: the firmware does not
+ * process this path. Down: the power stage off, the speaker's gain and routing back, GPIO 174 high.
+ */
+static int
+pa_receiver_up(void)
+{
+	if (pa_tlmm) {
+		pa_gpio(174, 0, 1, 2, 0);
+	}
+	int err = pa_write1(0x42, 0x4c00, 0x8);
+	err = err ? err : pa_write1(0x42, 0x4c20, 0x8);
+	err = err ? err : pa_write1(0x42, 0x6c04, 0x1a0);
+	err = err ? err : pa_write1(0x42, 0x4800, 0x10001);
+	err = err ? err : pa_key(0x42, 0x000f1aa0);
+	err = err ? err : pa_write1(0x42, 0x2014, 1);
+	err = err ? err : pa_write1(0x42, 0x2018, 0x21);
+	return err;
+}
+
+static int
+pa_receiver_down(void)
+{
+	int err = pa_stage_down(0x42);
+	int e = pa_write1(0x42, 0x6c04, 0x240);
+	err = err ? err : e;
+	e = pa_write1(0x42, 0x4c20, 0x36);
+	err = err ? err : e;
+	e = pa_write1(0x42, 0x4c00, 0);
+	err = err ? err : e;
+	if (pa_tlmm) {
+		pa_gpio(174, 0, 3, 2, 1);
+	}
+	return err;
+}
+
 static uint64_t
 pa_ms_since(uint64_t t0)
 {
@@ -908,17 +956,19 @@ pa_ms_since(uint64_t t0)
 	return ns / NSEC_PER_MSEC;
 }
 
-/* The power thread from the first play on (the amps up then): each request ends in the state it asks for. A failed
- * power-up is tried again with the next request only. */
+static const char *const pa_mode_name[3] = {"off", "speaker", "receiver"};
+
+/* The power thread from the first play on (the amps up in speaker mode then): each request ends in the mode it asks
+ * for, through off when it changes. A failed power-up is tried again with the next request only. */
 static void __dead2
 pa_power_loop(void)
 {
 	uint32_t seen = pa_req - 1;            /* the IO's state from before is looked at once */
 	uint64_t since = mach_absolute_time();
 	unsigned ups = 0, downs = 0;
-	pa_amps_up = 1;
+	pa_mode = PA_SPEAKER;
 	pa_follow = true;
-	printf("PANDORA AMP: power follows the speaker's IO now (up at its start, down at its stop)\n");
+	printf("PANDORA AMP: power follows the speaker's and the receiver's IO now (up at its start, down at its stop)\n");
 	for (;;) {
 		(void)assert_wait((event_t)&pa_req, THREAD_UNINT);
 		const uint32_t req = __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE);
@@ -928,42 +978,53 @@ pa_power_loop(void)
 		}
 		clear_wait(current_thread(), THREAD_AWAKENED);
 		seen = req;
-		const bool want = pa_want_on && !pa_final;
-		if (want != (pa_amps_up != 0)) {
-			const uint64_t t0 = mach_absolute_time();
-			const uint64_t was = pa_ms_since(since);
-			int err;
-			if (want) {
-				err = pa_power_up();
-				pa_amps_up = err == 0;
-				ups++;
-				printf("PANDORA AMP: up (%u) after %llu ms down, in %llu ms, err %d\n", ups, was, pa_ms_since(t0),
-				    err);
-			} else {
-				pa_levels(0x40, "before down");
-				pa_levels(0x42, "before down");
-				err = pa_power_down();
-				pa_amps_up = 0;
-				downs++;
-				printf("PANDORA AMP: down (%u%s) after %llu ms up, in %llu ms, err %d\n", downs,
-				    pa_final ? ", final" : "", was, pa_ms_since(t0), err);
-			}
+		const uint32_t want = pa_final || pa_want > PA_RECEIVER ? PA_OFF : pa_want;
+		if (want != pa_mode && pa_mode != PA_OFF) {
+			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
+			const uint32_t m = pa_mode;
+			const int err = m == PA_RECEIVER ? pa_receiver_down() : pa_speaker_down();
+			pa_mode = PA_OFF;
+			downs++;
+			printf("PANDORA AMP: %s down (%u%s) after %llu ms up, in %llu ms, err %d\n", pa_mode_name[m], downs,
+			    pa_final ? ", final" : "", was, pa_ms_since(t0), err);
+			since = mach_absolute_time();
+		}
+		bool speaker_up = false;
+		if (want != pa_mode) {
+			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
+			const int err = want == PA_RECEIVER ? pa_receiver_up() : pa_speaker_up();
+			pa_mode = err ? PA_OFF : want;
+			speaker_up = pa_mode == PA_SPEAKER;
+			ups++;
+			printf("PANDORA AMP: %s up (%u) after %llu ms down, in %llu ms, err %d\n", pa_mode_name[want], ups, was,
+			    pa_ms_since(t0), err);
 			since = mach_absolute_time();
 		}
 		__atomic_store_n(&pa_seen, req, __ATOMIC_RELEASE);
 		thread_wakeup((event_t)&pa_seen);
+		/* 0307: the user hears the speaker reach its level about 3 s after a start, the receiver not; iOS's output does
+		 * not rise (0305 levels against the file). The firmware's readouts (its input from the DSP, its voltage out)
+		 * every 100 ms for 6 s after a speaker power-up, next to PandoraAudio's levels of what the DSP got; a new
+		 * request ends them. */
+		for (unsigned k = 1; speaker_up && k <= 60 && __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE) == seen; k++) {
+			char when[24];
+			pa_sleep(100);
+			snprintf(when, sizeof(when), "up +%u ms", k * 100);
+			pa_levels(0x40, when);
+			pa_levels(0x42, when);
+		}
 	}
 }
 
-/* Waits up to MS for the power thread to deal with request REQ (or, with ON, for the amps to be up). */
+/* Waits up to MS for the power thread to deal with request REQ. */
 static bool
-pa_wait_req(uint32_t req, bool on, unsigned ms)
+pa_wait_req(uint32_t req, unsigned ms)
 {
 	uint64_t deadline;
 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
 	for (;;) {
 		(void)assert_wait_deadline((event_t)&pa_seen, THREAD_UNINT, deadline);
-		if ((int32_t)(__atomic_load_n(&pa_seen, __ATOMIC_ACQUIRE) - req) >= 0 || (on && pa_amps_up)) {
+		if ((int32_t)(__atomic_load_n(&pa_seen, __ATOMIC_ACQUIRE) - req) >= 0) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 			return true;
 		}
@@ -973,26 +1034,27 @@ pa_wait_req(uint32_t req, bool on, unsigned ms)
 	}
 }
 
-/* From PandoraAudio.cpp: the speaker's IO starts (ON 1) or stops (0). With ON, waits up to WAIT_MS for the amps to
- * be up. 0 when they are as asked, ENODEV when the power thread does not run (yet), ETIMEDOUT, EIO. */
-int pandora_amp_io(int on, unsigned wait_ms);
+/* From PandoraAudio.cpp: the mode the amps should be in, 0 off, 1 speaker, 2 receiver (0300; 0298 had on and off).
+ * Waits up to WAIT_MS for it. 0 when they are as asked, ENODEV when the power thread does not run (yet), ETIMEDOUT,
+ * EIO. */
+int pandora_amp_io(int mode, unsigned wait_ms);
 int
-pandora_amp_io(int on, unsigned wait_ms)
+pandora_amp_io(int mode, unsigned wait_ms)
 {
-	pa_want_on = on ? 1 : 0;
+	pa_want = mode >= PA_OFF && mode <= PA_RECEIVER ? (uint32_t)mode : PA_OFF;
 	const uint32_t req = __atomic_add_fetch(&pa_req, 1, __ATOMIC_ACQ_REL);
 	thread_wakeup((event_t)&pa_req);
 	if (!pa_follow) {
 		return ENODEV;
 	}
-	if (!on || !wait_ms) {
+	if (!wait_ms) {
 		return 0;
 	}
-	if (!pa_wait_req(req, true, wait_ms)) {
-		printf("PANDORA AMP: not up after %u ms\n", wait_ms);
+	if (!pa_wait_req(req, wait_ms)) {
+		printf("PANDORA AMP: not %s after %u ms\n", pa_mode_name[pa_want], wait_ms);
 		return ETIMEDOUT;
 	}
-	return pa_amps_up ? 0 : EIO;
+	return pa_mode == pa_want ? 0 : EIO;
 }
 
 /* Before a power off or a restart (PandoraAudio.cpp's power-off and restart message, sweet_ufs.c's
@@ -1007,8 +1069,8 @@ pandora_amp_final(const char *why)
 	pa_final = true;
 	const uint32_t req = __atomic_add_fetch(&pa_req, 1, __ATOMIC_ACQ_REL);
 	thread_wakeup((event_t)&pa_req);
-	const bool done = pa_wait_req(req, false, 1000);
-	printf("PANDORA AMP: %s: amps %s\n", why, pa_amps_up ? "STILL UP" : done ? "down" : "down?");
+	const bool done = pa_wait_req(req, 1000);
+	printf("PANDORA AMP: %s: amps %s\n", why, pa_mode != PA_OFF ? "STILL UP" : done ? "down" : "down?");
 }
 
 static void
@@ -1103,7 +1165,7 @@ pa_tdm_thread(void *arg, wait_result_t result)
 		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
 	}
 	/* 0295: boot-arg pandora_spk_live=1: the DSP sends iOS's speaker output (silence between sounds). 0298: from
-	 * here on the amps' power follows the speaker's IO (pa_power_loop); the readouts come before each power-down. */
+	 * here on the amps' power follows the speaker's IO (pa_power_loop); 0300: and the receiver's. */
 	int live = 0;
 	(void)PE_parse_boot_argn("pandora_spk_live", &live, sizeof(live));
 	if (live) {
