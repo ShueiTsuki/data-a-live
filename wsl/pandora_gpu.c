@@ -544,7 +544,7 @@ gpu_level3(void)
 #define GMU_ASID          1u
 #define GMU_SLOT          2u
 #define GMU_TABLE_PAGES   64u
-#define GPU_TABLE_PAGES   1024u     /* 4 MiB: the level-9 tables plus room for ~2 GiB of later 4K maps */
+#define GPU_TABLE_PAGES   2048u     /* 8 MiB: the level-9 tables plus room for ~4 GiB of later 4K maps (0332: more clients) */
 #define GPU_INPUT_BITS    36u       /* 0219: the GPU context's addresses; room for the clients' 4 GiB windows */
 
 struct gmu_buf {
@@ -2297,7 +2297,7 @@ LCK_GRP_DECLARE(gpu_lck_grp, "pandora_gpu");
 LCK_MTX_DECLARE(gpu_lock, &gpu_lck_grp);
 
 #define GPU_MAX_BOS       4096u
-#define GPU_MAX_CLIENTS   4u
+#define GPU_MAX_CLIENTS   15u       /* 0332: the 4 GiB windows at 4..64 GiB of the 36-bit space (4 with the 32-bit layout) */
 #define GPU_MAX_IBS       128u      /* NativeAdrenoAbiMaxBuffers (tools/turnip/abi_128.py, 0194) */
 struct gpu_bo {
 	bool used;
@@ -2568,7 +2568,9 @@ pandora_gpu_open(void)
 {
 	int c = -1;
 	lck_mtx_lock(&gpu_lock);
-	for (unsigned i = 0; gpu_ready && i < GPU_MAX_CLIENTS && c < 0; i++) {
+	/* 0332: 15 windows of 4 GiB with a 36-bit GPU context; the 32-bit layout has 4 (gpu_window32). */
+	const unsigned clients = gpu_smmu.tcfg.input_bits >= 36 ? GPU_MAX_CLIENTS : 4;
+	for (unsigned i = 0; gpu_ready && i < clients && c < 0; i++) {
 		if (!gpu_clients[i].used) {
 			gpu_clients[i].used = true;
 			gpu_clients[i].reset = true;
@@ -2583,6 +2585,10 @@ pandora_gpu_open(void)
 	if (c >= 0) {
 		printf("PANDORA GPU: client %d (%s) window %#llx+%#llx\n", c, gpu_clients[c].name, gpu_clients[c].va_start,
 		    gpu_clients[c].va_size);
+	} else if (gpu_ready) {
+		char name[24];
+		proc_selfname(name, sizeof(name));
+		printf("PANDORA GPU: %s refused, all %u client windows taken\n", name, clients);
 	}
 	return c;
 }
@@ -3661,9 +3667,9 @@ gpu_watch(void)
 		flush_dcache64((addr64_t)gpu_bufs[2].pa + MEMPTRS_OFF, 16, TRUE);
 		uint32_t ring = mem[1], fsr = gpu_rd(gpu_smmu_va, gpu_smmu.cb + 0x58);
 		if (ring != last_ring || fsr != last_fsr) {
-			printf("PANDORA GPU WATCH: %u s ring timestamp %u (issued %u) rbbm %08x cp int %08x rptr %u wptr %u\n",
-			    (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX), gr(CP_INTERRUPT_STATUS_GLOBAL),
-			    gr(CP_RB_RPTR), ring_wptr);
+			printf("PANDORA GPU WATCH: %u s ring timestamp %u (issued %u) rbbm %08x cp int %08x rptr %u wptr %u; "
+			    "table pages %u of %u\n", (t + 1) * 5, ring, gpu_seqno, gr(RBBM_STATUS_A8XX),
+			    gr(CP_INTERRUPT_STATUS_GLOBAL), gr(CP_RB_RPTR), ring_wptr, gpu_smmu.tnext, gpu_smmu.tpages);
 			last_ring = ring;
 		} else if ((int32_t)(last_issued - ring) > 0 && ring != dumped) {
 			/* 0196: work that was already pending at the last tick, no progress since (bb22's
