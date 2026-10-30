@@ -161,6 +161,13 @@ if [ -n "${AMP_FW:-}" ]; then
 			PARTS+=("$(winp "$AMP_FW/$g")")
 		fi
 	done
+	# Say so when the speaker graph is missing: pandora_spk=3 then logs "no graph" and the phone
+	# stays silent while every other step (amp firmware, TDM, IOAudio2) looks fine.
+	if [ ! -f "$AMP_FW/spkgraph.bin" ]; then
+		echo "warning: no $AMP_FW/spkgraph.bin: the speaker graph will not open and iOS audio stays" >&2
+		echo "         silent (pandora_spk=3 prints 'no graph'); generate it with" >&2
+		echo "         tools/spk_graph.py <phone ACDB> $AMP_FW/spkgraph.bin" >&2
+	fi
 	# this phone's speaker calibration (Android /mnt/vendor/persist/audio/crus_calr.bin), when copied there;
 	# goes only into the pack on the phone, never into the repo
 	if [ -f "$AMP_FW/crus_calr.bin" ]; then
