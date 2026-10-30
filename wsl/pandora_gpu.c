@@ -2615,6 +2615,29 @@ pandora_gpu_close(int client)
 	printf("PANDORA GPU: client %d closed, %u buffers freed\n", client, n);
 }
 
+/*
+ * 0331: buffer slots are handed out next-fit, from just after the last one given, so a slot just freed is not given
+ * again at once. Turnip's Darwin backend keeps its tu_bo structs in an array indexed by the slot, and its
+ * darwin_bo_finish zeroed a struct only after the BoFree of its slot: an allocation in between got the same slot
+ * (the lowest free one), filled the same struct, and had it zeroed under its owner (post23/26/27: addresses of
+ * 0 plus an offset). tools/turnip/pandora_bo_finish_order.py fixes the order; this keeps a freed slot out of use
+ * for a while as well, as NativeAdreno's handles come from a counter. Under the lock; GPU_MAX_BOS when all are taken.
+ */
+static unsigned gpu_bo_cursor;
+
+static unsigned
+gpu_bo_free_slot(void)
+{
+	for (unsigned t = 0; t < GPU_MAX_BOS; t++) {
+		const unsigned i = (gpu_bo_cursor + t) % GPU_MAX_BOS;
+		if (!gpu_bos[i].used) {
+			gpu_bo_cursor = (i + 1) % GPU_MAX_BOS;
+			return i;
+		}
+	}
+	return GPU_MAX_BOS;
+}
+
 int pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *handle);
 int
 pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *handle)
@@ -2624,22 +2647,17 @@ pandora_gpu_bo_alloc(int client, uint64_t bytes, uint32_t align_log2, uint64_t *
 	}
 	int err = ENOMEM;
 	lck_mtx_lock(&gpu_lock);
-	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
+	const unsigned i = gpu_bo_free_slot();   /* 0331 */
+	const uint64_t off = i < GPU_MAX_BOS ? gpu_pool_alloc(bytes, 1ull << align_log2) : ~0ull;
+	if (off != ~0ull) {
 		struct gpu_bo *b = &gpu_bos[i];
-		if (b->used) {
-			continue;
-		}
-		uint64_t off = gpu_pool_alloc(bytes, 1ull << align_log2);
-		if (off != ~0ull) {
-			/* Zeroed, and out of the CPU caches when the kernel's view is cacheable: the
-			 * client maps it write-combined and the GPU reads it non-cacheably. */
-			gpu_pool_zero(off, bytes);
-			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
-			*handle = ((uint64_t)b->gen << 32) | (i + 1);
-			err = 0;
-			gpu_clients[client].allocs++;
-		}
-		break;
+		/* Zeroed, and out of the CPU caches when the kernel's view is cacheable: the
+		 * client maps it write-combined and the GPU reads it non-cacheably. */
+		gpu_pool_zero(off, bytes);
+		*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen, .off = off, .bytes = bytes };
+		*handle = ((uint64_t)b->gen << 32) | (i + 1);
+		err = 0;
+		gpu_clients[client].allocs++;
 	}
 	lck_mtx_unlock(&gpu_lock);
 	return err;
@@ -2756,17 +2774,15 @@ pandora_gpu_bo_import(int client, const uint64_t *pages, uint32_t n, void *ref, 
 	memcpy(copy, pages, n * sizeof(uint64_t));
 	int err = ENOMEM;
 	lck_mtx_lock(&gpu_lock);
-	for (unsigned i = 0; i < GPU_MAX_BOS; i++) {
+	const unsigned i = gpu_bo_free_slot();   /* 0331 */
+	if (i < GPU_MAX_BOS) {
 		struct gpu_bo *b = &gpu_bos[i];
-		if (!b->used) {
-			*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen,
-				              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref,
-				              .readonly = readonly };
-			*handle = ((uint64_t)b->gen << 32) | (i + 1);
-			err = 0;
-			gpu_clients[client].imports++;
-			break;
-		}
+		*b = (struct gpu_bo){ .used = true, .client = client, .gen = ++gpu_bo_gen,
+			              .bytes = (uint64_t)n << 12, .pages = copy, .ref = ref,
+			              .readonly = readonly };
+		*handle = ((uint64_t)b->gen << 32) | (i + 1);
+		err = 0;
+		gpu_clients[client].imports++;
 	}
 	lck_mtx_unlock(&gpu_lock);
 	if (err) {
