@@ -1,0 +1,20 @@
+[package]
+name = "m2v-replay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+metal2vulkan = { path = "/opt/work/lplugin/metal2vulkan/crates/metal2vulkan", features = ["ash"] }
+metal2vulkan-runtime = { path = "/opt/work/lplugin/metal2vulkan/crates/metal2vulkan-runtime" }
+ash = { version = "0.38", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "rtt"
+path = "src/bin/rtt.rs"
+
+[profile.release]
+incremental = true
+debug = "line-tables-only"
