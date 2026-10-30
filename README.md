@@ -6,7 +6,7 @@
 
 项目还在实验阶段，不适合日常使用。仓库里是内核补丁、驱动源码和工具，iOS 系统和手机固件用的是你自己的 IPSW 和手机。
 
-2026-10-30 起原作者停止开发。接手要看的说明在 [HANDOFF.md](HANDOFF.md)。
+2026-10-30 起原作者停止开发，这个仓库只读归档。之后由 yechenan 在 [yechenan/data-a-live](https://github.com/yechenan/data-a-live) 继续。接手要看的说明在 [HANDOFF.md](HANDOFF.md)。
 
 ## 现在的状态
 
