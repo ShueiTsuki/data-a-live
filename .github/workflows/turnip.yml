@@ -69,6 +69,14 @@ jobs:
           python3 tools/turnip/pandora_wait.py mesa
           # A DSB SY where command streams in write-combined memory are handed on (post15's half-seen IB packet).
           python3 tools/turnip/pandora_dsb.py mesa
+          # Checks that name a freed or zeroed BO before the GPU uses it (pandora-turnip: lines in syslog), as on the phone
+          # since post25 (out-root/turnip/bochk4).
+          python3 tools/turnip/pandora_bocheck.py mesa
+          python3 tools/turnip/pandora_bocheck_submit.py mesa
+          python3 tools/turnip/pandora_bocheck_finish.py mesa
+          # The GPU hang's root cause: darwin_bo_finish zeroed a tu_bo after the reap had already freed its slot, so a
+          # BO newly made in that slot lost its address (0331 kernel side, PLAN post27-post28).
+          python3 tools/turnip/pandora_bo_finish_order.py mesa
           ls nativeadreno/NativeAdrenoABI.h
           # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
           python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
