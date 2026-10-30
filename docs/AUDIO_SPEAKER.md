@@ -191,6 +191,19 @@ iPhone X 的内置音频用 IOAudio2Family。我们的内核没有预链接苹�
 
 VirtualAudio 是老式的 AudioHardwarePlugIn，在 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin`，不在 `/System` 下。ios-sweet 的根文件系统镜像 v12 把它挪到了 `HAL.disabled`，因为那时没有音频设备，mediaserverd 会崩。用 sweet 系镜像的要先挪回来（aud6、aud7）。
 
+插件挪回来以后，用开机参数 `pandora_pathlog=mediaserverd`（0285）确认 mediaserverd 真的看了它：那个参数
+把该进程对路径含 `Plug-Ins` 或 `VirtualAudio` 的每一次 open/access/stat 打进内核日志。
+
+```
+PANDORA PATH: mediaserverd open /Library/Audio/Plug-Ins/HAL
+PANDORA PATH: mediaserverd open /System/Library/Audio/Plug-Ins/HAL/AirPlayHalogen.driver/Info.plist
+...
+PANDORA PATH: mediaserverd open /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio
+```
+
+如果列表停在某个插件上、后面再没有 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin`，说明那个插件没加载成功，
+HAL 根本没起来，先修它；能看到 VirtualAudio 那一行，才轮到设备模型的问题。
+
 光有 "Speaker" 还不够，还要一个 UID 为 "Hawking" 的输入设备。默认虚拟设备 vdef 要给 8 个附属虚拟设备建路由，其中 Hawking（vhaw）是必需的。它的输入端口 'phki' 从 UID 为 "Hawking" 的设备建出来。缺它的时候，默认路由退回 Null_Device（aud18 的日志），系统声音进了空设备，音量条也拖不动。我们在 IOResources 上放了第二个 IOAudio2Device 实例（personality 里 `PandoraAudioRole = Hawking`），带一条静音的输入流。加上以后路由就通了：日志里是 `{ vdef: pap → pspk 扬声器 Speaker }, { vhaw: phki → pap }`（aud19）。真 iPhone X 上它对应 AppleSecondaryAudio 的 "Hawking"。
 
 响铃/静音开关也要有回答。backboardd 开机时向 HID 系统要电话页 0x0B、用法 0x2E 的当前状态，0 是静音，1 是响铃。按键驱动不回答的话，iOS 一直当成静音。我们在按键驱动里回答响铃（0289）。
