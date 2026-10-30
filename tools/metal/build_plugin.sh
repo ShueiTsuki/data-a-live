@@ -38,8 +38,9 @@ print("};")' "$B/$n.spv" "$n"
 } > "$B/gen/NativeTurnipShaders.h"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
-# The pinned NativeMetal has patches 0001-0007; UniXNU's script also lists 0008, which is not in it.
-for p in "$NM"/bridge/patches/000*.patch; do
+# The pinned AdrenoMetal (ce5e19e) has patches 0001-0016; data-a-live's own (tools/metal/m2v) are applied by
+# build_plugin_linux.sh only.
+for p in "$NM"/bridge/patches/[0-9][0-9][0-9][0-9]-*.patch; do
 	echo "   $(basename "$p")"
 	git -C "$M2V" apply "$p"
 done

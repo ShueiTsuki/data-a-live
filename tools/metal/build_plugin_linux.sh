@@ -40,8 +40,8 @@ print("};")' "$B/$n.spv" "$n"
 
 echo "== metal2vulkan bridge (UniXNU build-native-metal-bridge.py)"
 # The patches, in order: NativeMetal's, then data-a-live's own runtime changes (tools/metal/m2v/NNNN-*.patch, made
-# against the tree after NativeMetal's).
-PATCHES=("$NM"/bridge/patches/000*.patch)
+# against the tree after NativeMetal's; upstream carries our first nine as its 0008-0016 since ce5e19e).
+PATCHES=("$NM"/bridge/patches/[0-9][0-9][0-9][0-9]-*.patch)
 for p in "$(cd "$(dirname "$0")" && pwd)"/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
 	[ -e "$p" ] && PATCHES+=("$p")
 done

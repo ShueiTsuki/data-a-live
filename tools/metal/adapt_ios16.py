@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt UniXNU NativeMetal (pinned c6d29ca, written for iPadOS 17 on an Adreno 740) to iOS 16.7 on the
+"""Adapt UniXNU AdrenoMetal (formerly NativeMetal; pinned ce5e19e, written for iPadOS 17 on an Adreno 740) to iOS 16.7 on the
 Adreno 840 (data-a-live). Exact, asserted text edits in a NativeMetal checkout; run once on a fresh tree.
 
   adapt_ios16.py NATIVEMETAL_DIR
@@ -129,10 +129,12 @@ edit('NativeAdrenoMetalPlugin.mm',
     if (gReports >= 0) return;   // data-a-live: the addresses below are iPadOS 17.7.11 QuartzCore's, not iOS 16's
     ++gReports;""")
 edit('NativeAdrenoMetalPlugin.mm',
-     """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+     """        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
+    }
     return device;""",
-     """    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
-    else if (!strcmp(getprogname(), "backboardd")) {
+     """        if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
+    }
+    if (device && !strcmp(getprogname(), "backboardd")) {
         // data-a-live: the render server as a client (no publish mode here): what it reads for the deep
         // framebuffer, and the bridge's telemetry (refused surfaces, last problems) every 30 s.
         CFTypeRef deep = CFPreferencesCopyAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFPreferencesCurrentApplication);
@@ -1208,29 +1210,9 @@ edit('NativeAdrenoMetalPlugin.mm',
             }, nullptr) == 0) pthread_detach(timing);
 """)
 
-# ---- data-a-live: device answers asked once per (selector, argument) (2026-10-25, round 2) ----------------------
-# r1c: QuartzCore asks the device about 3100 questions with an argument every 10 s while the screen moves
-# (supportsFamily:, supportsTextureSampleCount:, minimumLinearTextureAlignmentForPixelFormat:, ...), and the runtime
-# worked each out again: 140 us a call, 4 % of a core. Every such answer is a property of the device (NativeMetalObjects.rs
-# device_answer reads only the device's properties, family rows and format table), so each is asked once and kept, the
-# way the answers without an argument already are; a refusal is kept as 0/NO and logged once.
-edit('NativeBridgeMetalFrontend.mm',
-     """static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
- uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
- return value;
-}""",
-     """static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
- static std::mutex lock;   // data-a-live: each (selector, argument) asked once (tools/metal/adapt_ios16.py, round 2)
- static std::unordered_map<uint64_t,std::vector<std::pair<SEL,uint64_t>>> known;   // argument -> (selector, answer)
- {std::lock_guard<std::mutex> hold(lock);
-  if(auto at=known.find(arg);at!=known.end())for(const auto &seen:at->second)if(seen.first==cmd)return seen.second;}
- uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
- std::lock_guard<std::mutex> hold(lock);
- known[arg].emplace_back(cmd,value);
- return value;
-}""")
+# ---- device answers asked once per (selector, argument) ------------------------------------------------------------
+# r1c: QuartzCore asks the device about 3100 questions with an argument every 10 s while the screen moves, 140 us each.
+# Upstream 31867dc ("keep each device answer that takes an argument") keeps them the same way; nothing to edit here.
 
 # ---- data-a-live: the runtime's work counts in the 10-second report (2026-10-25, round 2) --------------------------
 # r2n's call stacks put a quarter of a pass's end in shadow copies (EncoderCore::shadow_copies, Turnip's r2d blits): a
@@ -1275,30 +1257,25 @@ pub extern "C" fn nmb_device_work_counts(device: *const NmbDevice, out: *mut c_c
     })
 }
 ''')
-# ---- data-a-live: padded targets rendered in place where Turnip's stores stay in their rows (2026-10-25) -----------
-# metal2vulkan makes a texture over padded rows that renders a shadow (m2v 0003, PaddedTargetsPolicy): CA's framebuffer,
-# 1125 pixels at 4608-byte rows, was copied in and out around every pass into it (r2o: about 2.5 full screens copied
-# back a frame). Such a texture is now an image over the surface's rows, Apple's own Metal's way (it renders into the
-# IOSurface), where Turnip's stores stay inside the texture's rows: a GMEM store whose render area ends at the image's
-# right or bottom edge writes on to the next multiple of 16 texels across and 4 rows down (A6xxGPUInfo's gmem_align_w
-# and gmem_align_h, tu_attachment_store_unaligned; r2p's mtltest part 4b: 1125 texels written as 1136), so m2v 0009
-# takes those as DeviceOptions::render_store_alignment and keeps a shadow of any other. pandora_m2v_padded=shadow in the
-# boot-args keeps every one a shadow, the runtime's default.
-# The same device options refuse rebinds of no-copy buffers (m2v 0006, DeviceOptions::refuse_rebinds), which this
-# frontend never makes: while CA's no-copy buffers live, every encoder logged each call for a rebind that never came.
-# pandora_m2v_rebinds=allow in the boot-args keeps the runtime's default.
+# ---- data-a-live: padded targets and rebinds (2026-10-25; on upstream ce5e19e 2026-10-30) ---------------------------
+# CA's framebuffer, 1125 pixels at 4608-byte rows, was copied in and out of a shadow image around every pass into it
+# (r2o: about 2.5 full screens copied back a frame). Upstream now aliases every padded texture, rendered and written
+# ones too (PaddedReadsPolicy::AliasWrites, its m2v 0008), and keeps a GMEM store at an image's edge inside the rows
+# (its m2v 0016); our own m2v 0003/0009 for the same are dropped. pandora_m2v_padded=shadow in the boot-args goes back
+# to the runtime's default (reads aliased, rendered and written ones shadowed).
+# The device options also refuse rebinds of no-copy buffers (upstream's m2v 0013, DeviceOptions::refuse_rebinds, off by
+# default), which this frontend never makes: while CA's no-copy buffers live, every encoder logged each call for a
+# rebind that never came. pandora_m2v_rebinds=allow in the boot-args keeps the runtime's default.
 edit('bridge/NativeMetalObjects.rs',
-     """        options.messages = Some(MessageSink::new(observe_message));
+     """        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
 """,
-     """        options.messages = Some(MessageSink::new(observe_message));
-        // data-a-live: padded targets render in place where Turnip's stores, aligned to 16 x 4 texels
-        // at an image's edge, stay in their rows (tools/metal/adapt_ios16.py); pandora_m2v_padded=shadow keeps shadows.
-        if !pandora_boot_arg_is("pandora_m2v_padded", "shadow") {
-            options.policy.padded_targets = metal2vulkan::device::PaddedTargetsPolicy::Alias;
-            options.render_store_alignment = Some([16, 4]);
+     """        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
+        // data-a-live: pandora_m2v_padded=shadow keeps rendered and written padded textures as shadows (tools/metal/adapt_ios16.py).
+        if pandora_boot_arg_is("pandora_m2v_padded", "shadow") {
+            options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::Alias;
         }
         // data-a-live: this frontend never rebinds a no-copy buffer (NativeMetalObjects.h), so the
-        // encoders need not log their calls for one (m2v 0006); pandora_m2v_rebinds=allow keeps the logs.
+        // encoders need not log their calls for one; pandora_m2v_rebinds=allow keeps the logs.
         options.refuse_rebinds = !pandora_boot_arg_is("pandora_m2v_rebinds", "allow");
 """)
 p = ROOT / 'bridge/NativeMetalObjects.rs'
@@ -1372,6 +1349,87 @@ edit('NativeBridgeMetalFrontend.mm',
   return d;
  }
 }
+""")
+
+# ---- data-a-live: Metal conformance step 1 (2026-10-30) ----------------------------------------------------------
+# The goal is a device that answers like a real iPhone X to every client, third-party apps included
+# (tools/metal/conformance.py lists the methods the bridge's objects lack against the SDK and the A11 driver).
+# 1. Every bridge class adopts its public Metal protocol, as Apple's driver classes do. Only the device did, so
+#    conformsToProtocol: and Swift's casts to a Metal protocol (`as? MTLTexture`, class_conformsToProtocol) answered NO
+#    for every other object. Adoption only answers that question; each method is still looked up on its own.
+# 2. What clients ask the objects and get NO for is logged, each (question, class, name) once per process, at most 400:
+#    respondsToSelector: and instancesRespondToSelector:, methodForSelector: of a missing method (RenderBox caches IMPs
+#    that way), conformsToProtocol:. A framework that asks first and takes another path on NO leaves no other trace.
+edit('NativeBridgeMetalFrontend.mm',
+     """#include <unordered_map>
+""",
+     """#include <unordered_map>
+#include <unordered_set>
+#include <atomic>
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """@implementation NBObject
+""",
+     """// data-a-live: a question a client asked a bridge object and got NO for (respondsToSelector: and the like), logged once per
+// (question, class, name) into the unified log, at most 400 a process (tools/metal/adapt_ios16.py, conformance step 1).
+static void pandoraAsked(unsigned how,Class cls,const void *what,const char *name) {
+ static const char *const hows[]={"responds","conforms","methodFor"};
+ static std::mutex lock;
+ static std::unordered_set<uint64_t> seen;
+ static std::atomic<bool> full{false};
+ if(full.load(std::memory_order_relaxed))return;
+ const uint64_t key=((uint64_t)(uintptr_t)cls*1000003u)^((uint64_t)(uintptr_t)what<<2)^how;
+ {std::lock_guard<std::mutex> hold(lock);
+  if(!seen.insert(key).second)return;
+  if(seen.size()>=400)full=true;}
+ NSLog(@"pandora-metal asked: %s %s %s -> NO",hows[how],class_getName(cls),name);
+}
+static BOOL pandoraConforms(Class cls,Protocol *protocol) {
+ for(Class c=cls;c;c=class_getSuperclass(c))if(class_conformsToProtocol(c,protocol))return YES;
+ return NO;
+}
+#define PANDORA_ASKED_METHODS \\
+- (BOOL)respondsToSelector:(SEL)sel { \\
+ if(class_respondsToSelector(object_getClass(self),sel))return YES; \\
+ pandoraAsked(0,object_getClass(self),sel,sel_getName(sel));return NO; \\
+} \\
+- (BOOL)conformsToProtocol:(Protocol *)protocol { \\
+ if(pandoraConforms(object_getClass(self),protocol))return YES; \\
+ pandoraAsked(1,object_getClass(self),(__bridge const void *)protocol,protocol_getName(protocol));return NO; \\
+} \\
+- (IMP)methodForSelector:(SEL)sel { \\
+ if(!class_respondsToSelector(object_getClass(self),sel))pandoraAsked(2,object_getClass(self),sel,sel_getName(sel)); \\
+ return class_getMethodImplementation(object_getClass(self),sel); \\
+}
+@implementation NBObject
+PANDORA_ASKED_METHODS
++ (BOOL)instancesRespondToSelector:(SEL)sel {
+ if(class_respondsToSelector(self,sel))return YES;
+ pandoraAsked(0,self,sel,sel_getName(sel));return NO;
+}
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """@implementation NBDeviceMethods
+- (NSString *)name {return gName;}
+""",
+     """@implementation NBDeviceMethods
+PANDORA_ASKED_METHODS   // data-a-live: copied onto the device class with the rest (native_bridge_metal_open)
+- (NSString *)name {return gName;}
+""")
+edit('NativeBridgeMetalFrontend.mm',
+     """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
+""",
+     """ if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
+ // data-a-live: every other bridge class adopts its public Metal protocol too (tools/metal/adapt_ios16.py, conformance step 1).
+ const struct {const char *cls;Protocol *protocol;} adopted[]={
+  {"NBQueue",@protocol(MTLCommandQueue)},{"NBCommandBuffer",@protocol(MTLCommandBuffer)},
+  {"NBRenderEncoder",@protocol(MTLRenderCommandEncoder)},{"NBComputeEncoder",@protocol(MTLComputeCommandEncoder)},
+  {"NBBlitEncoder",@protocol(MTLBlitCommandEncoder)},{"NBTexture",@protocol(MTLTexture)},{"NBBuffer",@protocol(MTLBuffer)},
+  {"NBHeap",@protocol(MTLHeap)},{"NBLibrary",@protocol(MTLLibrary)},{"NBFunction",@protocol(MTLFunction)},
+  {"NBRenderPipeline",@protocol(MTLRenderPipelineState)},{"NBComputePipeline",@protocol(MTLComputePipelineState)},
+  {"NBSampler",@protocol(MTLSamplerState)},{"NBDepthStencil",@protocol(MTLDepthStencilState)},{"NBEvent",@protocol(MTLEvent)},
+  {"NBSharedEvent",@protocol(MTLSharedEvent)},{"NBFence",@protocol(MTLFence)},{"NBBinaryArchive",@protocol(MTLBinaryArchive)}};
+ for(const auto &a:adopted)if(Class c=objc_getClass(a.cls))class_addProtocol(c,a.protocol);
 """)
 
 p = ROOT / 'NativeBridgeMetalFrontend.mm'
