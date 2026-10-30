@@ -1353,6 +1353,18 @@ edit('NativeBridgeMetalFrontend.mm',
      """   if(!strcmp(name,"supportsExtendedXR10Formats") && (!strstr(getprogname(),"Poster") || !strcmp(getprogname(),"PosterBoard")))value=0;
    if(!strcmp(name,"supportsExtendedXR10Formats"))NSLog(@"pandora-metal: supportsExtendedXR10Formats %llu",(unsigned long long)value);""")
 
+# PridePosterExtension aborted (post29, every process given a device) with "-[NBComputeEncoder globalTraceObjectID]:
+# unrecognized selector": Apple's objects (encoders, command buffers, resources) answer the private tracing id that
+# Metal's GPU-trace and capture paths read. Every bridge object answers 0, "no trace object".
+edit('NativeBridgeMetalFrontend.mm',
+     """@implementation NBObject
+- (id<MTLDevice>)device {return gDeviceObject;}
+""",
+     """@implementation NBObject
+- (id<MTLDevice>)device {return gDeviceObject;}
+- (uint64_t)globalTraceObjectID {return 0;}
+""")
+
 p = ROOT / 'NativeBridgeMetalFrontend.mm'
 p.write_text(p.read_text() + r'''
 // data-a-live: the runtime's work counts that changed since the last call (NativeMetalObjects.rs nmb_device_work_counts).
