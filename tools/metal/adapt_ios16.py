@@ -1363,6 +1363,15 @@ edit('NativeBridgeMetalFrontend.mm',
      """@implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (uint64_t)globalTraceObjectID {return 0;}
+// post30: PridePosterExtension then stopped on -[NBCommandBuffer userDictionary] (Apple's command buffers keep a
+// private mutable dictionary for their clients); each bridge object keeps one, made on first use.
+- (NSMutableDictionary *)userDictionary {
+ @synchronized(self) {
+  NSMutableDictionary *d=objc_getAssociatedObject(self,@selector(userDictionary));
+  if(!d){d=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,@selector(userDictionary),d,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+  return d;
+ }
+}
 """)
 
 p = ROOT / 'NativeBridgeMetalFrontend.mm'
