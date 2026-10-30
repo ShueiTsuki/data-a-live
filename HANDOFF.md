@@ -111,6 +111,7 @@ AMP=1 NOEXEC=bluetoothd bash tools/gpu_test.sh post31 out-root/turnip/bochk4 --w
 
 ## 参考
 
+- [docs/EXPERIENCE.md](docs/EXPERIENCE.md)：按部分整理的经验（启动、存储、显示、GPU、Metal、声音、电池温度、系统服务、调试手段、做事方法）。
 - [PLAN.md](PLAN.md)：全部进度和每轮测试。
 - [docs/GPU_PLAN.md](docs/GPU_PLAN.md)、[docs/GPU_PORT_MAP.md](docs/GPU_PORT_MAP.md)：GPU 移植。
 - [docs/SPEAKER_RESEARCH.md](docs/SPEAKER_RESEARCH.md)、[docs/AUDIO_SPEAKER.md](docs/AUDIO_SPEAKER.md)：喇叭。
