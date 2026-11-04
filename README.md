@@ -88,14 +88,6 @@ GPU 部分用了 UniXNU 的组件：NativeAdreno 的用户接口、ArmSmmu4K、M
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)（Turnip Vulkan 驱动）、[metal2vulkan](https://github.com/steelbrain/metal2vulkan)（Metal 着色器翻译）。
 - Linux 内核里的高通驱动（msm/Adreno、时钟、SPMI、ADC、GPI、I2C 等）：寄存器和启动顺序都参考了它们。
 
-## 支持开发
-
-开发很费钱和时间的呜呜呜，全部的打赏将会用于之后的维护以及本人购买 [In Falsus](https://store.steampowered.com/app/3971950/)。
-
-<img src="docs/wechat-reward.jpg" alt="微信赞赏码" width="240">
-
-打赏全凭自愿，项目里的所有东西都是免费的。
-
 ## 许可证
 
 内核补丁和编进内核的代码用 APSL 2.0。其他代码和文档用 MIT。从别的项目拷来的文件保留原来的许可证。具体条款在 [LICENSE](LICENSE) 里。
